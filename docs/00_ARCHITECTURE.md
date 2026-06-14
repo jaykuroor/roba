@@ -78,7 +78,7 @@ Every cross-track signal (marked → in §15) MUST have, in the **consuming** tr
 | Concern | Choice | Notes |
 |---|---|---|
 | Repo | **Monorepo** | one repo; `track_b` imports `core` directly |
-| Backend | **Python 3.11+ / FastAPI / Uvicorn** | async; agents + orchestrator |
+| Backend | **Python 3.14 / FastAPI / Uvicorn** | async; agents + orchestrator |
 | ORM / DB | **SQLAlchemy 2.x / SQLite** | one file `demo.db`; trivial reset |
 | Realtime | **WebSocket** (FastAPI native) | one hub broadcasts to frontend |
 | Frontend | **React 18 + Vite + TypeScript + Tailwind** | dashboards, demo controls, voice |
@@ -87,7 +87,7 @@ Every cross-track signal (marked → in §15) MUST have, in the **consuming** tr
 | LLM | **Gemini 2.x Flash (primary) → Groq → OpenRouter → canned** | free tiers; see §13 |
 | Weather | external HTTP (impl picks; suggest **Open-Meteo**, no key) | usage decided in §9/§18.5 |
 | Scheduling | **in-process async loop bound to the sim clock** | no external scheduler |
-| Python deps | fastapi, uvicorn, sqlalchemy, pydantic, httpx, google-generativeai (or REST), python-dotenv | |
+| Python deps | fastapi, uvicorn, sqlalchemy, pydantic, httpx, google-genai (or REST), python-dotenv | |
 | **Containerization** | **Docker + Docker Compose** | `docker compose up` runs backend+frontend on any machine — see §26 |
 
 Env vars: `GEMINI_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `WEATHER_API_BASE` (optional), `DEMO_MODE`.
@@ -628,7 +628,7 @@ volumes: { dbdata: {} }
 
 ### 26.2 Dockerfile.backend
 ```dockerfile
-FROM python:3.11-slim
+FROM python:3.14-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
