@@ -1,0 +1,197 @@
+{
+  "meta": {
+    "preset_id": "burger_joint",
+    "name": "The Burger Joint",
+    "cuisine": "burger",
+    "history_days": 30,
+    "history_orders_per_day": 40
+  },
+  "ingredients": [
+    {"id": 1, "name": "Beef Patty", "category": "meat", "base_unit": "g", "perishable": 1, "shelf_life_days": 3.0, "allergen_flags": [], "weather_tags": [], "notes": "80/20 chuck"},
+    {"id": 2, "name": "Burger Bun", "category": "bakery", "base_unit": "each", "perishable": 1, "shelf_life_days": 4.0, "allergen_flags": ["gluten", "sesame"], "weather_tags": [], "notes": "brioche"},
+    {"id": 3, "name": "Cheddar Cheese", "category": "dairy", "base_unit": "g", "perishable": 1, "shelf_life_days": 30.0, "allergen_flags": ["milk"], "weather_tags": [], "notes": "sliced"},
+    {"id": 4, "name": "Lettuce", "category": "produce", "base_unit": "g", "perishable": 1, "shelf_life_days": 6.0, "allergen_flags": [], "weather_tags": ["salad"], "notes": ""},
+    {"id": 5, "name": "Tomato", "category": "produce", "base_unit": "g", "perishable": 1, "shelf_life_days": 5.0, "allergen_flags": [], "weather_tags": [], "notes": ""},
+    {"id": 6, "name": "Onion", "category": "produce", "base_unit": "g", "perishable": 1, "shelf_life_days": 30.0, "allergen_flags": [], "weather_tags": [], "notes": ""},
+    {"id": 7, "name": "Potato", "category": "produce", "base_unit": "g", "perishable": 1, "shelf_life_days": 30.0, "allergen_flags": [], "weather_tags": [], "notes": "for fries"},
+    {"id": 8, "name": "Chicken Breast", "category": "meat", "base_unit": "g", "perishable": 1, "shelf_life_days": 3.0, "allergen_flags": [], "weather_tags": [], "notes": ""},
+    {"id": 9, "name": "Bacon", "category": "meat", "base_unit": "g", "perishable": 1, "shelf_life_days": 10.0, "allergen_flags": [], "weather_tags": [], "notes": "smoked"},
+    {"id": 10, "name": "Burger Sauce", "category": "pantry", "base_unit": "ml", "perishable": 1, "shelf_life_days": 30.0, "allergen_flags": ["egg"], "weather_tags": [], "notes": "house"},
+    {"id": 11, "name": "Pickles", "category": "pantry", "base_unit": "g", "perishable": 0, "shelf_life_days": 60.0, "allergen_flags": [], "weather_tags": [], "notes": ""},
+    {"id": 12, "name": "Cola", "category": "beverage", "base_unit": "ml", "perishable": 0, "shelf_life_days": 180.0, "allergen_flags": [], "weather_tags": ["cold_drink"], "notes": ""},
+    {"id": 13, "name": "Ice Cream", "category": "frozen", "base_unit": "ml", "perishable": 1, "shelf_life_days": 120.0, "allergen_flags": ["milk"], "weather_tags": ["ice_cream"], "notes": "vanilla"}
+  ],
+  "stations": [
+    {"id": 1, "name": "Grill"},
+    {"id": 2, "name": "Fry"},
+    {"id": 3, "name": "Cold"}
+  ],
+  "menu_items": [
+    {"id": 1, "name": "Classic Cheeseburger", "category": "burger", "station_id": 1, "dine_in_price": 10.0, "online_price": 12.0, "prep_time_min": 9.0, "is_batchable": 1, "active": 1, "weather_tags": ["comfort"], "description": "Beef patty, cheddar, lettuce, tomato and house sauce."},
+    {"id": 2, "name": "Bacon Burger", "category": "burger", "station_id": 1, "dine_in_price": 12.0, "online_price": 14.0, "prep_time_min": 10.0, "is_batchable": 1, "active": 1, "weather_tags": ["comfort"], "description": "Beef patty, cheddar, smoked bacon and onions."},
+    {"id": 3, "name": "Crispy Chicken Burger", "category": "burger", "station_id": 1, "dine_in_price": 11.0, "online_price": 13.0, "prep_time_min": 11.0, "is_batchable": 0, "active": 1, "weather_tags": ["comfort"], "description": "Crispy chicken breast with pickles and sauce."},
+    {"id": 4, "name": "French Fries", "category": "side", "station_id": 2, "dine_in_price": 4.0, "online_price": 5.0, "prep_time_min": 6.0, "is_batchable": 0, "active": 1, "weather_tags": [], "description": "Golden hand-cut fries."},
+    {"id": 5, "name": "Garden Salad", "category": "salad", "station_id": 3, "dine_in_price": 7.0, "online_price": 8.0, "prep_time_min": 5.0, "is_batchable": 0, "active": 1, "weather_tags": ["salad", "cold"], "description": "Lettuce, tomato and onion."},
+    {"id": 6, "name": "Cola", "category": "beverage", "station_id": 3, "dine_in_price": 3.0, "online_price": 3.5, "prep_time_min": 1.0, "is_batchable": 0, "active": 1, "weather_tags": ["cold_drink"], "description": "Chilled cola."},
+    {"id": 7, "name": "Vanilla Milkshake", "category": "dessert", "station_id": 3, "dine_in_price": 5.0, "online_price": 6.0, "prep_time_min": 3.0, "is_batchable": 0, "active": 1, "weather_tags": ["ice_cream", "cold"], "description": "Thick vanilla shake."}
+  ],
+  "recipes": [
+    {"id": 1, "menu_item_id": 1},
+    {"id": 2, "menu_item_id": 2},
+    {"id": 3, "menu_item_id": 3},
+    {"id": 4, "menu_item_id": 4},
+    {"id": 5, "menu_item_id": 5},
+    {"id": 6, "menu_item_id": 6},
+    {"id": 7, "menu_item_id": 7}
+  ],
+  "recipe_lines": [
+    {"id": 1, "recipe_id": 1, "ingredient_id": 1, "qty": 150.0, "unit": "g", "optional": 0},
+    {"id": 2, "recipe_id": 1, "ingredient_id": 2, "qty": 1.0, "unit": "each", "optional": 0},
+    {"id": 3, "recipe_id": 1, "ingredient_id": 3, "qty": 30.0, "unit": "g", "optional": 0},
+    {"id": 4, "recipe_id": 1, "ingredient_id": 4, "qty": 20.0, "unit": "g", "optional": 0},
+    {"id": 5, "recipe_id": 1, "ingredient_id": 5, "qty": 30.0, "unit": "g", "optional": 0},
+    {"id": 6, "recipe_id": 1, "ingredient_id": 10, "qty": 15.0, "unit": "ml", "optional": 0},
+    {"id": 7, "recipe_id": 2, "ingredient_id": 1, "qty": 150.0, "unit": "g", "optional": 0},
+    {"id": 8, "recipe_id": 2, "ingredient_id": 2, "qty": 1.0, "unit": "each", "optional": 0},
+    {"id": 9, "recipe_id": 2, "ingredient_id": 3, "qty": 30.0, "unit": "g", "optional": 0},
+    {"id": 10, "recipe_id": 2, "ingredient_id": 9, "qty": 30.0, "unit": "g", "optional": 0},
+    {"id": 11, "recipe_id": 2, "ingredient_id": 10, "qty": 15.0, "unit": "ml", "optional": 0},
+    {"id": 12, "recipe_id": 2, "ingredient_id": 6, "qty": 15.0, "unit": "g", "optional": 0},
+    {"id": 13, "recipe_id": 3, "ingredient_id": 8, "qty": 160.0, "unit": "g", "optional": 0},
+    {"id": 14, "recipe_id": 3, "ingredient_id": 2, "qty": 1.0, "unit": "each", "optional": 0},
+    {"id": 15, "recipe_id": 3, "ingredient_id": 4, "qty": 20.0, "unit": "g", "optional": 0},
+    {"id": 16, "recipe_id": 3, "ingredient_id": 10, "qty": 15.0, "unit": "ml", "optional": 0},
+    {"id": 17, "recipe_id": 3, "ingredient_id": 11, "qty": 10.0, "unit": "g", "optional": 0},
+    {"id": 18, "recipe_id": 4, "ingredient_id": 7, "qty": 200.0, "unit": "g", "optional": 0},
+    {"id": 19, "recipe_id": 5, "ingredient_id": 4, "qty": 80.0, "unit": "g", "optional": 0},
+    {"id": 20, "recipe_id": 5, "ingredient_id": 5, "qty": 40.0, "unit": "g", "optional": 0},
+    {"id": 21, "recipe_id": 5, "ingredient_id": 6, "qty": 20.0, "unit": "g", "optional": 0},
+    {"id": 22, "recipe_id": 6, "ingredient_id": 12, "qty": 330.0, "unit": "ml", "optional": 0},
+    {"id": 23, "recipe_id": 7, "ingredient_id": 13, "qty": 200.0, "unit": "ml", "optional": 0}
+  ],
+  "batch_definitions": [
+    {"id": 1, "menu_item_id": 1, "applicable_menus": [], "dayparts": ["lunch", "dinner"], "prep_lead_time_min": 12.0, "batch_size_min": 6.0, "batch_size_step": 2.0, "batch_size_max": 24.0, "decide_by_offset_min": 20.0, "prepared_shelf_life_min": 30.0, "station_id": 1, "required_skill": "grill", "default_cadence_min": 60.0, "historical_attach_rate": 0.30},
+    {"id": 2, "menu_item_id": 2, "applicable_menus": [], "dayparts": ["lunch", "dinner"], "prep_lead_time_min": 12.0, "batch_size_min": 4.0, "batch_size_step": 2.0, "batch_size_max": 20.0, "decide_by_offset_min": 20.0, "prepared_shelf_life_min": 30.0, "station_id": 1, "required_skill": "grill", "default_cadence_min": 75.0, "historical_attach_rate": 0.22}
+  ],
+  "staff": [
+    {"id": 1, "name": "Jake", "role": "grill_chef", "skill_level": 5, "hourly_cost": 28.0, "active": 1},
+    {"id": 2, "name": "Maria", "role": "fry_cook", "skill_level": 4, "hourly_cost": 22.0, "active": 1},
+    {"id": 3, "name": "Chen", "role": "cook", "skill_level": 4, "hourly_cost": 21.0, "active": 1},
+    {"id": 4, "name": "Sam", "role": "line_cook", "skill_level": 3, "hourly_cost": 19.0, "active": 1},
+    {"id": 5, "name": "Priya", "role": "line_cook", "skill_level": 3, "hourly_cost": 19.0, "active": 1}
+  ],
+  "staff_stations": [
+    {"id": 1, "staff_id": 1, "station_id": 1},
+    {"id": 2, "staff_id": 2, "station_id": 2},
+    {"id": 3, "staff_id": 3, "station_id": 3},
+    {"id": 4, "staff_id": 4, "station_id": 1},
+    {"id": 5, "staff_id": 4, "station_id": 2},
+    {"id": 6, "staff_id": 5, "station_id": 3},
+    {"id": 7, "staff_id": 5, "station_id": 2}
+  ],
+  "staff_dish_skills": [
+    {"id": 1, "staff_id": 1, "menu_item_id": 1},
+    {"id": 2, "staff_id": 1, "menu_item_id": 2},
+    {"id": 3, "staff_id": 2, "menu_item_id": 4}
+  ],
+  "suppliers": [
+    {"id": 1, "name": "Prime Meats", "lead_time_days": 2.0, "reliability_score": 0.93, "min_order_value": 80.0, "contact": "orders@primemeats.example"},
+    {"id": 2, "name": "Daily Greens", "lead_time_days": 1.0, "reliability_score": 0.96, "min_order_value": 30.0, "contact": "sales@dailygreens.example"},
+    {"id": 3, "name": "Pantry Plus", "lead_time_days": 3.0, "reliability_score": 0.9, "min_order_value": 60.0, "contact": "hello@pantryplus.example"}
+  ],
+  "supplier_catalog": [
+    {"id": 1, "supplier_id": 1, "ingredient_id": 1, "current_price": 0.009, "unit": "g", "pack_size": 5000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 2, "supplier_id": 3, "ingredient_id": 2, "current_price": 0.35, "unit": "each", "pack_size": 24.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 3, "supplier_id": 3, "ingredient_id": 3, "current_price": 0.014, "unit": "g", "pack_size": 2000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 4, "supplier_id": 2, "ingredient_id": 4, "current_price": 0.004, "unit": "g", "pack_size": 3000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 5, "supplier_id": 2, "ingredient_id": 5, "current_price": 0.004, "unit": "g", "pack_size": 5000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 6, "supplier_id": 2, "ingredient_id": 6, "current_price": 0.003, "unit": "g", "pack_size": 5000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 7, "supplier_id": 2, "ingredient_id": 7, "current_price": 0.002, "unit": "g", "pack_size": 10000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 8, "supplier_id": 1, "ingredient_id": 8, "current_price": 0.011, "unit": "g", "pack_size": 5000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 9, "supplier_id": 1, "ingredient_id": 9, "current_price": 0.018, "unit": "g", "pack_size": 2000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 10, "supplier_id": 3, "ingredient_id": 10, "current_price": 0.01, "unit": "ml", "pack_size": 2000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 11, "supplier_id": 3, "ingredient_id": 11, "current_price": 0.007, "unit": "g", "pack_size": 2000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 12, "supplier_id": 3, "ingredient_id": 12, "current_price": 0.002, "unit": "ml", "pack_size": 20000.0, "availability": "in_stock", "updated_at": 0.0},
+    {"id": 13, "supplier_id": 3, "ingredient_id": 13, "current_price": 0.005, "unit": "ml", "pack_size": 5000.0, "availability": "in_stock", "updated_at": 0.0}
+  ],
+  "inventory_levels": [
+    {"id": 1, "ingredient_id": 1, "par_level": 18000.0, "reorder_point": 9000.0, "safety_stock": 3600.0, "yield_factor": 1.0, "on_hand_cached": 14400.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 2, "ingredient_id": 2, "par_level": 600.0, "reorder_point": 300.0, "safety_stock": 120.0, "yield_factor": 1.0, "on_hand_cached": 480.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 3, "ingredient_id": 3, "par_level": 4000.0, "reorder_point": 2000.0, "safety_stock": 800.0, "yield_factor": 1.0, "on_hand_cached": 3200.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 4, "ingredient_id": 4, "par_level": 5000.0, "reorder_point": 2500.0, "safety_stock": 1000.0, "yield_factor": 1.0, "on_hand_cached": 4000.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 5, "ingredient_id": 5, "par_level": 5000.0, "reorder_point": 2500.0, "safety_stock": 1000.0, "yield_factor": 1.0, "on_hand_cached": 4000.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 6, "ingredient_id": 6, "par_level": 3000.0, "reorder_point": 1500.0, "safety_stock": 600.0, "yield_factor": 1.0, "on_hand_cached": 2400.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 7, "ingredient_id": 7, "par_level": 25000.0, "reorder_point": 12500.0, "safety_stock": 5000.0, "yield_factor": 1.0, "on_hand_cached": 20000.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 8, "ingredient_id": 8, "par_level": 8000.0, "reorder_point": 4000.0, "safety_stock": 1600.0, "yield_factor": 1.0, "on_hand_cached": 6400.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 9, "ingredient_id": 9, "par_level": 3000.0, "reorder_point": 1500.0, "safety_stock": 600.0, "yield_factor": 1.0, "on_hand_cached": 2400.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 10, "ingredient_id": 10, "par_level": 3000.0, "reorder_point": 1500.0, "safety_stock": 600.0, "yield_factor": 1.0, "on_hand_cached": 2400.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 11, "ingredient_id": 11, "par_level": 2000.0, "reorder_point": 1000.0, "safety_stock": 400.0, "yield_factor": 1.0, "on_hand_cached": 1600.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 12, "ingredient_id": 12, "par_level": 40000.0, "reorder_point": 20000.0, "safety_stock": 8000.0, "yield_factor": 1.0, "on_hand_cached": 32000.0, "last_counted_at": null, "last_counted_qty": null},
+    {"id": 13, "ingredient_id": 13, "par_level": 10000.0, "reorder_point": 5000.0, "safety_stock": 2000.0, "yield_factor": 1.0, "on_hand_cached": 8000.0, "last_counted_at": null, "last_counted_qty": null}
+  ],
+  "inventory_lots": [
+    {"id": 1, "ingredient_id": 1, "qty_on_hand": 14400.0, "unit": "g", "purchase_price": 0.009, "purchase_date": -86400.0, "received_date": -86400.0, "expiry_date": 259200.0, "supplier_id": 1, "storage_location": "walk_in", "status": "active"},
+    {"id": 2, "ingredient_id": 2, "qty_on_hand": 480.0, "unit": "each", "purchase_price": 0.35, "purchase_date": -86400.0, "received_date": -86400.0, "expiry_date": 345600.0, "supplier_id": 3, "storage_location": "dry_store", "status": "active"},
+    {"id": 3, "ingredient_id": 3, "qty_on_hand": 3200.0, "unit": "g", "purchase_price": 0.014, "purchase_date": -172800.0, "received_date": -172800.0, "expiry_date": 2592000.0, "supplier_id": 3, "storage_location": "walk_in", "status": "active"},
+    {"id": 4, "ingredient_id": 4, "qty_on_hand": 4000.0, "unit": "g", "purchase_price": 0.004, "purchase_date": -86400.0, "received_date": -86400.0, "expiry_date": 432000.0, "supplier_id": 2, "storage_location": "walk_in", "status": "active"},
+    {"id": 5, "ingredient_id": 5, "qty_on_hand": 4000.0, "unit": "g", "purchase_price": 0.004, "purchase_date": -86400.0, "received_date": -86400.0, "expiry_date": 345600.0, "supplier_id": 2, "storage_location": "walk_in", "status": "active"},
+    {"id": 6, "ingredient_id": 6, "qty_on_hand": 2400.0, "unit": "g", "purchase_price": 0.003, "purchase_date": -172800.0, "received_date": -172800.0, "expiry_date": 2592000.0, "supplier_id": 2, "storage_location": "dry_store", "status": "active"},
+    {"id": 7, "ingredient_id": 7, "qty_on_hand": 20000.0, "unit": "g", "purchase_price": 0.002, "purchase_date": -172800.0, "received_date": -172800.0, "expiry_date": 2592000.0, "supplier_id": 2, "storage_location": "dry_store", "status": "active"},
+    {"id": 8, "ingredient_id": 8, "qty_on_hand": 6400.0, "unit": "g", "purchase_price": 0.011, "purchase_date": -86400.0, "received_date": -86400.0, "expiry_date": 259200.0, "supplier_id": 1, "storage_location": "walk_in", "status": "active"},
+    {"id": 9, "ingredient_id": 9, "qty_on_hand": 2400.0, "unit": "g", "purchase_price": 0.018, "purchase_date": -86400.0, "received_date": -86400.0, "expiry_date": 864000.0, "supplier_id": 1, "storage_location": "walk_in", "status": "active"},
+    {"id": 10, "ingredient_id": 10, "qty_on_hand": 2400.0, "unit": "ml", "purchase_price": 0.01, "purchase_date": -86400.0, "received_date": -86400.0, "expiry_date": 2592000.0, "supplier_id": 3, "storage_location": "walk_in", "status": "active"},
+    {"id": 11, "ingredient_id": 11, "qty_on_hand": 1600.0, "unit": "g", "purchase_price": 0.007, "purchase_date": -172800.0, "received_date": -172800.0, "expiry_date": 5184000.0, "supplier_id": 3, "storage_location": "dry_store", "status": "active"},
+    {"id": 12, "ingredient_id": 12, "qty_on_hand": 32000.0, "unit": "ml", "purchase_price": 0.002, "purchase_date": -259200.0, "received_date": -259200.0, "expiry_date": 15552000.0, "supplier_id": 3, "storage_location": "dry_store", "status": "active"},
+    {"id": 13, "ingredient_id": 13, "qty_on_hand": 8000.0, "unit": "ml", "purchase_price": 0.005, "purchase_date": -172800.0, "received_date": -172800.0, "expiry_date": 10368000.0, "supplier_id": 3, "storage_location": "freezer", "status": "active"}
+  ],
+  "competitors": [
+    {"id": 1, "name": "Burger Barn", "platform": "google", "cuisine": ["burger", "american"], "distance_km": 0.6, "rating": 4.2, "is_open": 1, "price_tier": "$$", "updated_at": 0.0},
+    {"id": 2, "name": "Patty Palace", "platform": "ubereats", "cuisine": ["burger"], "distance_km": 1.3, "rating": 3.8, "is_open": 1, "price_tier": "$", "updated_at": 0.0},
+    {"id": 3, "name": "The Grill House", "platform": "google", "cuisine": ["american", "burger"], "distance_km": 2.0, "rating": 4.4, "is_open": 1, "price_tier": "$$$", "updated_at": 0.0},
+    {"id": 4, "name": "Shake Stop", "platform": "yelp", "cuisine": ["burger", "fast_food"], "distance_km": 1.8, "rating": 4.0, "is_open": 1, "price_tier": "$$", "updated_at": 0.0},
+    {"id": 5, "name": "Veggie Bites", "platform": "google", "cuisine": ["vegetarian", "burger"], "distance_km": 1.0, "rating": 4.1, "is_open": 0, "price_tier": "$$", "updated_at": 0.0}
+  ],
+  "competitor_offers": [
+    {"id": 1, "competitor_id": 1, "dish_or_combo": "Double Cheeseburger", "price": 11.0, "description": "Two patties, double cheese.", "updated_at": 0.0},
+    {"id": 2, "competitor_id": 2, "dish_or_combo": "Burger + Fries Combo", "price": 9.5, "description": "Burger with regular fries.", "updated_at": 0.0},
+    {"id": 3, "competitor_id": 1, "dish_or_combo": "Bacon Burger", "price": 12.5, "description": "Bacon and cheddar.", "updated_at": 0.0},
+    {"id": 4, "competitor_id": 3, "dish_or_combo": "Wagyu Burger", "price": 18.0, "description": "Premium wagyu beef.", "updated_at": 0.0},
+    {"id": 5, "competitor_id": 4, "dish_or_combo": "Vanilla Shake", "price": 5.5, "description": "Hand-spun shake.", "updated_at": 0.0},
+    {"id": 6, "competitor_id": 4, "dish_or_combo": "Crispy Chicken Burger", "price": 10.5, "description": "Buttermilk chicken.", "updated_at": 0.0}
+  ],
+  "reviews": [
+    {"id": 1, "source": "google", "rating": 5.0, "text": "The bacon burger is unreal!", "dish_mentions": ["Bacon Burger"], "sentiment": "positive", "sim_time": -86400.0, "processed": 0},
+    {"id": 2, "source": "yelp", "rating": 4.0, "text": "Fries are crispy and perfect.", "dish_mentions": ["French Fries"], "sentiment": "positive", "sim_time": -172800.0, "processed": 0},
+    {"id": 3, "source": "google", "rating": 2.0, "text": "Chicken burger was dry today.", "dish_mentions": ["Crispy Chicken Burger"], "sentiment": "negative", "sim_time": -259200.0, "processed": 0},
+    {"id": 4, "source": "tripadvisor", "rating": 5.0, "text": "Best milkshake around.", "dish_mentions": ["Vanilla Milkshake"], "sentiment": "positive", "sim_time": -345600.0, "processed": 0},
+    {"id": 5, "source": "google", "rating": 3.0, "text": "Cheeseburger was fine, nothing special.", "dish_mentions": ["Classic Cheeseburger"], "sentiment": "neutral", "sim_time": -432000.0, "processed": 0},
+    {"id": 6, "source": "yelp", "rating": 4.0, "text": "Great value combos.", "dish_mentions": [], "sentiment": "positive", "sim_time": -518400.0, "processed": 0},
+    {"id": 7, "source": "google", "rating": 1.0, "text": "Cold fries and slow service.", "dish_mentions": ["French Fries"], "sentiment": "negative", "sim_time": -604800.0, "processed": 0},
+    {"id": 8, "source": "google", "rating": 5.0, "text": "Juicy cheeseburger, will be back.", "dish_mentions": ["Classic Cheeseburger"], "sentiment": "positive", "sim_time": -691200.0, "processed": 0},
+    {"id": 9, "source": "tripadvisor", "rating": 4.0, "text": "Garden salad surprisingly fresh.", "dish_mentions": ["Garden Salad"], "sentiment": "positive", "sim_time": -777600.0, "processed": 0},
+    {"id": 10, "source": "yelp", "rating": 5.0, "text": "Friendly staff, tasty burgers.", "dish_mentions": [], "sentiment": "positive", "sim_time": -864000.0, "processed": 0}
+  ],
+  "supplier_price_history": [
+    {"id": 1, "supplier_id": 1, "ingredient_id": 1, "price": 0.0094, "sim_time": -432000.0},
+    {"id": 2, "supplier_id": 1, "ingredient_id": 1, "price": 0.0091, "sim_time": -259200.0},
+    {"id": 3, "supplier_id": 1, "ingredient_id": 1, "price": 0.0090, "sim_time": -86400.0},
+    {"id": 4, "supplier_id": 2, "ingredient_id": 7, "price": 0.0022, "sim_time": -432000.0},
+    {"id": 5, "supplier_id": 2, "ingredient_id": 7, "price": 0.0020, "sim_time": -259200.0},
+    {"id": 6, "supplier_id": 1, "ingredient_id": 8, "price": 0.0112, "sim_time": -259200.0}
+  ],
+  "weather_log": [
+    {"id": 1, "sim_time": 0.0, "source": "api", "temp_c": 24.0, "condition": "clear", "precip_mm": 0.0, "wind_kph": 10.0, "applied": 1}
+  ],
+  "sim_state": {
+    "sim_time": 28800.0, "day_number": 0, "day_of_week": 0, "speed": 1.0,
+    "status": "stopped", "operating_window": ["08:00", "23:00"],
+    "skip_closed_hours": 1, "call_mode": "freeze"
+  },
+  "sim_settings": {
+    "id": 1, "base_orders_per_day": 320, "velocity": 1.0,
+    "dish_mix_weights": {"1": 0.24, "2": 0.18, "3": 0.16, "4": 0.16, "5": 0.08, "6": 0.10, "7": 0.08},
+    "daypart_curve": null,
+    "channel_mix": {"dine_in": 0.55, "delivery": 0.30, "takeout": 0.15},
+    "anomaly_injections": null
+  }
+}
