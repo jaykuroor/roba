@@ -356,6 +356,22 @@ class PurchaseOrderLine(Base):
                 f"ingredient_id={self.ingredient_id} qty={self.qty}>")
 
 
+class Attendance(Base):
+    __tablename__ = "attendance"
+
+    id = _pk()
+    staff_id = mapped_column(ForeignKey("staff.id"))
+    date_sim_day = mapped_column(Integer)      # sim day number
+    status = mapped_column(String)             # present | leave | sick
+    daypart = mapped_column(String, nullable=True)  # null = whole day
+    reason = mapped_column(String, nullable=True)
+    sim_time = mapped_column(Float)
+
+    def __repr__(self):
+        return (f"<Attendance id={self.id} staff_id={self.staff_id} "
+                f"date_sim_day={self.date_sim_day} status={self.status!r}>")
+
+
 class MenuToggle(Base):
     __tablename__ = "menu_toggles"
 
@@ -726,6 +742,7 @@ REFERENCE_MODELS = [
 TRANSACTIONAL_MODELS = [
     InventoryLot, InventoryLedger, InventoryLevel, Order, OrderLine,
     Batch, WasteEvent, PurchaseOrder, PurchaseOrderLine, MenuToggle,
+    Attendance,
 ]
 
 INTELLIGENCE_MODELS = [
