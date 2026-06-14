@@ -52,6 +52,87 @@ def test_sweep_expires_live_signals(bus):
     assert bus.live() == []
 
 
+def test_subscribe_fires_callback_on_emit(bus):
+    """A subscriber for a type is invoked (synchronously) with the written
+    signal on every emit of that type, and not for other types."""
+    received = []
+    bus.subscribe(SignalType.LOW_STOCK, lambda sig: received.append(sig))
+
+    # An emit of a different type must not trigger the LOW_STOCK subscriber.
+    bus.emit(SignalType.WASTE_EVENT,
+             {"waste_type": "spoilage", "qty": 1.0, "unit": "g",
+              "cost": 1.0, "reason": "x"}, source="t", now=1.0)
+    assert received == []
+
+    signal = bus.emit(SignalType.LOW_STOCK, _low_stock(), source="t", now=2.0)
+    assert len(received) == 1
+    assert received[0].signal_id == signal.signal_id
+    assert received[0].type == SignalType.LOW_STOCK.value
+
+
+def test_multiple_subscribers_all_fire_and_isolate_failures(bus):
+    """Multiple subscribers per type all fire in order; a raising subscriber
+    does not stop siblings or break the emit."""
+    order = []
+    bus.subscribe(SignalType.LOW_STOCK, lambda _s: order.append("a"))
+    bus.subscribe(SignalType.LOW_STOCK, lambda _s: (_ for _ in ()).throw(RuntimeError("boom")))
+    bus.subscribe(SignalType.LOW_STOCK, lambda _s: order.append("c"))
+
+    signal = bus.emit(SignalType.LOW_STOCK, _low_stock(), source="t", now=1.0)
+
+    assert signal is not None  # emit still succeeds
+    assert order == ["a", "c"]  # the failing subscriber is isolated
+
+
+def test_dedup_refresh_does_not_refire_subscribers(bus, session_factory):
+    """A dedup-refresh (same key, changed payload) updates the live signal in
+    place but does NOT re-invoke subscribers — reactors fire once per genuine
+    emit, never on a refresh (§14.3)."""
+    fired = []
+    bus.subscribe(SignalType.LOW_STOCK, lambda s: fired.append(s.payload["on_hand"]))
+
+    # New insert -> fires.
+    bus.emit(SignalType.LOW_STOCK, _low_stock(on_hand=5.0),
+             source="t", dedup_key="k", now=1.0)
+    # Same dedup_key, materially changed payload -> refresh path, no re-fire.
+    bus.emit(SignalType.LOW_STOCK, _low_stock(on_hand=3.0),
+             source="t", dedup_key="k", now=2.0)
+
+    assert fired == [5.0]
+
+    # The single live row still got the refreshed payload (broadcast/state path
+    # is unaffected — only the reactor dispatch is gated).
+    session = session_factory()
+    try:
+        rows = session.query(Signal).filter(Signal.dedup_key == "k").all()
+    finally:
+        session.close()
+    assert len(rows) == 1
+    assert rows[0].payload["on_hand"] == 3.0
+
+
+def test_identical_dedup_emit_does_not_fire_subscribers(bus):
+    """A materially-identical dedup emit is a no-op and fires no subscribers."""
+    fired = []
+    bus.subscribe(SignalType.LOW_STOCK, lambda s: fired.append(s))
+    bus.emit(SignalType.LOW_STOCK, _low_stock(on_hand=5.0),
+             source="t", dedup_key="k", now=1.0)
+    bus.emit(SignalType.LOW_STOCK, _low_stock(on_hand=5.0),
+             source="t", dedup_key="k", now=2.0)
+    assert len(fired) == 1  # only the first (new-insert) emit
+
+
+def test_distinct_emits_each_fire_subscribers(bus):
+    """Distinct emits (no dedup_key) each fire subscribers — the
+    APPROVAL_RESOLVED case, where every resolution is a separate event."""
+    fired = []
+    bus.subscribe(SignalType.LOW_STOCK, lambda s: fired.append(s.signal_id))
+    a = bus.emit(SignalType.LOW_STOCK, _low_stock(), source="t", now=1.0)
+    b = bus.emit(SignalType.LOW_STOCK, _low_stock(), source="t", now=2.0)
+    assert fired == [a.signal_id, b.signal_id]
+    assert a.signal_id != b.signal_id
+
+
 def test_valid_dict_payload_passes_through_unchanged(bus):
     """A valid dict payload is stored verbatim."""
     payload = _low_stock()
