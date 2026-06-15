@@ -2,6 +2,11 @@ import { useEffect, useState } from "react";
 import { ControlBar } from "./shell/ControlBar";
 import { ApprovalInbox } from "./shell/ApprovalInbox";
 import { wsClient } from "./ws";
+import { CompetitorPanel } from "./track_a/CompetitorPanel";
+import { ForecastDashboard } from "./track_a/ForecastDashboard";
+import { ReviewPanel } from "./track_a/ReviewPanel";
+import { SignalFeed } from "./track_a/SignalFeed";
+import { StaffPanel } from "./track_a/StaffPanel";
 
 // Track tab groups (00 §23). The real panels are mounted by the two
 // programmers into these slots; here they are empty labelled placeholders.
@@ -14,7 +19,12 @@ interface ActiveTab {
   name: string;
 }
 
-function TrackAPlaceholder({ label }: { label: string }) {
+function TrackAPanel({ label }: { label: string }) {
+  if (label === "Forecast") return <ForecastDashboard />;
+  if (label === "Competitors") return <CompetitorPanel />;
+  if (label === "Reviews") return <ReviewPanel />;
+  if (label === "Staff") return <StaffPanel />;
+  if (label === "Signal Feed") return <SignalFeed />;
   return (
     <div
       data-track="a"
@@ -112,7 +122,7 @@ export default function App() {
 
           <div className="min-h-[60vh]">
             {activeTab.track === "A" ? (
-              <TrackAPlaceholder label={activeTab.name} />
+              <TrackAPanel label={activeTab.name} />
             ) : (
               <TrackBPlaceholder label={activeTab.name} />
             )}

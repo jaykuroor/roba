@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -156,6 +157,7 @@ class AppContext:
         self.scenarios: Optional[ScenarioEngine] = None
         self.hub: WebSocketHub = WebSocketHub()
         self.loop_task: Optional[asyncio.Task] = None
+        self.track_a: Dict[str, Any] = {}
 
 
 ctx = AppContext()
@@ -231,6 +233,25 @@ def _bootstrap() -> None:
 
     # Ship the flagship Friday Rush scenario on first run.
     scenarios.seed_default_scenario()
+
+    # Track A: Demand & Sensing. In DEMO_MODE=track_a this also wires the
+    # Track A-owned MockInventory; in combined mode it stays disabled.
+    try:
+        from track_a import bootstrap_track_a
+
+        bus.sim_time = clock.sim_time
+        ctx.track_a = bootstrap_track_a(
+            bus=bus,
+            db_session_factory=factory,
+            orchestrator=orchestrator,
+            formatter=formatter,
+            calls=calls,
+            llm=llm,
+            ws_broadcast=sink,
+        )
+    except Exception:  # noqa: BLE001 - Track A must not prevent core startup.
+        logger.exception("Track A failed to bootstrap")
+        ctx.track_a = {}
 
     ctx.bus = bus
     ctx.clock = clock
@@ -739,6 +760,113 @@ def read_calls(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
 # ===========================================================================
 # Action endpoints (§20)
 # ===========================================================================
+
+# ===========================================================================
+# Track A reads/actions
+# ===========================================================================
+
+class TrackAStaffBody(BaseModel):
+    staff_id: Optional[int] = None
+    station_id: Optional[int] = None
+    daypart: Optional[str] = None
+    status: str = "sick"
+    reason: str = "called in sick"
+
+
+def _track_a_agent(name: str) -> Any:
+    agent = ctx.track_a.get(name)
+    if agent is None:
+        raise HTTPException(status_code=503, detail=f"Track A agent {name!r} is not available")
+    return agent
+
+
+@app.get("/api/track-a/snapshot")
+def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    signals = [
+        _row_to_dict(r)
+        for r in db_session.query(models.Signal)
+        .filter(models.Signal.status == "live")
+        .order_by(models.Signal.created_at.desc())
+        .all()
+        if {"forecasting", "sensing", "human"}.intersection(set(r.groups or []))
+    ]
+    return {
+        "demo_mode": os.getenv("DEMO_MODE", "combined"),
+        "menu_items": [_row_to_dict(r) for r in db_session.query(models.MenuItem).order_by(models.MenuItem.id.asc()).all()],
+        "forecasts": [
+            _row_to_dict(r)
+            for r in db_session.query(models.Forecast).order_by(models.Forecast.generated_at.desc()).limit(100).all()
+        ],
+        "batches": [
+            _row_to_dict(r)
+            for r in db_session.query(models.Batch).order_by(models.Batch.decided_at.desc()).limit(50).all()
+        ],
+        "competitors": [_row_to_dict(r) for r in db_session.query(models.Competitor).order_by(models.Competitor.id.asc()).all()],
+        "competitor_offers": [_row_to_dict(r) for r in db_session.query(models.CompetitorOffer).order_by(models.CompetitorOffer.id.asc()).all()],
+        "competitor_intel": [
+            _row_to_dict(r)
+            for r in db_session.query(models.CompetitorIntel).order_by(models.CompetitorIntel.sim_time.desc()).limit(50).all()
+        ],
+        "reviews": [_row_to_dict(r) for r in db_session.query(models.Review).order_by(models.Review.sim_time.desc()).limit(50).all()],
+        "review_insights": [
+            _row_to_dict(r)
+            for r in db_session.query(models.ReviewInsight).order_by(models.ReviewInsight.sim_time.desc()).limit(50).all()
+        ],
+        "stations": [_row_to_dict(r) for r in db_session.query(models.Station).order_by(models.Station.id.asc()).all()],
+        "staff": [_row_to_dict(r) for r in db_session.query(models.Staff).order_by(models.Staff.id.asc()).all()],
+        "staff_stations": [_row_to_dict(r) for r in db_session.query(models.StaffStation).order_by(models.StaffStation.id.asc()).all()],
+        "attendance": [_row_to_dict(r) for r in db_session.query(models.Attendance).order_by(models.Attendance.sim_time.desc()).limit(50).all()],
+        "signals": signals,
+        "events": [
+            _row_to_dict(r)
+            for r in db_session.query(models.EventLog).order_by(models.EventLog.sim_time.desc()).limit(50).all()
+        ],
+    }
+
+
+@app.post("/api/track-a/forecast/run")
+def track_a_run_forecast() -> Dict[str, Any]:
+    forecaster = _track_a_agent("forecaster")
+    forecasts = forecaster.run_forecast("manual")
+    return {"created": len(forecasts)}
+
+
+@app.post("/api/track-a/reviews/process")
+def track_a_process_reviews() -> Dict[str, Any]:
+    review = _track_a_agent("review")
+    rows = review.process_unprocessed()
+    return {"created": len(rows)}
+
+
+@app.post("/api/track-a/staff/recompute")
+def track_a_staff_recompute() -> Dict[str, Any]:
+    staff = _track_a_agent("staff")
+    return {"coverage": staff.recompute()}
+
+
+@app.post("/api/track-a/staff/call-in-sick")
+def track_a_staff_call_in_sick(body: TrackAStaffBody) -> Dict[str, Any]:
+    staff = _track_a_agent("staff")
+    return staff.call_in_sick(
+        staff_id=body.staff_id,
+        station_id=body.station_id,
+        daypart=body.daypart,
+        status=body.status,
+        reason=body.reason,
+    )
+
+
+@app.post("/api/track-a/competitors/{competitor_id}/research")
+def track_a_competitor_research(competitor_id: int) -> Dict[str, Any]:
+    session = db.SessionLocal()
+    try:
+        if session.get(models.Competitor, competitor_id) is None:
+            raise HTTPException(status_code=404, detail=f"Competitor {competitor_id} not found")
+    finally:
+        session.close()
+    competitor = _track_a_agent("competitor")
+    return competitor.request_research(competitor_id)
+
 
 class VoiceBody(BaseModel):
     text: str
