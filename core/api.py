@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -232,6 +233,21 @@ def _bootstrap() -> None:
     # Ship the flagship Friday Rush scenario on first run.
     scenarios.seed_default_scenario()
 
+    # Wire the track agents/mocks for the active DEMO_MODE (§3.2 / §26.2). The
+    # backend imports both tracks; DEMO_MODE selects which mocks run. Track
+    # registration is best-effort: a track that hasn't shipped its wiring yet
+    # (no ``register``) or that raises must never prevent core from starting.
+    demo_mode = os.getenv("DEMO_MODE", "combined")
+    _register_tracks(
+        demo_mode,
+        bus=bus,
+        orchestrator=orchestrator,
+        db_session_factory=factory,
+        llm=llm,
+        calls=calls,
+        approvals=approvals,
+    )
+
     ctx.bus = bus
     ctx.clock = clock
     ctx.orchestrator = orchestrator
@@ -244,6 +260,35 @@ def _bootstrap() -> None:
     ctx.formatter = formatter
     ctx.pos = pos
     ctx.scenarios = scenarios
+
+
+def _register_tracks(demo_mode: str, **ctx_kwargs: Any) -> None:
+    """Call each active track's ``agents.register(...)`` for ``demo_mode``.
+
+    ``track_b`` / ``track_a`` run their real agents in ``combined`` and in their
+    own standalone mode; the standalone mode additionally selects that track's
+    mocks (the other track's signals). Each call is isolated so one track's
+    wiring problem cannot take down the app."""
+    targets = []
+    if demo_mode in ("track_b", "combined"):
+        targets.append("track_b")
+    if demo_mode in ("track_a", "combined"):
+        targets.append("track_a")
+
+    for pkg_name in targets:
+        try:
+            module = __import__(f"{pkg_name}.agents", fromlist=["register"])
+        except Exception:  # noqa: BLE001 — a missing/broken track must not crash core.
+            logger.exception("Could not import %s.agents", pkg_name)
+            continue
+        register = getattr(module, "register", None)
+        if register is None:
+            logger.info("%s.agents has no register() yet — skipping", pkg_name)
+            continue
+        try:
+            register(demo_mode=demo_mode, **ctx_kwargs)
+        except Exception:  # noqa: BLE001 — isolate track wiring failures.
+            logger.exception("%s.agents.register failed", pkg_name)
 
 
 @asynccontextmanager

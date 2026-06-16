@@ -6,11 +6,12 @@ import { wsClient } from "./ws";
 import { apiGet } from "./api";
 import { actions } from "./store";
 import type { SimState, Weather } from "./types";
+import { TRACK_B_PANELS } from "./track_b";
 
-// Track tab groups (00 §23). The real panels are mounted by the two
-// programmers into these slots; here they are empty labelled placeholders.
+// Track tab groups (00 §23). Track A panels are still empty labelled
+// placeholders; Track B mounts its four real panels from the track_b registry.
 const TRACK_A_TABS = ["Forecast", "Competitors", "Reviews", "Staff", "Signal Feed"];
-const TRACK_B_TABS = ["Inventory", "Expiry", "Suppliers", "Activity Log"];
+const TRACK_B_TABS = TRACK_B_PANELS.map((p) => p.name);
 
 type Track = "A" | "B";
 interface ActiveTab {
@@ -30,16 +31,11 @@ function TrackAPlaceholder({ label }: { label: string }) {
   );
 }
 
-function TrackBPlaceholder({ label }: { label: string }) {
-  return (
-    <div
-      data-track="b"
-      data-panel={label}
-      className="flex h-full items-center justify-center rounded-lg border border-dashed border-muted bg-surface/40 text-text/40"
-    >
-      <span className="text-sm">Track B · {label}</span>
-    </div>
-  );
+function TrackBPanel({ label }: { label: string }) {
+  const panel = TRACK_B_PANELS.find((p) => p.name === label);
+  if (!panel) return null;
+  const Panel = panel.component;
+  return <Panel />;
 }
 
 function TabButton({
@@ -129,7 +125,7 @@ export default function App() {
             {activeTab.track === "A" ? (
               <TrackAPlaceholder label={activeTab.name} />
             ) : (
-              <TrackBPlaceholder label={activeTab.name} />
+              <TrackBPanel label={activeTab.name} />
             )}
           </div>
         </div>
