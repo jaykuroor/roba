@@ -4,20 +4,35 @@ Maintains stock as an append-only ledger and raises stock / expiry / waste
 signals. It is the **only** writer of ``inventory_ledger / inventory_lots /
 inventory_levels`` (§19.4) and the single component that depletes inventory.
 
-**Scaffold status:** this is a registered stub. It already subscribes to the
-``inventory`` group, takes the per-line depletion callback (``handle_order_line``,
-§10), and owns the ``EXPIRY_SCAN_SIM_S`` scan trigger — but the depletion math
-(§18.4), threshold signals (§18.8), receipts, reconciliation, and waste emission
-are filled in by a later milestone. The reactor/trigger entry points below are
-intentionally no-ops so the wiring is exercised end-to-end first.
+Depletion (§18.4, implemented exactly): for each sold order line / cooked
+batch and each ``recipe_line``, ``used = qty × recipe_qty / yield_factor``;
+deplete FIFO across ``inventory_lots`` (oldest ``expiry`` first); append
+``inventory_ledger(reason=sale_depletion|batch_depletion, delta=-used,
+ref_id, balance_after)``; update the lot + ``inventory_levels.on_hand_cached``;
+broadcast ``inventory_updated``. ``on_hand`` is always the ledger sum (the
+cache is a convenience kept in lockstep).
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
+from core import config
 from core.agent_base import BaseAgent
-from core.models import Signal
+from core.models import Ingredient
+from core.models import InventoryLedger as InventoryLedgerRow
+from core.models import (
+    InventoryLevel,
+    InventoryLot,
+    MenuItem,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    Recipe,
+    RecipeLine,
+    Signal,
+    WasteEvent,
+)
+from core.signals import SignalType
 
 # Signal groups this agent listens to (02 §B4.1).
 GROUPS = ["inventory"]
@@ -26,19 +41,48 @@ GROUPS = ["inventory"]
 class InventoryLedger(BaseAgent):
     """Deterministic stock ledger; depletion, thresholds, receipts, waste."""
 
-    def __init__(self, bus: Any, db_session_factory: Any, name: str = "ledger"):
-        super().__init__(bus, db_session_factory, name)
+    def __init__(
+        self,
+        bus: Any,
+        db_session_factory: Any,
+        name: str = "ledger",
+        ws_broadcast: Any = None,
+    ):
+        super().__init__(bus, db_session_factory, name, ws_broadcast=ws_broadcast)
         self.subscribe(GROUPS)
+        # Rolling (sim_time, qty) usage ring buffer per ingredient, used only
+        # to estimate ``projected_runout`` / ``projected_usage_before_expiry``
+        # — a light local analogue of the formatter's item-velocity buffer,
+        # scoped to ingredient depletion rather than dish sales.
+        self._usage: Dict[int, List[Tuple[float, float]]] = {}
 
     # -- signal handling ----------------------------------------------------
 
     def on_signal(self, signal: Signal) -> None:
-        """React to ``BATCH_DECISION(cook)`` / ``USER_FACT`` / PO deliveries.
+        """React to ``BATCH_DECISION(cook)`` and ``USER_FACT`` (§18.4).
 
-        Stub: depletion + threshold logic (§18.4 / §18.8) lands in a later
-        milestone."""
-        # TODO(track_b): batch depletion, receipts, reconciliation (§18.4).
-        return None
+        PO deliveries are driven directly by Procurement calling
+        :meth:`receive`, not via the bus.
+        """
+        if signal.type == SignalType.BATCH_DECISION.value:
+            payload = signal.payload or {}
+            if payload.get("decision") == "cook":
+                self._deplete_for_recipe(
+                    menu_item_id=payload["menu_item_id"],
+                    qty=float(payload.get("qty") or 0.0),
+                    reason="batch_depletion",
+                    ref_id=payload.get("batch_definition_id"),
+                )
+            return
+
+        if signal.type == SignalType.USER_FACT.value:
+            payload = signal.payload or {}
+            if payload.get("intent") in ("record_receipt", "add_inventory_count"):
+                # core/voice.py already performs these writes deterministically
+                # (§11); the Ledger's job here is purely to surface the
+                # resulting drift/receipt on the live dashboard.
+                self._surface_user_fact(payload)
+            return
 
     # -- order-line callback (§10) -----------------------------------------
 
@@ -46,20 +90,504 @@ class InventoryLedger(BaseAgent):
         """Deplete ingredients for one sold ``order_line`` (FIFO, §18.4).
 
         Registered with ``bus.register_order_line_handler`` so the core POS sim
-        drives depletion without putting order lines on the signal bus."""
-        # TODO(track_b): FIFO depletion + ledger append + threshold checks.
-        return None
+        drives depletion without putting order lines on the signal bus.
+        Voided lines never reach here (the formatter only forwards ``sold``
+        lines; voided ones become a ``cancelled_order`` waste event instead).
+        """
+        if getattr(line, "status", "sold") != "sold":
+            return
+        self._deplete_for_recipe(
+            menu_item_id=line.menu_item_id,
+            qty=float(line.qty or 0.0),
+            reason="sale_depletion",
+            ref_id=line.id,
+        )
 
-    # -- triggers -----------------------------------------------------------
+    # -- depletion core (§18.4) ---------------------------------------------
+
+    def _deplete_for_recipe(
+        self, menu_item_id: int, qty: float, reason: str, ref_id: Optional[int]
+    ) -> None:
+        """Deplete every ``recipe_line`` ingredient for ``qty`` units of a dish."""
+        if qty <= 0:
+            return
+        now = self.sim_time
+        session = self.db_session_factory()
+        try:
+            recipe = (
+                session.query(Recipe)
+                .filter(Recipe.menu_item_id == menu_item_id)
+                .first()
+            )
+            if recipe is None:
+                return
+            lines = (
+                session.query(RecipeLine)
+                .filter(RecipeLine.recipe_id == recipe.id)
+                .all()
+            )
+            specs = [
+                {"ingredient_id": rl.ingredient_id, "qty": rl.qty}
+                for rl in lines
+            ]
+        finally:
+            session.close()
+
+        for spec in specs:
+            level_yield = self._yield_factor(spec["ingredient_id"])
+            used = qty * float(spec["qty"] or 0.0) / max(level_yield, 1e-9)
+            if used <= 0:
+                continue
+            self._deplete_fifo(spec["ingredient_id"], used, reason, ref_id, now)
+
+    def _yield_factor(self, ingredient_id: int) -> float:
+        session = self.db_session_factory()
+        try:
+            level = (
+                session.query(InventoryLevel)
+                .filter(InventoryLevel.ingredient_id == ingredient_id)
+                .first()
+            )
+            if level is None or not level.yield_factor:
+                return 1.0
+            return float(level.yield_factor)
+        finally:
+            session.close()
+
+    def _deplete_fifo(
+        self,
+        ingredient_id: int,
+        qty: float,
+        reason: str,
+        ref_id: Optional[int],
+        now: float,
+    ) -> None:
+        """Deplete ``qty`` of ``ingredient_id`` FIFO (oldest ``expiry`` first)."""
+        session = self.db_session_factory()
+        try:
+            level = self._get_or_create_level(session, ingredient_id)
+            remaining = qty
+            lots = (
+                session.query(InventoryLot)
+                .filter(
+                    InventoryLot.ingredient_id == ingredient_id,
+                    InventoryLot.status == "active",
+                )
+                .order_by(InventoryLot.expiry_date.asc())
+                .all()
+            )
+            balance_after = float(level.on_hand_cached or 0.0)
+            for lot in lots:
+                if remaining <= 0:
+                    break
+                take = min(lot.qty_on_hand, remaining)
+                if take <= 0:
+                    continue
+                lot.qty_on_hand -= take
+                if lot.qty_on_hand <= 1e-9:
+                    lot.qty_on_hand = 0.0
+                    lot.status = "depleted"
+                remaining -= take
+                balance_after -= take
+                session.add(
+                    InventoryLedgerRow(
+                        ingredient_id=ingredient_id,
+                        lot_id=lot.id,
+                        delta_qty=-take,
+                        reason=reason,
+                        ref_id=ref_id,
+                        sim_time=now,
+                        balance_after=balance_after,
+                    )
+                )
+
+            # Stockout: more demanded than any lot could supply — still record
+            # the shortfall against the ledger (no lot to attribute it to) so
+            # the on-hand cache and the ledger sum never diverge.
+            if remaining > 1e-9:
+                balance_after -= remaining
+                session.add(
+                    InventoryLedgerRow(
+                        ingredient_id=ingredient_id,
+                        lot_id=None,
+                        delta_qty=-remaining,
+                        reason=reason,
+                        ref_id=ref_id,
+                        sim_time=now,
+                        balance_after=balance_after,
+                    )
+                )
+
+            level.on_hand_cached = balance_after
+            session.commit()
+        finally:
+            session.close()
+
+        self._record_usage(ingredient_id, now, qty)
+        self.broadcast(
+            "inventory_updated", {"ingredient_id": ingredient_id, "on_hand": balance_after}
+        )
+        self._check_thresholds(ingredient_id, balance_after, now)
+
+    @staticmethod
+    def _get_or_create_level(session: Any, ingredient_id: int) -> InventoryLevel:
+        level = (
+            session.query(InventoryLevel)
+            .filter(InventoryLevel.ingredient_id == ingredient_id)
+            .first()
+        )
+        if level is None:
+            level = InventoryLevel(
+                ingredient_id=ingredient_id,
+                par_level=0.0,
+                reorder_point=0.0,
+                safety_stock=0.0,
+                yield_factor=1.0,
+                on_hand_cached=0.0,
+            )
+            session.add(level)
+            session.flush()
+        return level
+
+    # -- usage-rate tracking (for projected_runout / expiry estimates) -----
+
+    def _record_usage(self, ingredient_id: int, sim_time: float, qty: float) -> None:
+        buffer = self._usage.setdefault(ingredient_id, [])
+        buffer.append((sim_time, qty))
+        cutoff = sim_time - config.VELOCITY_WINDOW_SIM_S
+        while buffer and buffer[0][0] < cutoff:
+            buffer.pop(0)
+
+    def _usage_rate(self, ingredient_id: int) -> float:
+        """Ingredient usage rate (qty per sim-second) over the rolling window."""
+        buffer = self._usage.get(ingredient_id)
+        if not buffer:
+            return 0.0
+        total = sum(q for _t, q in buffer)
+        return total / config.VELOCITY_WINDOW_SIM_S
+
+    # -- threshold signals (§18.4 / §18.8) ----------------------------------
+
+    def _check_thresholds(self, ingredient_id: int, on_hand: float, now: float) -> None:
+        session = self.db_session_factory()
+        try:
+            level = (
+                session.query(InventoryLevel)
+                .filter(InventoryLevel.ingredient_id == ingredient_id)
+                .first()
+            )
+            safety_stock = float(level.safety_stock or 0.0) if level else 0.0
+        finally:
+            session.close()
+
+        rate = self._usage_rate(ingredient_id)
+        far_future = now + config.EXPIRY_WINDOW_SIM_S * 2
+        projected_runout = (now + on_hand / rate) if rate > 0 else far_future
+
+        if on_hand <= 0:
+            affected = self._affected_menu_items(ingredient_id)
+            self.emit(
+                SignalType.STOCKOUT_RISK,
+                {
+                    "ingredient_id": ingredient_id,
+                    "on_hand": on_hand,
+                    "projected_runout": now,
+                    "affected_items": affected,
+                },
+                dedup_key=f"stockout:{ingredient_id}",
+            )
+            self.log_event(
+                "stockout_risk",
+                f"Ingredient {ingredient_id} is at or below zero on-hand ({on_hand:.1f}).",
+                {"ingredient_id": ingredient_id, "on_hand": on_hand},
+            )
+        elif safety_stock > 0 and on_hand <= safety_stock:
+            self.emit(
+                SignalType.LOW_STOCK,
+                {
+                    "ingredient_id": ingredient_id,
+                    "on_hand": on_hand,
+                    "threshold": safety_stock,
+                    "projected_runout": projected_runout,
+                    "unit": self._unit(ingredient_id),
+                },
+                dedup_key=f"low_stock:{ingredient_id}",
+            )
+            self.log_event(
+                "low_stock",
+                f"Ingredient {ingredient_id} on-hand ({on_hand:.1f}) at/below safety stock ({safety_stock:.1f}).",
+                {"ingredient_id": ingredient_id, "on_hand": on_hand, "safety_stock": safety_stock},
+            )
+
+    def _affected_menu_items(self, ingredient_id: int) -> List[int]:
+        session = self.db_session_factory()
+        try:
+            rows = (
+                session.query(MenuItem.id)
+                .join(Recipe, Recipe.menu_item_id == MenuItem.id)
+                .join(RecipeLine, RecipeLine.recipe_id == Recipe.id)
+                .filter(RecipeLine.ingredient_id == ingredient_id, MenuItem.active == 1)
+                .all()
+            )
+            return [r[0] for r in rows]
+        finally:
+            session.close()
+
+    def _unit(self, ingredient_id: int) -> str:
+        session = self.db_session_factory()
+        try:
+            ing = session.get(Ingredient, ingredient_id)
+            return ing.base_unit if ing is not None else "each"
+        finally:
+            session.close()
+
+    # -- expiry scan (§18.8) -------------------------------------------------
 
     def scan_expiry(self) -> None:
         """Expiry scan every ``EXPIRY_SCAN_SIM_S`` → ``EXPIRY_RISK`` / waste."""
-        # TODO(track_b): expiry scan + WASTE_EVENT on expired lots (§18.8).
-        return None
+        now = self.sim_time
+        session = self.db_session_factory()
+        try:
+            lots = (
+                session.query(InventoryLot)
+                .filter(InventoryLot.status == "active")
+                .all()
+            )
+            specs = [
+                {
+                    "id": lot.id,
+                    "ingredient_id": lot.ingredient_id,
+                    "qty_on_hand": lot.qty_on_hand,
+                    "expiry_date": lot.expiry_date,
+                    "purchase_price": lot.purchase_price,
+                    "unit": lot.unit,
+                }
+                for lot in lots
+            ]
+        finally:
+            session.close()
+
+        for spec in specs:
+            if spec["expiry_date"] is None:
+                continue
+            remaining = float(spec["expiry_date"]) - now
+            if remaining <= 0:
+                self._expire_lot(spec, now)
+            elif remaining <= config.EXPIRY_WINDOW_SIM_S:
+                self._raise_expiry_risk(spec, now, remaining)
+
+    def _raise_expiry_risk(self, spec: Dict[str, Any], now: float, remaining: float) -> None:
+        rate = self._usage_rate(spec["ingredient_id"])
+        projected_usage = rate * remaining
+        if projected_usage >= spec["qty_on_hand"]:
+            return  # will be used up before it expires — no risk
+        self.emit(
+            SignalType.EXPIRY_RISK,
+            {
+                "ingredient_id": spec["ingredient_id"],
+                "lot_id": spec["id"],
+                "qty": spec["qty_on_hand"],
+                "expiry": spec["expiry_date"],
+                "projected_usage_before_expiry": projected_usage,
+            },
+            ttl=remaining,
+            dedup_key=f"expiry:{spec['id']}",
+        )
+
+    def _expire_lot(self, spec: Dict[str, Any], now: float) -> None:
+        qty = spec["qty_on_hand"]
+        session = self.db_session_factory()
+        try:
+            lot = session.get(InventoryLot, spec["id"])
+            if lot is None or lot.status != "active":
+                return
+            lot.status = "expired"
+            level = self._get_or_create_level(session, spec["ingredient_id"])
+            balance_after = float(level.on_hand_cached or 0.0) - qty
+            level.on_hand_cached = balance_after
+            session.add(
+                InventoryLedgerRow(
+                    ingredient_id=spec["ingredient_id"],
+                    lot_id=spec["id"],
+                    delta_qty=-qty,
+                    reason="waste",
+                    ref_id=spec["id"],
+                    sim_time=now,
+                    balance_after=balance_after,
+                )
+            )
+            cost = qty * float(spec["purchase_price"] or 0.0)
+            session.add(
+                WasteEvent(
+                    waste_type="expiry",
+                    ingredient_id=spec["ingredient_id"],
+                    menu_item_id=None,
+                    lot_id=spec["id"],
+                    qty=qty,
+                    unit=spec["unit"],
+                    cost=cost,
+                    reason="lot expired unused",
+                    sim_time=now,
+                    source=self.name,
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        self.broadcast(
+            "inventory_updated", {"ingredient_id": spec["ingredient_id"], "on_hand": balance_after}
+        )
+        self.emit(
+            SignalType.WASTE_EVENT,
+            {
+                "waste_type": "expiry",
+                "ingredient_id": spec["ingredient_id"],
+                "menu_item_id": None,
+                "lot_id": spec["id"],
+                "qty": qty,
+                "unit": spec["unit"],
+                "cost": cost,
+                "reason": "lot expired unused",
+            },
+            groups=["inventory", "procurement", "human"],
+        )
+        self.log_event(
+            "waste",
+            f"Lot {spec['id']} expired unused ({qty:.1f} {spec['unit']}, cost {cost:.2f}).",
+            {"ingredient_id": spec["ingredient_id"], "lot_id": spec["id"], "cost": cost},
+        )
 
     # -- receipts (called by Procurement) ----------------------------------
 
-    def receive(self, po: Any) -> None:
-        """Create a receipt lot + ledger entry on PO delivery (§B4.1)."""
-        # TODO(track_b): create inventory_lot + inventory_ledger(receipt).
-        return None
+    def receive(self, po_id: int) -> None:
+        """Create receipt lots + ledger entries for every line of a delivered
+        PO (§B4.1 / §B4.4). ``po_id`` is the :class:`PurchaseOrder` id."""
+        now = self.sim_time
+        session = self.db_session_factory()
+        try:
+            po = session.get(PurchaseOrder, po_id)
+            if po is None:
+                return
+            lines = (
+                session.query(PurchaseOrderLine)
+                .filter(PurchaseOrderLine.po_id == po_id)
+                .all()
+            )
+            specs = [
+                {
+                    "ingredient_id": pl.ingredient_id,
+                    "qty": pl.qty,
+                    "unit": pl.unit,
+                    "unit_price": pl.unit_price,
+                }
+                for pl in lines
+            ]
+            supplier_id = po.supplier_id
+        finally:
+            session.close()
+
+        for spec in specs:
+            self._receive_line(
+                spec["ingredient_id"], spec["qty"], spec["unit"],
+                spec["unit_price"], supplier_id, now, po_id,
+            )
+
+    def _receive_line(
+        self,
+        ingredient_id: int,
+        qty: float,
+        unit: str,
+        unit_price: float,
+        supplier_id: Optional[int],
+        now: float,
+        po_id: int,
+    ) -> None:
+        session = self.db_session_factory()
+        try:
+            ing = session.get(Ingredient, ingredient_id)
+            shelf_life = float(ing.shelf_life_days or 5.0) if ing is not None else 5.0
+            lot = InventoryLot(
+                ingredient_id=ingredient_id,
+                qty_on_hand=qty,
+                unit=unit,
+                purchase_price=unit_price,
+                purchase_date=now,
+                received_date=now,
+                expiry_date=now + shelf_life * 86400.0,
+                supplier_id=supplier_id,
+                storage_location="main",
+                status="active",
+            )
+            session.add(lot)
+            session.flush()
+
+            level = self._get_or_create_level(session, ingredient_id)
+            balance_after = float(level.on_hand_cached or 0.0) + qty
+            level.on_hand_cached = balance_after
+            session.add(
+                InventoryLedgerRow(
+                    ingredient_id=ingredient_id,
+                    lot_id=lot.id,
+                    delta_qty=qty,
+                    reason="receipt",
+                    ref_id=po_id,
+                    sim_time=now,
+                    balance_after=balance_after,
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        self.broadcast(
+            "inventory_updated", {"ingredient_id": ingredient_id, "on_hand": balance_after}
+        )
+        self.log_event(
+            "receipt",
+            f"Received {qty:.1f} {unit} of ingredient {ingredient_id} (PO {po_id}).",
+            {"ingredient_id": ingredient_id, "qty": qty, "po_id": po_id},
+        )
+
+    # -- voice-driven drift surfacing ---------------------------------------
+
+    def _surface_user_fact(self, payload: Dict[str, Any]) -> None:
+        """``record_receipt`` / ``add_inventory_count`` are already applied by
+        ``core/voice.py`` directly against the ledger tables (§11) — surface
+        the resulting on-hand / drift on the live dashboard without
+        re-applying the write."""
+        ing_name = payload.get("entity_ref")
+        if not ing_name:
+            return
+        session = self.db_session_factory()
+        try:
+            ing = (
+                session.query(Ingredient)
+                .filter(Ingredient.name.ilike(str(ing_name)))
+                .first()
+            )
+            if ing is None:
+                return
+            ingredient_id = ing.id
+            level = (
+                session.query(InventoryLevel)
+                .filter(InventoryLevel.ingredient_id == ingredient_id)
+                .first()
+            )
+            on_hand = float(level.on_hand_cached) if level is not None else 0.0
+        finally:
+            session.close()
+
+        self.broadcast("inventory_updated", {"ingredient_id": ingredient_id, "on_hand": on_hand})
+        if payload.get("intent") == "add_inventory_count":
+            self.log_event(
+                "reconciliation",
+                f"Voice count for {ing_name}: on-hand now {on_hand:.1f} (drift recorded).",
+                {"ingredient_id": ingredient_id, "on_hand": on_hand},
+            )
+        else:
+            self.log_event(
+                "receipt",
+                f"Voice receipt recorded for {ing_name}; on-hand now {on_hand:.1f}.",
+                {"ingredient_id": ingredient_id, "on_hand": on_hand},
+            )

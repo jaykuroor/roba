@@ -151,3 +151,123 @@ export interface MenuItem {
 
 /** Generic entity row for the entity editor (columns vary per resource). */
 export type EntityRow = Record<string, unknown>;
+
+// -- Track B (00 §19.2 / §19.3) ----------------------------------------------
+
+/** inventory_levels row (GET /api/inventory). */
+export interface InventoryLevel {
+  id: number;
+  ingredient_id: number;
+  par_level: number | null;
+  reorder_point: number | null;
+  safety_stock: number | null;
+  yield_factor: number | null;
+  on_hand_cached: number | null;
+  last_counted_at: number | null;
+  last_counted_qty: number | null;
+}
+
+/** ingredients row (GET /api/ingredients is not exposed; names are looked up
+ * from the menu/recipe reads where available, otherwise shown by id). */
+export interface Ingredient {
+  id: number;
+  name: string;
+  category: string | null;
+  base_unit: "g" | "ml" | "each";
+  perishable: number;
+  shelf_life_days: number | null;
+}
+
+/** inventory_lots row (GET /api/inventory/lots). */
+export interface InventoryLot {
+  id: number;
+  ingredient_id: number;
+  qty_on_hand: number;
+  unit: string;
+  purchase_price: number | null;
+  purchase_date: number | null;
+  received_date: number | null;
+  expiry_date: number | null;
+  supplier_id: number | null;
+  storage_location: string | null;
+  status: "active" | "depleted" | "expired";
+}
+
+/** promotions row (GET /api/promotions). */
+export interface Promotion {
+  id: number;
+  type: "combo" | "discount";
+  menu_items: number[];
+  trigger: "expiry" | "slow_mover" | "intel";
+  discount_pct: number;
+  channel: "menu" | "aggregator" | "both";
+  status: "proposed" | "approved" | "active" | "expired";
+  approval_id: number | null;
+  sim_time: number;
+}
+
+/** negotiations row (GET /api/negotiations). */
+export interface Negotiation {
+  id: number;
+  supplier_id: number;
+  ingredient_id: number;
+  call_id: number | null;
+  transcript: unknown;
+  outcome: Record<string, unknown> | null;
+  savings: number | null;
+  sim_time: number;
+}
+
+/** supplier_catalog row (GET/PATCH /api/supplier-catalog). */
+export interface SupplierCatalogRow {
+  id: number;
+  supplier_id: number;
+  ingredient_id: number;
+  current_price: number;
+  unit: string;
+  pack_size: number;
+  availability: "in_stock" | "limited" | "out";
+  updated_at: number | null;
+}
+
+/** suppliers row (GET/PATCH /api/suppliers). */
+export interface SupplierRow {
+  id: number;
+  name: string;
+  lead_time_days: number | null;
+  reliability_score: number | null;
+  min_order_value: number | null;
+  contact: string | null;
+}
+
+/** menu_toggles row, embedded in menu_toggled WS payloads. */
+export interface MenuToggleEvent {
+  menu_item_id: number;
+  action: "disable" | "enable";
+  reason?: string;
+}
+
+/** event_log row (GET /api/events + event_logged WS event). */
+export interface EventLogEntry {
+  id: number;
+  sim_time: number;
+  category: string;
+  actor: string;
+  summary: string;
+  detail: unknown;
+}
+
+/** The bus envelope (00 §14.1), as carried by signal_emitted. */
+export interface SignalEnvelope {
+  signal_id: string;
+  type: string;
+  source: string;
+  groups: string[];
+  priority: number;
+  payload: Record<string, unknown>;
+  created_at: number;
+  expires_at: number | null;
+  dedup_key: string | null;
+  status: "live" | "consumed" | "expired";
+  correlation_id: string | null;
+}

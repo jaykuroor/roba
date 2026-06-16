@@ -2,9 +2,10 @@
 
 ``register`` is the single entry point the core app shell calls at startup
 (``core/api.py`` bootstrap) once per process. It constructs the three Track B
-agents, subscribes them to their groups, registers them with the orchestrator
-(so in-group signals are routed to ``on_signal``), wires the per-line depletion
-callback (§10), and registers each agent's §17 interval triggers.
+agents plus the Procurement service and the approval handlers, subscribes the
+agents to their groups, registers them with the orchestrator (so in-group
+signals are routed to ``on_signal``), wires the per-line depletion callback
+(§10), and registers each agent's §17 interval triggers.
 
 When ``DEMO_MODE=track_b`` it also constructs and registers the
 :class:`~track_b.mocks.mock_forecaster.MockForecaster`, the placeholder that
@@ -20,6 +21,8 @@ from typing import Any, Dict
 
 from core import config
 
+from ..approval.handlers import ApprovalHandlers
+from ..procurement.procurement import Procurement
 from .ledger import InventoryLedger
 from .market_spectator import MarketSpectator
 from .optimizer import InventoryOptimizer
@@ -33,18 +36,26 @@ def register(
     orchestrator: Any,
     db_session_factory: Any,
     demo_mode: str = "combined",
+    llm: Any = None,
+    calls: Any = None,
+    approvals: Any = None,
+    ws_broadcast: Any = None,
     **_kwargs: Any,
 ) -> Dict[str, Any]:
-    """Wire Track B into the running core (agents, triggers, mock).
-
-    Extra keyword args (``llm``, ``calls``, ``approvals`` …) are accepted and
-    ignored for now so the core call-site can pass the full context without this
-    scaffold needing to know which pieces a later milestone consumes.
+    """Wire Track B into the running core (agents, services, triggers, mock).
 
     Returns a dict of the constructed components (handy for tests)."""
-    ledger = InventoryLedger(bus, db_session_factory)
-    optimizer = InventoryOptimizer(bus, db_session_factory)
-    market = MarketSpectator(bus, db_session_factory)
+    ledger = InventoryLedger(bus, db_session_factory, ws_broadcast=ws_broadcast)
+    procurement = Procurement(
+        bus, db_session_factory, orchestrator, ledger,
+        approvals=approvals, ws_broadcast=ws_broadcast,
+    )
+    optimizer = InventoryOptimizer(
+        bus, db_session_factory, ws_broadcast=ws_broadcast,
+        procurement=procurement, approvals=approvals,
+    )
+    market = MarketSpectator(bus, db_session_factory, ws_broadcast=ws_broadcast, calls=calls)
+    handlers = ApprovalHandlers(bus, procurement, optimizer)
 
     for agent in (ledger, optimizer, market):
         orchestrator.register_agent(agent)
@@ -77,6 +88,8 @@ def register(
         "ledger": ledger,
         "optimizer": optimizer,
         "market_spectator": market,
+        "procurement": procurement,
+        "approval_handlers": handlers,
         "mock_forecaster": None,
     }
 

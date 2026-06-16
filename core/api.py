@@ -157,6 +157,10 @@ class AppContext:
         self.scenarios: Optional[ScenarioEngine] = None
         self.hub: WebSocketHub = WebSocketHub()
         self.loop_task: Optional[asyncio.Task] = None
+        # Per-track component dicts returned by each track's register(), e.g.
+        # ctx.tracks["track_b"]["market_spectator"] — used by REST endpoints
+        # that need to call into a track's agents (e.g. the Negotiate button).
+        self.tracks: Dict[str, Dict[str, Any]] = {}
 
 
 ctx = AppContext()
@@ -218,6 +222,14 @@ def _bootstrap() -> None:
     calls.set_ws_broadcast(sink)
     calls.attach_approvals(approvals)
 
+    # §14.4 agent-group routing: every signal type fans out to
+    # ``orchestrator.on_signal`` (which dispatches to each registered agent
+    # whose subscribed groups intersect the signal's groups). Wired via the
+    # same generic ``bus.subscribe`` dispatch path used by the call subsystem
+    # / approvals — fires once per genuine new emit, never on a dedup-refresh.
+    for _sig_type in SignalType:
+        bus.subscribe(_sig_type, orchestrator.on_signal)
+
     # Register the §17 triggers core owns: the weather fetch, the POS arrival
     # generator, the approvals-expiry sweep, and the scenario engine.
     weather.register(orchestrator)
@@ -246,6 +258,7 @@ def _bootstrap() -> None:
         llm=llm,
         calls=calls,
         approvals=approvals,
+        ws_broadcast=sink,
     )
 
     ctx.bus = bus
@@ -286,7 +299,7 @@ def _register_tracks(demo_mode: str, **ctx_kwargs: Any) -> None:
             logger.info("%s.agents has no register() yet — skipping", pkg_name)
             continue
         try:
-            register(demo_mode=demo_mode, **ctx_kwargs)
+            ctx.tracks[pkg_name] = register(demo_mode=demo_mode, **ctx_kwargs) or {}
         except Exception:  # noqa: BLE001 — isolate track wiring failures.
             logger.exception("%s.agents.register failed", pkg_name)
 
@@ -594,10 +607,12 @@ def seed_generate(body: GenerateBody) -> Dict[str, Any]:
 # ===========================================================================
 
 CRUD_RESOURCES = {
+    "ingredients": models.Ingredient,
     "menu": models.MenuItem,
     "recipes": models.Recipe,
     "staff": models.Staff,
     "suppliers": models.Supplier,
+    "supplier-catalog": models.SupplierCatalog,
     "inventory": models.InventoryLevel,
     "competitors": models.Competitor,
     "reviews": models.Review,
@@ -792,6 +807,30 @@ def read_purchase_orders(db_session: Any = Depends(db.get_db)) -> List[Dict[str,
     return [_row_to_dict(r) for r in db_session.query(models.PurchaseOrder).all()]
 
 
+@app.get("/api/inventory/lots")
+def read_inventory_lots(
+    ingredient_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None),
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    query = db_session.query(models.InventoryLot)
+    if ingredient_id is not None:
+        query = query.filter(models.InventoryLot.ingredient_id == ingredient_id)
+    if status is not None:
+        query = query.filter(models.InventoryLot.status == status)
+    return [_row_to_dict(r) for r in query.order_by(models.InventoryLot.expiry_date.asc()).all()]
+
+
+@app.get("/api/promotions")
+def read_promotions(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
+    return [_row_to_dict(r) for r in db_session.query(models.Promotion).order_by(models.Promotion.sim_time.asc()).all()]
+
+
+@app.get("/api/negotiations")
+def read_negotiations(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
+    return [_row_to_dict(r) for r in db_session.query(models.Negotiation).order_by(models.Negotiation.sim_time.asc()).all()]
+
+
 @app.get("/api/competitor-intel")
 def read_competitor_intel(
     competitor_id: Optional[int] = Query(None),
@@ -863,6 +902,23 @@ def call_end(call_id: int) -> Dict[str, Any]:
         session.close()
     outcome = ctx.calls.end_call(call_id)
     return {"call_id": call_id, "outcome": outcome}
+
+
+class NegotiateBody(BaseModel):
+    supplier_id: int
+    ingredient_id: int
+
+
+@app.post("/api/market/negotiate")
+def market_negotiate(body: NegotiateBody) -> Dict[str, Any]:
+    """Presenter-triggered negotiation (SupplierEditor's "Negotiate" button,
+    02 §B6) — routes into Track B's Market Spectator, which creates the
+    approval-gated outbound call (§8.2)."""
+    market = (ctx.tracks.get("track_b") or {}).get("market_spectator")
+    if market is None:
+        raise HTTPException(status_code=503, detail="Market Spectator not active")
+    market.negotiate(body.supplier_id, body.ingredient_id)
+    return {"supplier_id": body.supplier_id, "ingredient_id": body.ingredient_id, "requested": True}
 
 
 # ===========================================================================
