@@ -84,13 +84,13 @@ Every cross-track signal (marked → in §15) MUST have, in the **consuming** tr
 | Frontend | **React 18 + Vite + TypeScript + Tailwind** | dashboards, demo controls, voice |
 | Charts | **Recharts** | forecast/inventory/velocity |
 | Voice STT/TTS | **Browser Web Speech API** | `SpeechRecognition` + `speechSynthesis`; text fallback always present |
-| LLM | **Gemini 2.x Flash (primary) → Groq → OpenRouter → canned** | free tiers; see §13 |
+| LLM | **Gemini 3.1 Flash-Lite via google-genai (primary) -> Groq -> OpenRouter -> canned** | free tiers; see §13 |
 | Weather | external HTTP (impl picks; suggest **Open-Meteo**, no key) | usage decided in §9/§18.5 |
 | Scheduling | **in-process async loop bound to the sim clock** | no external scheduler |
-| Python deps | fastapi, uvicorn, sqlalchemy, pydantic, httpx, google-genai (or REST), python-dotenv | |
+| Python deps | fastapi, uvicorn, sqlalchemy, pydantic, httpx, google-genai, python-dotenv | |
 | **Containerization** | **Docker + Docker Compose** | `docker compose up` runs backend+frontend on any machine — see §26 |
 
-Env vars: `GEMINI_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `WEATHER_API_BASE` (optional), `DEMO_MODE`.
+Env vars: `GEMINI_API_KEY`, `GEMINI_MODEL` (default `gemini-3.1-flash-lite`), `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `WEATHER_API_BASE` (optional), `DEMO_MODE`.
 
 ---
 
@@ -293,7 +293,7 @@ ingredients → menu_items → recipes/recipe_lines → batch_definitions → st
 
 `LLMProvider.complete(messages, json_schema=None, max_tokens=...) -> str | dict`.
 
-- **Fallback chain:** Gemini 2.x Flash → Groq (llama-3.3-70b) → OpenRouter free model → **canned response**. Try next on 429/5xx/timeout.
+- **Fallback chain:** Gemini 3.1 Flash-Lite via the `google-genai` SDK -> Groq (llama-3.3-70b) -> OpenRouter free model -> **canned response**. Try next on 429/5xx/timeout.
 - **Caching:** `cache_key = sha256(model + messages + schema)`; in-process dict (and optional on-disk) so repeated demo runs don't burn quota. TTL = process lifetime.
 - **Backoff:** exponential, 3 retries per provider, base 1.5 s; **`sleep(2s)` between successive agent LLM calls** (free-tier RPM protection).
 - **Prompt hygiene:** keep system prompts short; **never** concatenate full conversation history needlessly (Groq 429s come from tokens-per-minute on long prompts).

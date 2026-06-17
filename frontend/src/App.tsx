@@ -86,14 +86,26 @@ export default function App() {
 
   useEffect(() => {
     wsClient.connect();
+    const hydrateSim = () => {
+      apiGet<Partial<SimState>>("/api/sim/state")
+        .then((s) => actions.setSimState(s))
+        .catch(() => undefined);
+    };
+    const hydrateWeather = () => {
+      apiGet<Weather>("/api/weather")
+        .then((w) => actions.setWeather(w))
+        .catch(() => undefined);
+    };
     // Hydrate from REST so the bar is populated before the first WS tick.
-    apiGet<Partial<SimState>>("/api/sim/state")
-      .then((s) => actions.setSimState(s))
-      .catch(() => undefined);
-    apiGet<Weather>("/api/weather")
-      .then((w) => actions.setWeather(w))
-      .catch(() => undefined);
-    return () => wsClient.close();
+    // Poll sim state as a fallback because dev WS setup can briefly reconnect.
+    hydrateSim();
+    hydrateWeather();
+    const simPoll = setInterval(hydrateSim, 1000);
+    const weatherPoll = setInterval(hydrateWeather, 10000);
+    return () => {
+      clearInterval(simPoll);
+      clearInterval(weatherPoll);
+    };
   }, []);
 
   return (

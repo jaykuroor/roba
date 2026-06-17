@@ -39,6 +39,7 @@ class CompetitorAgent(BaseAgent):
 
     def passive_monitor(self) -> List[Dict[str, Any]]:
         updates: List[Dict[str, Any]] = []
+        after_commit: List[tuple[str, Any]] = []
         session = self.db_session_factory()
         try:
             competitors = session.query(Competitor).order_by(Competitor.id.asc()).all()
@@ -55,14 +56,20 @@ class CompetitorAgent(BaseAgent):
                     "offers_changed": False,
                     "summary": summary,
                 }
-                self.emit(
-                    SignalType.COMPETITOR_UPDATE,
-                    payload,
-                    dedup_key=f"competitor:{competitor.id}",
+                after_commit.append(
+                    (
+                        "emit",
+                        (
+                            SignalType.COMPETITOR_UPDATE,
+                            payload,
+                            {"dedup_key": f"competitor:{competitor.id}"},
+                        ),
+                    )
                 )
                 updates.append(payload)
         finally:
             session.close()
+        self._run_after_commit(after_commit)
         self._broadcast("competitor_update", {"updates": updates})
         return updates
 
@@ -175,6 +182,12 @@ class CompetitorAgent(BaseAgent):
     def _broadcast(self, event: str, payload: Dict[str, Any]) -> None:
         if self.ws_broadcast is not None:
             self.ws_broadcast(event, payload)
+
+    def _run_after_commit(self, actions: List[tuple[str, Any]]) -> None:
+        for kind, payload in actions:
+            if kind == "emit":
+                signal_type, signal_payload, kwargs = payload
+                self.emit(signal_type, signal_payload, **kwargs)
 
     @staticmethod
     def _competitor_to_dict(row: Competitor) -> Dict[str, Any]:

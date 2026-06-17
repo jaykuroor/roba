@@ -86,6 +86,7 @@ export function ForecastDashboard() {
             <tr>
               <th className="px-3 py-2">Item</th>
               <th className="px-3 py-2">Window</th>
+              <th className="px-3 py-2">Generated</th>
               <th className="px-3 py-2">Baseline</th>
               <th className="px-3 py-2">Forecast</th>
               <th className="px-3 py-2">Why</th>
@@ -96,6 +97,7 @@ export function ForecastDashboard() {
               <tr key={forecast.id} className="border-t border-muted/70">
                 <td className="px-3 py-3 font-medium">{itemName(data, forecast.menu_item_id)}</td>
                 <td className="px-3 py-3 text-text/65">{forecast.daypart} · {formatSimTime(forecast.window.start)}</td>
+                <td className="px-3 py-3 text-text/65">{formatSimTime(forecast.generated_at)}</td>
                 <td className="px-3 py-3">{formatQty(forecast.baseline_qty)}</td>
                 <td className="px-3 py-3 font-semibold text-accent">{formatQty(forecast.forecast_qty)}</td>
                 <td className="px-3 py-3">

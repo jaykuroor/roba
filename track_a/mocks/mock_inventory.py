@@ -49,6 +49,7 @@ class MockInventory:
                 self.disabled_at = None
             return
 
+        actions = []
         session = self.db_session_factory()
         try:
             item = session.query(MenuItem).filter(MenuItem.active == 1).order_by(MenuItem.id.asc()).first()
@@ -56,42 +57,54 @@ class MockInventory:
                 return
             ingredient_id = self._first_ingredient_id(session, item.id)
             catalog = session.query(SupplierCatalog).filter(SupplierCatalog.ingredient_id == ingredient_id).first() if ingredient_id else None
-            self.disabled_item_id = item.id
+            item_id = item.id
+            self.disabled_item_id = item_id
             self.disabled_at = now
-            self.bus.emit(
-                SignalType.MENU_TOGGLE,
-                {"menu_item_id": item.id, "action": "disable", "reason": "mock low stock"},
-                source="track_a.mock_inventory",
-                dedup_key=f"mock-menu:{item.id}",
+            actions.append(
+                (
+                    SignalType.MENU_TOGGLE,
+                    {"menu_item_id": item_id, "action": "disable", "reason": "mock low stock"},
+                    {"dedup_key": f"mock-menu:{item_id}"},
+                )
             )
             if ingredient_id is not None:
-                self.bus.emit(
-                    SignalType.STOCKOUT_RISK,
-                    {
-                        "ingredient_id": ingredient_id,
-                        "on_hand": 1.0,
-                        "projected_runout": now + 1800.0,
-                        "affected_items": [item.id],
-                    },
-                    source="track_a.mock_inventory",
-                    dedup_key=f"mock-stockout:{ingredient_id}",
+                actions.append(
+                    (
+                        SignalType.STOCKOUT_RISK,
+                        {
+                            "ingredient_id": ingredient_id,
+                            "on_hand": 1.0,
+                            "projected_runout": now + 1800.0,
+                            "affected_items": [item_id],
+                        },
+                        {"dedup_key": f"mock-stockout:{ingredient_id}"},
+                    )
                 )
             if catalog is not None:
-                self.bus.emit(
-                    SignalType.SUPPLIER_PRICE_UPDATE,
-                    {
-                        "supplier_id": catalog.supplier_id,
-                        "ingredient_id": catalog.ingredient_id,
-                        "old_price": float(catalog.current_price or 0.0),
-                        "new_price": round(float(catalog.current_price or 0.0) * 1.08, 4),
-                        "availability": "limited",
-                        "via": "market",
-                    },
-                    source="track_a.mock_inventory",
-                    dedup_key=f"mock-price:{catalog.id}",
+                current_price = float(catalog.current_price or 0.0)
+                actions.append(
+                    (
+                        SignalType.SUPPLIER_PRICE_UPDATE,
+                        {
+                            "supplier_id": catalog.supplier_id,
+                            "ingredient_id": catalog.ingredient_id,
+                            "old_price": current_price,
+                            "new_price": round(current_price * 1.08, 4),
+                            "availability": "limited",
+                            "via": "market",
+                        },
+                        {"dedup_key": f"mock-price:{catalog.id}"},
+                    )
                 )
         finally:
             session.close()
+        for signal_type, payload, kwargs in actions:
+            self.bus.emit(
+                signal_type,
+                payload,
+                source="track_a.mock_inventory",
+                **kwargs,
+            )
 
     @staticmethod
     def _first_ingredient_id(session: Any, menu_item_id: int) -> Optional[int]:

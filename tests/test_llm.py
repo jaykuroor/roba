@@ -2,6 +2,7 @@
 
 import pytest
 
+from core import config
 from core.llm import CANNED_NOTE, LLMProvider
 
 
@@ -12,6 +13,10 @@ class _FakeResp:
 
     def json(self):
         return self._payload
+
+
+class _FakeGeminiResponse:
+    text = "gemini hello"
 
 
 def test_canned_fallback_without_keys(monkeypatch):
@@ -55,6 +60,76 @@ def test_cache_single_http_request(monkeypatch):
     assert first == "hello world"
     assert second == "hello world"
     assert calls["n"] == 1  # second call served from cache
+
+
+def test_gemini_uses_google_genai_sdk_and_default_model(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    seen = {}
+
+    def fake_generate(client, model, contents, gen_config):
+        seen["client"] = client
+        seen["model"] = model
+        seen["contents"] = contents
+        seen["config"] = gen_config
+        return _FakeGeminiResponse()
+
+    llm = LLMProvider(fallback=["gemini", "canned"])
+    llm._sleep = lambda *_a, **_k: None
+    monkeypatch.setattr(llm, "_get_gemini_client", lambda: object())
+    monkeypatch.setattr(llm, "_gemini_generate", fake_generate)
+
+    result = llm.complete(
+        [
+            {"role": "system", "content": "Be short."},
+            {"role": "user", "content": "Say hi."},
+        ],
+        use_site="call_supplier",
+    )
+
+    assert result == "gemini hello"
+    assert seen["model"] == config.GEMINI_MODEL == "gemini-3.1-flash-lite"
+    assert seen["contents"]
+    assert llm.request_count == 0  # monkeypatched seam did not perform a request
+
+
+def test_gemini_json_config_carries_schema(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    seen = {}
+
+    def fake_generate(client, model, contents, gen_config):
+        seen["config"] = gen_config
+        return type(
+            "Resp",
+            (),
+            {"text": "{\"intent\":\"set_leave\",\"confidence\":0.8,\"tags\":[]}"},
+        )()
+
+    llm = LLMProvider(fallback=["gemini", "canned"])
+    llm._sleep = lambda *_a, **_k: None
+    monkeypatch.setattr(llm, "_get_gemini_client", lambda: object())
+    monkeypatch.setattr(llm, "_gemini_generate", fake_generate)
+
+    parsed = llm.complete(
+        [{"role": "user", "content": "Priya is off tomorrow"}],
+        json_schema=SCHEMA,
+        use_site="voice",
+    )
+
+    cfg = seen["config"]
+    mime = getattr(cfg, "response_mime_type", None)
+    schema = getattr(cfg, "response_json_schema", None)
+    if isinstance(cfg, dict):
+        mime = cfg.get("response_mime_type")
+        schema = cfg.get("response_json_schema")
+    assert parsed["intent"] == "set_leave"
+    assert mime == "application/json"
+    assert schema == SCHEMA
 
 
 def test_generation_use_site_never_cached(monkeypatch):

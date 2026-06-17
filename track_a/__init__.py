@@ -38,7 +38,9 @@ def bootstrap_track_a(
     ws_broadcast: Any = None,
 ) -> Dict[str, Any]:
     """Wire Track A agents into core without crossing track boundaries."""
-    forecaster = DemandForecaster(bus, db_session_factory, formatter, ws_broadcast)
+    forecaster = DemandForecaster(
+        bus, db_session_factory, formatter, ws_broadcast, llm=llm
+    )
     competitor = CompetitorAgent(bus, db_session_factory, calls, ws_broadcast)
     review = ReviewAgent(bus, db_session_factory, llm, ws_broadcast)
     staff = StaffAgent(bus, db_session_factory, ws_broadcast)

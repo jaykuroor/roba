@@ -44,6 +44,7 @@ class StaffAgent(BaseAgent):
         day = int(now // SECONDS_PER_DAY)
         daypart = current_daypart(now)
         emitted: List[Dict[str, Any]] = []
+        after_commit: List[tuple[str, Any]] = []
         session = self.db_session_factory()
         try:
             stations = session.query(Station.id, Station.name).order_by(Station.id.asc()).all()
@@ -75,20 +76,30 @@ class StaffAgent(BaseAgent):
                     "affected_items": [] if covered else item_ids,
                     "shortfall": 0.0 if covered else 1.0,
                 }
-                self.emit(
-                    SignalType.STAFF_COVERAGE,
-                    payload,
-                    ttl=shift_ttl(now),
-                    dedup_key=f"coverage:{station_id}",
-                )
-                self.log_event(
-                    "staff",
-                    f"{station_name} coverage {'restored' if covered else 'missing'}",
-                    {**payload, "daypart": daypart, "available_staff": available},
+                after_commit.extend(
+                    [
+                        (
+                            "emit",
+                            (
+                                SignalType.STAFF_COVERAGE,
+                                payload,
+                                {"ttl": shift_ttl(now), "dedup_key": f"coverage:{station_id}"},
+                            ),
+                        ),
+                        (
+                            "log",
+                            (
+                                "staff",
+                                f"{station_name} coverage {'restored' if covered else 'missing'}",
+                                {**payload, "daypart": daypart, "available_staff": available},
+                            ),
+                        ),
+                    ]
                 )
                 emitted.append({**payload, "station": station_name, "available_staff": available})
         finally:
             session.close()
+        self._run_after_commit(after_commit)
         self._broadcast("staff_coverage", {"coverage": emitted})
         return emitted
 
@@ -153,6 +164,15 @@ class StaffAgent(BaseAgent):
     def _broadcast(self, event: str, payload: Dict[str, Any]) -> None:
         if self.ws_broadcast is not None:
             self.ws_broadcast(event, payload)
+
+    def _run_after_commit(self, actions: List[tuple[str, Any]]) -> None:
+        for kind, payload in actions:
+            if kind == "emit":
+                signal_type, signal_payload, kwargs = payload
+                self.emit(signal_type, signal_payload, **kwargs)
+            elif kind == "log":
+                category, summary, detail = payload
+                self.log_event(category, summary, detail)
 
 
 def shift_ttl(now: float) -> float:

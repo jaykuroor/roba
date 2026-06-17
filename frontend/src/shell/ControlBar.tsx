@@ -24,7 +24,13 @@ import {
   useWeather,
   useWsConnected,
 } from "../store";
-import type { Scenario, SimState, SimStatus, WeatherCondition } from "../types";
+import type {
+  Scenario,
+  SimSettings,
+  SimState,
+  SimStatus,
+  WeatherCondition,
+} from "../types";
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8];
 const CONDITIONS: WeatherCondition[] = ["clear", "clouds", "rain", "storm", "snow"];
@@ -586,8 +592,19 @@ function SeedPicker() {
 function VelocitySlider() {
   const [velocity, setVelocity] = useState(1.0);
 
-  function commit(value: number) {
-    apiPatch("/api/sim/pos", { velocity: value }).catch(() => undefined);
+  useEffect(() => {
+    apiGet<SimSettings>("/api/sim/pos")
+      .then((settings) => setVelocity(settings.velocity ?? 1.0))
+      .catch(() => undefined);
+  }, []);
+
+  async function commit(value: number) {
+    try {
+      await apiPatch("/api/sim/pos", { velocity: value });
+      await apiPost("/api/track-a/forecast/run").catch(() => undefined);
+    } catch {
+      /* ignore; the slider remains optimistic until the next settings read */
+    }
   }
 
   return (
@@ -599,9 +616,9 @@ function VelocitySlider() {
         step={0.1}
         value={velocity}
         onChange={(e) => setVelocity(Number(e.target.value))}
-        onMouseUp={() => commit(velocity)}
-        onTouchEnd={() => commit(velocity)}
-        onKeyUp={() => commit(velocity)}
+        onMouseUp={() => void commit(velocity)}
+        onTouchEnd={() => void commit(velocity)}
+        onKeyUp={() => void commit(velocity)}
         className="w-28 accent-accent"
       />
       <span className="w-10 text-sm tabular-nums text-text">{velocity.toFixed(1)}×</span>

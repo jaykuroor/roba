@@ -60,6 +60,7 @@ COMPETITOR_RADIUS_KM = 3
 COMPETITOR_CALL_TARGETS = 2
 
 # llm
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 LLM_FALLBACK = ["gemini", "groq", "openrouter", "canned"]
 LLM_RETRIES = 3
 LLM_BACKOFF_BASE_S = 1.5

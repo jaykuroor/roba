@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from core import config
 from core.agent_base import BaseAgent
 from core.clock import DAY_CLOSE_OFFSET, DAY_OPEN_OFFSET, SECONDS_PER_DAY
+from core.llm import CANNED_NOTE
 from core.models import (
     Batch,
     BatchDefinition,
@@ -25,6 +26,7 @@ from core.models import (
     SimSettings,
     WeatherLog,
 )
+from core.pos_simulator import active_injections
 from core.signals import SignalType
 
 
@@ -48,10 +50,12 @@ class DemandForecaster(BaseAgent):
         db_session_factory: Callable[[], Any],
         formatter: Optional[Any] = None,
         ws_broadcast: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+        llm: Optional[Any] = None,
     ):
         super().__init__(bus, db_session_factory, "track_a.forecaster")
         self.formatter = formatter
         self.ws_broadcast = ws_broadcast
+        self.llm = llm
         self.subscribe(["forecasting"])
 
     def register(self, orchestrator: Any) -> None:
@@ -87,6 +91,8 @@ class DemandForecaster(BaseAgent):
         now = float(self.bus.sim_time)
         daypart, window = current_window(now)
         rows: List[Forecast] = []
+        live = self.bus.live()
+        after_commit: List[Tuple[str, Any]] = []
 
         session = self.db_session_factory()
         try:
@@ -96,13 +102,17 @@ class DemandForecaster(BaseAgent):
                 .order_by(MenuItem.id.asc())
                 .all()
             )
-            live = self.bus.live()
             for item in items:
                 if self._is_disabled_by_signal(item.id, live):
-                    self.log_event(
-                        "forecast",
-                        f"Skipped {item.name}: menu disabled by inventory signal",
-                        {"menu_item_id": item.id, "trigger": trigger_reason},
+                    after_commit.append(
+                        (
+                            "log",
+                            (
+                                "forecast",
+                                f"Skipped {item.name}: menu disabled by inventory signal",
+                                {"menu_item_id": item.id, "trigger": trigger_reason},
+                            ),
+                        )
                     )
                     continue
 
@@ -134,9 +144,7 @@ class DemandForecaster(BaseAgent):
                 item_payload = self._item_to_dict(item)
                 rows.append(forecast)
 
-                self.emit(
-                    SignalType.DEMAND_FORECAST,
-                    {
+                forecast_payload = {
                         "menu_item_id": item_id,
                         "window": window,
                         "daypart": daypart,
@@ -144,25 +152,16 @@ class DemandForecaster(BaseAgent):
                         "baseline": round(baseline, 2),
                         "multipliers": multipliers,
                         "confidence": confidence,
-                    },
-                    ttl=max(window["end"] - now, 1.0),
-                    dedup_key=f"forecast:{item_id}:{int(window['start'])}",
-                )
-                self.log_event(
-                    "forecast",
-                    f"Forecast {item_name}: {qty:g} for {daypart}",
-                    {
+                    }
+                log_detail = {
                         "menu_item_id": item_id,
                         "baseline": round(baseline, 2),
                         "multipliers": multipliers,
                         "confidence": confidence,
                         "trigger": trigger_reason,
-                    },
-                )
-                self._broadcast(
-                    "forecast_updated",
-                    {
-                        "forecast": {
+                    }
+                ws_payload = {
+                    "forecast": {
                             "id": forecast_id,
                             "menu_item_id": item_id,
                             "window": window,
@@ -174,41 +173,66 @@ class DemandForecaster(BaseAgent):
                             "generated_at": now,
                             "trigger_reason": trigger_reason,
                         },
-                        "item": item_payload,
-                    },
+                    "item": item_payload,
+                }
+                after_commit.extend(
+                    [
+                        (
+                            "emit",
+                            (
+                                SignalType.DEMAND_FORECAST,
+                                forecast_payload,
+                                {
+                                    "ttl": max(window["end"] - now, 1.0),
+                                    "dedup_key": f"forecast:{item_id}:{int(window['start'])}",
+                                },
+                            ),
+                        ),
+                        (
+                            "log",
+                            (
+                                "forecast",
+                                f"Forecast {item_name}: {qty:g} for {daypart}",
+                                log_detail,
+                            ),
+                        ),
+                        ("broadcast", ("forecast_updated", ws_payload)),
+                    ]
                 )
 
             session.commit()
         finally:
             session.close()
 
+        self._run_after_commit(after_commit)
         self.decide_batches(trigger_reason)
         return rows
 
     def baseline_qty(self, session: Any, item_id: int, daypart: str, now: float) -> float:
         """Baseline fallback chain: same daypart+dow, daypart, then seed mix."""
+        _current_daypart, window = current_window(now)
+        window_fraction = _window_fraction(daypart, window)
         current_dow = int(now // SECONDS_PER_DAY) % 7
         same_dow = self._history_average(session, item_id, daypart, current_dow)
         if same_dow > 0:
-            return same_dow
+            return round(same_dow * window_fraction, 2)
 
         any_dow = self._history_average(session, item_id, daypart, None)
         if any_dow > 0:
-            return any_dow
+            return round(any_dow * window_fraction, 2)
 
-        settings = session.get(SimSettings, 1)
-        weights = dict(getattr(settings, "dish_mix_weights", None) or {})
-        total_weight = sum(float(v) for v in weights.values()) or 1.0
-        item_weight = float(weights.get(str(item_id), 1.0))
-        base = float(getattr(settings, "base_orders_per_day", config.BASE_ORDERS_PER_DAY) or 0.0)
-        daypart_weight = DAYPART_SECONDS.get(daypart, ("", "", 0.2))[2]
-        return max(1.0, base * item_weight / total_weight * daypart_weight)
+        item = session.get(MenuItem, item_id)
+        if item is None:
+            return 0.0
+        projected = self._settings_projected_qty(session, item, daypart, now)
+        return max(1.0, projected)
 
     def decide_batches(self, trigger_reason: str = "manual") -> List[Batch]:
         now = float(self.bus.sim_time)
         daypart, window = current_window(now)
         live = self.bus.live()
         rows: List[Batch] = []
+        after_commit: List[Tuple[str, Any]] = []
 
         session = self.db_session_factory()
         try:
@@ -256,24 +280,17 @@ class DemandForecaster(BaseAgent):
                 batch_id = row.id
                 rows.append(row)
 
-                self.emit(
-                    SignalType.BATCH_DECISION,
-                    {
+                signal_payload = {
                         "batch_definition_id": definition.id,
                         "menu_item_id": item.id,
                         "serve_window": window,
                         "decision": decision,
                         "qty": planned,
                         "by": "agent",
-                    },
-                    dedup_key=f"batch:{definition.id}:{int(window['start'])}:{decision}",
-                )
+                    }
                 reason_text = ", ".join(reasons)
                 summary = f"{decision} {planned:g} {item.name}: {reason_text}"
-                self.log_event(
-                    "batch",
-                    summary,
-                    {
+                log_detail = {
                         "menu_item_id": item.id,
                         "batch_definition_id": definition.id,
                         "forecast_qty": f_qty,
@@ -281,12 +298,9 @@ class DemandForecaster(BaseAgent):
                         "planned_qty": planned,
                         "reasons": reasons,
                         "trigger": trigger_reason,
-                    },
-                )
-                self._broadcast(
-                    "batch_decided",
-                    {
-                        "batch": {
+                    }
+                ws_payload = {
+                    "batch": {
                             "id": batch_id,
                             "batch_definition_id": definition.id,
                             "menu_item_id": item.id,
@@ -297,18 +311,95 @@ class DemandForecaster(BaseAgent):
                             "status": "decided",
                             "by": "agent",
                         },
-                        "reason": reason_text,
-                    },
+                    "reason": reason_text,
+                }
+                after_commit.extend(
+                    [
+                        (
+                            "emit",
+                            (
+                                SignalType.BATCH_DECISION,
+                                signal_payload,
+                                {
+                                    "dedup_key": f"batch:{definition.id}:{int(window['start'])}:{decision}",
+                                },
+                            ),
+                        ),
+                        ("log", ("batch", summary, log_detail)),
+                        ("broadcast", ("batch_decided", ws_payload)),
+                    ]
                 )
             session.commit()
         finally:
             session.close()
+        self._run_after_commit(after_commit)
         return rows
 
     def generate_suggestions(self) -> Dict[str, Any]:
         result = {"suggestions": [], "summary": "no_change"}
-        self.log_event("forecast", "Batch suggestion scan: no change", result)
+        if self.llm is not None:
+            context = self._suggestion_context()
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You advise a restaurant demand forecaster. Return JSON "
+                        "with summary and suggestions. Suggestions are optional "
+                        "non-binding actions about add/remove/retime/resize "
+                        "batches based on recent forecasts and batch results."
+                    ),
+                },
+                {"role": "user", "content": str(context)},
+            ]
+            schema = {
+                "type": "object",
+                "properties": {
+                    "suggestions": {"type": "array"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["suggestions", "summary"],
+            }
+            parsed = self.llm.complete(
+                messages,
+                json_schema=schema,
+                max_tokens=500,
+                use_site="forecaster_suggestion",
+            )
+            if isinstance(parsed, dict) and parsed.get("note") != CANNED_NOTE:
+                suggestions = parsed.get("suggestions")
+                result = {
+                    "suggestions": suggestions if isinstance(suggestions, list) else [],
+                    "summary": str(parsed.get("summary") or "no_change"),
+                }
+        self.log_event(
+            "forecast",
+            f"Batch suggestion scan: {result.get('summary', 'no_change')}",
+            result,
+        )
         return result
+
+    def _suggestion_context(self) -> Dict[str, Any]:
+        session = self.db_session_factory()
+        try:
+            forecasts = (
+                session.query(Forecast)
+                .order_by(Forecast.generated_at.desc())
+                .limit(20)
+                .all()
+            )
+            batches = (
+                session.query(Batch)
+                .order_by(Batch.decided_at.desc())
+                .limit(20)
+                .all()
+            )
+            return {
+                "sim_time": float(self.bus.sim_time),
+                "forecasts": [self._forecast_to_dict(row) for row in forecasts],
+                "batches": [self._batch_to_dict(row) for row in batches],
+            }
+        finally:
+            session.close()
 
     def _history_average(
         self,
@@ -346,6 +437,7 @@ class DemandForecaster(BaseAgent):
         live: Iterable[Signal],
     ) -> Dict[str, float]:
         return {
+            "settings_demand": round(self._settings_multiplier(session, item, baseline, daypart), 3),
             "event": round(self._event_multiplier(item, window, live), 3),
             "competitor": round(self._competitor_multiplier(item, live), 3),
             "review": round(self._review_multiplier(item, live), 3),
@@ -353,6 +445,93 @@ class DemandForecaster(BaseAgent):
             "weather": round(self._weather_multiplier(session, item), 3),
             "recent_velocity": round(self._velocity_multiplier(item.id, baseline, daypart), 3),
         }
+
+    def _settings_multiplier(
+        self,
+        session: Any,
+        item: MenuItem,
+        baseline: float,
+        daypart: str,
+    ) -> float:
+        """Make live sim_settings visible even when history supplies baseline.
+
+        Historical order lines remain the explainable baseline, while the
+        editable simulation controls act as a demand-plan multiplier. This keeps
+        the forecast dashboard responsive to the POS settings drawer instead of
+        hiding those edits behind already-seeded history.
+        """
+        if baseline <= 0:
+            return 1.0
+        projected = self._settings_projected_qty(session, item, daypart, float(self.bus.sim_time))
+        if projected <= 0:
+            return 0.0
+        return projected / baseline
+
+    def _settings_projected_qty(
+        self,
+        session: Any,
+        item: MenuItem,
+        daypart: str,
+        now: float,
+    ) -> float:
+        settings = session.get(SimSettings, 1)
+        base = float(getattr(settings, "base_orders_per_day", None) or config.BASE_ORDERS_PER_DAY)
+        velocity = float(getattr(settings, "velocity", None) or 1.0)
+        daypart_weight = self._settings_daypart_weight(settings, daypart)
+        _current_daypart, window = current_window(now)
+        window_fraction = _window_fraction(daypart, window)
+
+        weights = self._settings_item_weights(session, settings, now)
+        total_weight = sum(weights.values())
+        item_weight = weights.get(int(item.id), 0.0)
+        share = item_weight / total_weight if total_weight > 0 else 0.0
+
+        for inj in active_injections(getattr(settings, "anomaly_injections", None), now):
+            mult = inj.get("velocity_mult")
+            if mult is not None:
+                velocity *= float(mult)
+
+        return max(0.0, base * velocity * share * daypart_weight * window_fraction)
+
+    @staticmethod
+    def _settings_daypart_weight(settings: Optional[SimSettings], daypart: str) -> float:
+        curve = getattr(settings, "daypart_curve", None) or {}
+        default = DAYPART_SECONDS.get(daypart, ("", "", 0.2))[2]
+        return float(curve.get(daypart, default))
+
+    @staticmethod
+    def _settings_item_weights(
+        session: Any,
+        settings: Optional[SimSettings],
+        now: float,
+    ) -> Dict[int, float]:
+        active_items = session.query(MenuItem).filter(MenuItem.active == 1).all()
+        active_ids = {int(item.id) for item in active_items}
+        raw_weights = getattr(settings, "dish_mix_weights", None) or {}
+
+        weights: Dict[int, float] = {}
+        for raw_id, raw_weight in raw_weights.items():
+            try:
+                item_id = int(raw_id)
+                weight = float(raw_weight)
+            except (TypeError, ValueError):
+                continue
+            if item_id in active_ids and weight > 0:
+                weights[item_id] = weight
+
+        if not weights:
+            weights = {item_id: 1.0 for item_id in active_ids}
+
+        for inj in active_injections(getattr(settings, "anomaly_injections", None), now):
+            skew = inj.get("dish_mix_skew")
+            if not isinstance(skew, dict):
+                continue
+            for item_id in list(weights):
+                factor = skew.get(str(item_id))
+                if factor is not None:
+                    weights[item_id] *= float(factor)
+
+        return weights
 
     def _event_multiplier(self, item: MenuItem, window: Dict[str, float], live: Iterable[Signal]) -> float:
         mult = 1.0
@@ -486,6 +665,18 @@ class DemandForecaster(BaseAgent):
         if self.ws_broadcast is not None:
             self.ws_broadcast(event, payload)
 
+    def _run_after_commit(self, actions: List[Tuple[str, Any]]) -> None:
+        for kind, payload in actions:
+            if kind == "emit":
+                signal_type, signal_payload, kwargs = payload
+                self.emit(signal_type, signal_payload, **kwargs)
+            elif kind == "log":
+                category, summary, detail = payload
+                self.log_event(category, summary, detail)
+            elif kind == "broadcast":
+                event, ws_payload = payload
+                self._broadcast(event, ws_payload)
+
     @staticmethod
     def _forecast_to_dict(row: Forecast) -> Dict[str, Any]:
         return {col.key: getattr(row, col.key) for col in row.__table__.columns}
@@ -516,6 +707,13 @@ def current_window(now: float) -> Tuple[str, Dict[str, float]]:
     if window_end <= window_start:
         window_end = day * SECONDS_PER_DAY + DAY_CLOSE_OFFSET
     return daypart, {"start": float(window_start), "end": float(window_end)}
+
+
+def _window_fraction(daypart: str, window: Dict[str, float]) -> float:
+    start, end, _weight = DAYPART_SECONDS[daypart]
+    daypart_len = max(float(end - start), 1.0)
+    window_len = max(float(window.get("end", 0.0)) - float(window.get("start", 0.0)), 0.0)
+    return min(1.0, max(0.0, window_len / daypart_len))
 
 
 def confidence_from(multipliers: Dict[str, float]) -> float:

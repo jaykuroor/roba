@@ -1,9 +1,9 @@
 import { actions } from "./store";
 import type { ApprovalRequest, Call, SimState, Weather } from "./types";
 
-// One WebSocket connection to the backend hub (00 §21). The browser hits the
-// frontend origin and Vite proxies /ws to the backend (00 §26.4), so the URL is
-// always derived from window.location — never a hardcoded host/port.
+// One WebSocket connection to the backend hub (§21). In production this uses
+// same-origin /ws. During local Vite dev, connect directly to the backend
+// because the dev proxy can drop non-tick hub messages on Windows.
 
 type Handler = (payload: Record<string, unknown>) => void;
 
@@ -29,6 +29,23 @@ export class WsClient {
   }
 
   private url(): string {
+    const explicitBackend = import.meta.env.VITE_BACKEND_ORIGIN as string | undefined;
+    const devBackend =
+      window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost"
+        ? "http://127.0.0.1:8000"
+        : undefined;
+    const origin =
+      explicitBackend || (window.location.port === "5173" ? devBackend : undefined);
+
+    if (origin) {
+      const backend = new URL(origin);
+      backend.protocol = backend.protocol === "https:" ? "wss:" : "ws:";
+      backend.pathname = "/ws";
+      backend.search = "";
+      backend.hash = "";
+      return backend.toString();
+    }
+
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     return `${proto}://${window.location.host}/ws`;
   }
@@ -47,10 +64,15 @@ export class WsClient {
     this.socket = socket;
 
     socket.onopen = () => {
+      if (this.socket !== socket) {
+        socket.close();
+        return;
+      }
       actions.setWsConnected(true);
     };
 
     socket.onmessage = (ev: MessageEvent) => {
+      if (this.socket !== socket) return;
       let message: { event?: string; payload?: Record<string, unknown> };
       try {
         message = JSON.parse(ev.data as string);
@@ -62,14 +84,17 @@ export class WsClient {
     };
 
     socket.onclose = () => {
+      if (this.socket !== socket) return;
       actions.setWsConnected(false);
       this.socket = null;
       if (!this.closedByUser) this.scheduleReconnect();
     };
 
     socket.onerror = () => {
-      // Let onclose drive the reconnect; closing here avoids a stuck socket.
-      socket.close();
+      if (this.socket !== socket) return;
+      // Let onclose drive the reconnect. Closing a CONNECTING socket produces
+      // Chrome's "closed before the connection is established" warning.
+      if (socket.readyState === WebSocket.OPEN) socket.close();
     };
   }
 
@@ -93,8 +118,18 @@ export class WsClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.socket?.close();
+    const socket = this.socket;
     this.socket = null;
+    actions.setWsConnected(false);
+    if (!socket) return;
+    if (socket.readyState === WebSocket.CONNECTING) {
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.onopen = () => socket.close();
+      return;
+    }
+    if (socket.readyState === WebSocket.OPEN) socket.close();
   }
 }
 

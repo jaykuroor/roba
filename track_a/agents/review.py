@@ -6,8 +6,28 @@ from collections import Counter
 from typing import Any, Callable, Dict, List, Optional
 
 from core.agent_base import BaseAgent
+from core.llm import CANNED_NOTE
 from core.models import Review, ReviewInsight, Signal
 from core.signals import SignalType
+
+
+REVIEW_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "severity": {"type": "string"},
+        "summary": {"type": "string"},
+        "suggested_action": {"type": "string"},
+        "dish_mentions": {"type": "array"},
+        "sentiment": {"type": "string"},
+    },
+    "required": [
+        "severity",
+        "summary",
+        "suggested_action",
+        "dish_mentions",
+        "sentiment",
+    ],
+}
 
 
 class ReviewAgent(BaseAgent):
@@ -40,6 +60,7 @@ class ReviewAgent(BaseAgent):
     def process_unprocessed(self) -> List[ReviewInsight]:
         rows: List[ReviewInsight] = []
         now = float(self.bus.sim_time)
+        after_commit: List[tuple[str, Any]] = []
         session = self.db_session_factory()
         try:
             reviews = (
@@ -113,19 +134,71 @@ class ReviewAgent(BaseAgent):
                     "dish_mentions": parsed["dish_mentions"],
                 }
                 key = "review:" + (parsed["dish_mentions"][0] if parsed["dish_mentions"] else "general")
-                self.emit(SignalType.REVIEW_INSIGHT, payload, dedup_key=key)
-                self.log_event("review", parsed["summary"], payload)
-                self._broadcast(
-                    "review_insight",
-                    {"insight": insight_payload, "review": review_payload},
+                after_commit.extend(
+                    [
+                        ("emit", (SignalType.REVIEW_INSIGHT, payload, {"dedup_key": key})),
+                        ("log", ("review", parsed["summary"], payload)),
+                        (
+                            "broadcast",
+                            ("review_insight", {"insight": insight_payload, "review": review_payload}),
+                        ),
+                    ]
                 )
             session.commit()
         finally:
             session.close()
+        self._run_after_commit(after_commit)
         return rows
 
+    def _analyze(self, review: Dict[str, Any]) -> Dict[str, Any]:
+        if self.llm is not None:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Analyze one restaurant review. Return JSON with "
+                        "severity low|medium|high, summary, suggested_action, "
+                        "dish_mentions, and sentiment positive|neutral|negative."
+                    ),
+                },
+                {"role": "user", "content": str(review)},
+            ]
+            result = self.llm.complete(
+                messages,
+                json_schema=REVIEW_SCHEMA,
+                max_tokens=400,
+                use_site="review",
+            )
+            if isinstance(result, dict) and result.get("note") != CANNED_NOTE:
+                return self._normalise_llm_analysis(result, review)
+        return self._deterministic_analysis(review)
+
     @staticmethod
-    def _analyze(review: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalise_llm_analysis(
+        result: Dict[str, Any], review: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        fallback = ReviewAgent._deterministic_analysis(review)
+        sentiment = str(result.get("sentiment") or fallback["sentiment"]).lower()
+        if sentiment not in {"positive", "neutral", "negative"}:
+            sentiment = fallback["sentiment"]
+        severity = str(result.get("severity") or fallback["severity"]).lower()
+        if severity not in {"low", "medium", "high"}:
+            severity = fallback["severity"]
+        mentions = result.get("dish_mentions")
+        if not isinstance(mentions, list):
+            mentions = fallback["dish_mentions"]
+        return {
+            "sentiment": sentiment,
+            "severity": severity,
+            "summary": str(result.get("summary") or fallback["summary"]),
+            "suggested_action": str(
+                result.get("suggested_action") or fallback["suggested_action"]
+            ),
+            "dish_mentions": [str(m) for m in mentions],
+        }
+
+    @staticmethod
+    def _deterministic_analysis(review: Dict[str, Any]) -> Dict[str, Any]:
         text = str(review.get("text") or "").lower()
         mentions = list(review.get("dish_mentions") or [])
         rating = float(review.get("rating") or 0.0)
@@ -170,6 +243,18 @@ class ReviewAgent(BaseAgent):
     def _broadcast(self, event: str, payload: Dict[str, Any]) -> None:
         if self.ws_broadcast is not None:
             self.ws_broadcast(event, payload)
+
+    def _run_after_commit(self, actions: List[tuple[str, Any]]) -> None:
+        for kind, payload in actions:
+            if kind == "emit":
+                signal_type, signal_payload, kwargs = payload
+                self.emit(signal_type, signal_payload, **kwargs)
+            elif kind == "log":
+                category, summary, detail = payload
+                self.log_event(category, summary, detail)
+            elif kind == "broadcast":
+                event, ws_payload = payload
+                self._broadcast(event, ws_payload)
 
     @staticmethod
     def _insight_to_dict(row: ReviewInsight) -> Dict[str, Any]:
