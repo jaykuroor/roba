@@ -1,13 +1,13 @@
-"""LLM provider layer (§13).
+"""Gemini-backed LLM provider layer (§13).
 
-``LLMProvider.complete`` tries providers in order from ``config.LLM_FALLBACK``
-(``gemini`` → ``groq`` → ``openrouter`` → ``canned``). Each real provider is
-attempted with exponential backoff up to ``config.LLM_RETRIES`` retries (base
-``config.LLM_BACKOFF_BASE_S``); a 429 / 5xx / timeout is retried and, once
-retries are exhausted, the chain moves to the next provider. After a successful
-inter-provider transition (i.e. one network attempt was made and we fall
-through to the next provider) we sleep ``config.LLM_INTER_CALL_SLEEP_S`` (free
--tier RPM protection, §13).
+``LLMProvider.complete`` uses Gemini via the official ``google-genai`` SDK and
+falls back only to deterministic canned responses. Alternative hosted LLMs are
+intentionally not part of the runtime path for this demo.
+
+Gemini attempts use exponential backoff up to ``config.LLM_RETRIES`` retries
+(base ``config.LLM_BACKOFF_BASE_S``). A 429 / 5xx / timeout is retried; if the
+Gemini key is missing or all attempts fail, the call-site receives its canned
+fallback instead of an exception.
 
 When ``json_schema`` is given the raw text is parsed and validated with a
 pydantic model built dynamically from the schema; on a parse/validation failure
@@ -39,12 +39,8 @@ logger = logging.getLogger(__name__)
 # LLM did not actually answer and engage their own deterministic fallback.
 CANNED_NOTE = "canned_fallback"
 
-# Provider endpoints / models (§13, pinned).
+# Provider model (§13, pinned).
 GEMINI_MODEL = config.GEMINI_MODEL
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "mistralai/mistral-7b-instruct:free"
 
 
 class _SkipProvider(Exception):
@@ -113,7 +109,10 @@ class LLMProvider:
         inter_call_sleep_s: Optional[float] = None,
         timeout_s: float = 20.0,
     ):
-        self.fallback = list(fallback if fallback is not None else config.LLM_FALLBACK)
+        requested_fallback = list(fallback if fallback is not None else config.LLM_FALLBACK)
+        self.fallback = [provider for provider in requested_fallback if provider in {"gemini", "canned"}]
+        if "canned" not in self.fallback:
+            self.fallback.append("canned")
         self.retries = retries if retries is not None else config.LLM_RETRIES
         self.backoff_base_s = (
             backoff_base_s if backoff_base_s is not None else config.LLM_BACKOFF_BASE_S
@@ -215,6 +214,14 @@ class LLMProvider:
                 "summary": "no_change",
                 "note": CANNED_NOTE,
             },
+            # Manual Demand Forecaster optimization: no overrides.
+            "forecaster_optimization": {
+                "item_adjustments": [],
+                "global_notes": [],
+                "memory_updates": [],
+                "confidence": 0.0,
+                "note": CANNED_NOTE,
+            },
             # Call outcome extraction (§8.5): nothing usable -> safe no-op.
             "outcome_extraction": {
                 "outcome": {},
@@ -257,7 +264,6 @@ class LLMProvider:
             return self._cache[cache_key]
 
         want_json = json_schema is not None
-        made_network_attempt = False
         result: Optional[Union[str, dict]] = None
 
         for provider in self.fallback:
@@ -268,11 +274,6 @@ class LLMProvider:
             if not self._has_key(provider):
                 # Missing key: skip instantly (no network, no inter-call sleep).
                 continue
-
-            # §13: sleep between successive provider network calls.
-            if made_network_attempt:
-                self._sleep(self.inter_call_sleep_s)
-            made_network_attempt = True
 
             try:
                 raw = self._attempt_provider(
@@ -355,19 +356,6 @@ class LLMProvider:
     ) -> str:
         if provider == "gemini":
             return self._gemini(messages, json_schema, max_tokens, want_json)
-        if provider == "groq":
-            return self._openai_compatible(
-                GROQ_URL, GROQ_MODEL, self._key("groq"), messages, max_tokens, want_json
-            )
-        if provider == "openrouter":
-            return self._openai_compatible(
-                OPENROUTER_URL,
-                OPENROUTER_MODEL,
-                self._key("openrouter"),
-                messages,
-                max_tokens,
-                want_json,
-            )
         raise _SkipProvider()
 
     # -- concrete providers -------------------------------------------------
@@ -497,78 +485,6 @@ class LLMProvider:
             raise _RetryableError(f"status {status_int}") from exc
         raise _SkipProvider() from exc
 
-    def _openai_compatible(
-        self,
-        url: str,
-        model: str,
-        api_key: str,
-        messages: List[dict],
-        max_tokens: int,
-        want_json: bool,
-    ) -> str:
-        """OpenAI chat-completions shape (Groq and OpenRouter, §13)."""
-        body: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-        }
-        if want_json:
-            body["response_format"] = {"type": "json_object"}
-
-        resp = self._request(
-            "POST",
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json_body=body,
-        )
-        self._raise_for_status(resp)
-        data = resp.json()
-        try:
-            return data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise _SkipProvider() from exc
-
-    # -- HTTP seam (single chokepoint; monkeypatchable in tests) -----------
-
-    def _request(
-        self,
-        method: str,
-        url: str,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, str]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        """Issue one HTTP request. Tests may monkeypatch this method to count
-        calls / inject fake responses. Timeouts are surfaced as retryable."""
-        import httpx
-
-        self.request_count += 1
-        try:
-            return httpx.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                json=json_body,
-                timeout=self.timeout_s,
-            )
-        except httpx.TimeoutException as exc:
-            raise _RetryableError("timeout") from exc
-        except httpx.HTTPError as exc:
-            raise _SkipProvider() from exc
-
-    @staticmethod
-    def _raise_for_status(resp: Any) -> None:
-        """Classify an HTTP response: 429/5xx → retryable; other non-2xx → skip."""
-        status = getattr(resp, "status_code", 200)
-        if status == 429 or status >= 500:
-            raise _RetryableError(f"status {status}")
-        if status >= 400:
-            raise _SkipProvider()
-
     # -- json parsing / validation -----------------------------------------
 
     @staticmethod
@@ -604,11 +520,7 @@ class LLMProvider:
 
     @staticmethod
     def _env_var(provider: str) -> str:
-        return {
-            "gemini": "GEMINI_API_KEY",
-            "groq": "GROQ_API_KEY",
-            "openrouter": "OPENROUTER_API_KEY",
-        }.get(provider, "")
+        return {"gemini": "GEMINI_API_KEY"}.get(provider, "")
 
     def _key(self, provider: str) -> str:
         return os.getenv(self._env_var(provider), "") or ""

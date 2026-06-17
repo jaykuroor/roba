@@ -20,6 +20,23 @@ export interface Forecast {
   trigger_reason: string;
 }
 
+export interface DemandMemory {
+  id: number;
+  scope_type: string;
+  scope_ref: string;
+  insight: {
+    title?: string;
+    summary?: string;
+    [key: string]: unknown;
+  };
+  evidence: Record<string, unknown>;
+  confidence: number;
+  created_at: number;
+  last_seen_at: number;
+  valid_until: number;
+  source: string;
+}
+
 export interface Batch {
   id: number;
   batch_definition_id: number;
@@ -136,9 +153,14 @@ export interface EventLog {
 
 export interface TrackASnapshot {
   demo_mode: string;
+  forecast_agent?: {
+    llm_auto_mode: boolean;
+  };
   menu_items: MenuItem[];
   forecasts: Forecast[];
   batches: Batch[];
+  demand_memory: DemandMemory[];
+  forecast_reasoning: EventLog[];
   competitors: Competitor[];
   competitor_offers: CompetitorOffer[];
   competitor_intel: CompetitorIntel[];

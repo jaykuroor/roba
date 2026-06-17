@@ -110,3 +110,12 @@ def test_unrecognised_intent_stores_only(seeded):
         assert session.query(UserFact).count() == 1
     finally:
         session.close()
+
+
+def test_station_absence_is_stored_as_operational_constraint(seeded):
+    voice, _session_factory = seeded
+    result = voice.process("All the possible staff making pasta are absent today")
+
+    assert result["extracted"]["intent"] == "set_operational_constraint"
+    assert result["extracted"]["value"]["all_qualified_staff"] is True
+    assert result["signal_id"] is not None

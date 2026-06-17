@@ -64,7 +64,8 @@ EXTRACTION_SCHEMA: Dict[str, Any] = {
 INTENTS = {
     "add_menu_item", "edit_menu_item", "set_recipe", "add_inventory_count",
     "record_receipt", "set_attendance", "set_leave", "add_event",
-    "set_supplier_price", "set_competitor", "add_review", "other",
+    "set_supplier_price", "set_competitor", "add_review",
+    "set_operational_constraint", "other",
 }
 
 _NUMBER_RE = r"(\d+(?:\.\d+)?)"
@@ -161,10 +162,32 @@ class VoiceProcessor:
         low = text.lower()
 
         # set_leave: "<Name> is on leave/sick ..." / "... day off ..."
-        if "leave" in low or "is off" in low or "day off" in low or "sick" in low or "off sick" in low:
+        if (
+            "leave" in low
+            or "is off" in low
+            or "day off" in low
+            or "sick" in low
+            or "off sick" in low
+            or "absent" in low
+            or "unavailable" in low
+            or "missing" in low
+        ):
             name = self._first_name(text)
             window = self._window_from_text(low)
             status = "sick" if "sick" in low else "leave"
+            if self._looks_like_station_absence(low, name):
+                return {
+                    "intent": "set_operational_constraint",
+                    "entity_type": "station_or_skill",
+                    "entity_ref": self._constraint_target(text, low),
+                    "attribute": "capacity_absence",
+                    "value": {
+                        "raw_text": text,
+                        "all_qualified_staff": self._all_qualified_staff_absent(low),
+                    },
+                    "effective_window": window,
+                    "confidence": 0.65,
+                }
             return {
                 "intent": "set_leave",
                 "entity_type": "staff",
@@ -215,6 +238,48 @@ class VoiceProcessor:
             "effective_window": None,
             "confidence": 0.2,
         }
+
+    @staticmethod
+    def _looks_like_station_absence(low: str, name: Optional[str]) -> bool:
+        absence = any(w in low for w in ("absent", "unavailable", "missing", "off sick", "sick"))
+        operational = any(
+            w in low
+            for w in (
+                "station", "counter", "line", "cook", "chef", "worker",
+                "staff", "making", "make", "prep",
+            )
+        )
+        # If a real named staff member was found, the structured attendance
+        # path is more precise. Avoid treating sentence-openers ("The") as a
+        # staff name.
+        has_staff_name = bool(name and name.lower() not in {"the", "all", "every", "no"})
+        return absence and operational and not has_staff_name
+
+    @staticmethod
+    def _all_qualified_staff_absent(low: str) -> bool:
+        return any(
+            phrase in low
+            for phrase in (
+                "all ", "every ", "no one", "nobody", "none of",
+                "all the possible", "everyone",
+            )
+        )
+
+    @staticmethod
+    def _constraint_target(text: str, low: str) -> str:
+        patterns = [
+            r"(?:the\s+)?([A-Za-z0-9 '&-]+?)\s+station",
+            r"(?:making|make|prep|prepping)\s+([A-Za-z0-9 '&-]+?)(?:\s+are|\s+is|\s+was|\s+were|\s+absent|$)",
+            r"([A-Za-z0-9 '&-]+?)\s+(?:cook|chef|worker|staff)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if not m:
+                continue
+            target = m.group(1).strip(" .,'\"")
+            if target and target.lower() not in {"the", "all", "possible", "station"}:
+                return target
+        return low
 
     # -- regex helpers ------------------------------------------------------
 

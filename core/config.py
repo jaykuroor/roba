@@ -7,6 +7,12 @@ are the binding defaults; the UI exposes a subset of them as adjustable.
 
 import os
 
+from dotenv import dotenv_values
+
+for _key, _value in dotenv_values(".env").items():
+    if _key in {"GEMINI_API_KEY", "GEMINI_MODEL", "LLM_FORECAST_AUTO_MODE"} and _key not in os.environ and _value:
+        os.environ[_key] = _value
+
 # clock
 OPERATING_WINDOW = ("08:00", "23:00")      # 54000 sim-s
 REAL_MINUTES_PER_DAY_1X = 15               # default
@@ -39,6 +45,13 @@ EVENT_MULT = 1.35
 STAFF_CAP_FACTOR = 0.5
 VELOCITY_CLAMP = (0.6, 1.6)
 SUGGESTION_INTERVAL_SIM_S = 54000          # ~1 sim-day
+LLM_MULTIPLIER_CLAMP = (0.0, 2.0)
+LLM_EXTREME_MULTIPLIERS = (0.0, 2.0)
+LLM_FORECAST_AUTO_MODE = os.getenv("LLM_FORECAST_AUTO_MODE", "0").lower() in {
+    "1", "true", "yes", "on"
+}
+COLD_TEMP_C = 12.0
+HOT_TEMP_C = 30.0
 
 # batches
 BATCH_BUFFER_SIM_S = 900
@@ -61,7 +74,7 @@ COMPETITOR_CALL_TARGETS = 2
 
 # llm
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-LLM_FALLBACK = ["gemini", "groq", "openrouter", "canned"]
+LLM_FALLBACK = ["gemini", "canned"]
 LLM_RETRIES = 3
 LLM_BACKOFF_BASE_S = 1.5
 LLM_INTER_CALL_SLEEP_S = 2

@@ -80,6 +80,17 @@ GENERATION_SCHEMA: Dict[str, Any] = {
     "required": ["menu_items"],
 }
 
+FORECAST_OPT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "item_adjustments": {"type": "array"},
+        "global_notes": {"type": "array"},
+        "memory_updates": {"type": "array"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["item_adjustments", "global_notes", "memory_updates"],
+}
+
 
 def run_case(
     llm: LLMProvider,
@@ -167,6 +178,31 @@ def main() -> int:
             "generation",
             GENERATION_SCHEMA,
             900,
+        ),
+        run_case(
+            llm,
+            "forecaster_optimization_json",
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Optimize this restaurant demand forecast as compact JSON. "
+                        "Use concise user-facing reasons only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "{'weather': {'temperature_c': 7, 'condition': 'storm'}, "
+                        "'items': [{'menu_item_id': 1, 'name': 'Margherita Pizza', "
+                        "'baseline': 3, 'multipliers': {'weather': 1.1}}], "
+                        "'memory': []}"
+                    ),
+                },
+            ],
+            "forecaster_optimization",
+            FORECAST_OPT_SCHEMA,
+            700,
         ),
     ]
     report = {

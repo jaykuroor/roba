@@ -45,5 +45,10 @@ export function formatSimTime(value: number | null | undefined) {
 
 export function formatQty(value: number | null | undefined) {
   if (value == null || Number.isNaN(value)) return "0";
+  return Number(value).toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+export function formatBaseline(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) return "0";
   return Number(value).toLocaleString(undefined, { maximumFractionDigits: 1 });
 }

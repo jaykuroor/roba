@@ -315,7 +315,12 @@ app.add_middleware(
 
 def _row_to_dict(obj: Any) -> Dict[str, Any]:
     """Serialize any ORM row into a plain dict of its column values."""
-    return {col.key: getattr(obj, col.key) for col in obj.__table__.columns}
+    data = {col.key: getattr(obj, col.key) for col in obj.__table__.columns}
+    if isinstance(obj, models.Forecast):
+        data["forecast_qty"] = int(round(float(data.get("forecast_qty") or 0)))
+    elif isinstance(obj, models.Batch):
+        data["planned_qty"] = int(round(float(data.get("planned_qty") or 0)))
+    return data
 
 
 def _rows_to_dict(rows: List[Any]) -> List[Dict[str, Any]]:
@@ -836,6 +841,10 @@ class TrackAStaffBody(BaseModel):
     reason: str = "called in sick"
 
 
+class TrackAForecastAutoBody(BaseModel):
+    enabled: bool
+
+
 def _track_a_agent(name: str) -> Any:
     agent = ctx.track_a.get(name)
     if agent is None:
@@ -853,11 +862,25 @@ def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
         predicate=lambda row: row.get("status") == "live"
         and bool(track_groups.intersection(set(row.get("groups") or []))),
     )
+    forecaster = ctx.track_a.get("forecaster")
     return {
         "demo_mode": os.getenv("DEMO_MODE", "combined"),
         "menu_items": _read_rows(db_session, models.MenuItem, models.MenuItem.id.asc()),
         "forecasts": _read_rows(db_session, models.Forecast, models.Forecast.generated_at.desc(), 100),
         "batches": _read_rows(db_session, models.Batch, models.Batch.decided_at.desc(), 50),
+        "demand_memory": _read_rows(
+            db_session,
+            models.DemandForecasterMemory,
+            models.DemandForecasterMemory.last_seen_at.desc(),
+            40,
+        ),
+        "forecast_reasoning": _read_rows(
+            db_session,
+            models.EventLog,
+            models.EventLog.sim_time.desc(),
+            80,
+            predicate=lambda row: row.get("category") in {"forecast", "batch"},
+        ),
         "competitors": _read_rows(db_session, models.Competitor, models.Competitor.id.asc()),
         "competitor_offers": _read_rows(db_session, models.CompetitorOffer, models.CompetitorOffer.id.asc()),
         "competitor_intel": _read_rows(db_session, models.CompetitorIntel, models.CompetitorIntel.sim_time.desc(), 50),
@@ -869,14 +892,33 @@ def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
         "attendance": _read_rows(db_session, models.Attendance, models.Attendance.sim_time.desc(), 50),
         "signals": signals,
         "events": _read_rows(db_session, models.EventLog, models.EventLog.sim_time.desc(), 50),
+        "forecast_agent": {
+            "llm_auto_mode": bool(getattr(forecaster, "llm_auto_mode", False)),
+        },
     }
 
 
 @app.post("/api/track-a/forecast/run")
 def track_a_run_forecast() -> Dict[str, Any]:
     forecaster = _track_a_agent("forecaster")
-    forecasts = forecaster.run_forecast("manual")
+    with db.DB_LOCK:
+        forecasts = forecaster.run_forecast("manual")
     return {"created": len(forecasts)}
+
+
+@app.post("/api/track-a/forecast/optimize")
+def track_a_optimize_forecast() -> Dict[str, Any]:
+    forecaster = _track_a_agent("forecaster")
+    with db.DB_LOCK:
+        forecasts = forecaster.optimize_forecast("manual")
+    return {"created": len(forecasts), "optimized": True}
+
+
+@app.post("/api/track-a/forecast/auto-mode")
+def track_a_forecast_auto_mode(body: TrackAForecastAutoBody) -> Dict[str, Any]:
+    forecaster = _track_a_agent("forecaster")
+    with db.DB_LOCK:
+        return forecaster.set_auto_mode(body.enabled)
 
 
 @app.post("/api/track-a/reviews/process")
