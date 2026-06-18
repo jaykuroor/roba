@@ -581,6 +581,14 @@ class VoiceProcessor:
         (§18.4). Ensure the multiplier is carried on the fact."""
         if extracted.get("value") in (None, ""):
             extracted["value"] = EVENT_MULT
+        else:
+            try:
+                numeric_value = float(extracted.get("value"))
+            except (TypeError, ValueError):
+                numeric_value = None
+            if numeric_value is not None and numeric_value > 10:
+                extracted["value"] = numeric_value
+                extracted["attribute"] = "expected_attendance"
         if not extracted.get("attribute"):
             extracted["attribute"] = "demand_multiplier"
         return ["event_stored"]

@@ -1,6 +1,6 @@
 import pytest
 
-from core.models import Batch, DemandForecasterMemory, Forecast, SimSettings
+from core.models import Batch, DemandForecasterMemory, EventLog, Forecast, SimSettings
 from core.signals import SignalType
 from track_a.agents.forecaster import DemandForecaster
 
@@ -82,6 +82,38 @@ def test_forecast_applies_multipliers_and_explains(bus, session_factory, seeded)
         assert stored.multipliers["weather"] == 1.18
         assert stored.forecast_qty > stored.baseline_qty
         assert stored.confidence > 0
+    finally:
+        session.close()
+
+
+def test_large_event_value_is_treated_as_attendance_not_multiplier(bus, session_factory, seeded):
+    bus.emit(
+        SignalType.USER_FACT,
+        {
+            "intent": "add_event",
+            "entity_type": "event",
+            "entity_ref": "food fest",
+            "attribute": "demand_multiplier",
+            "value": 800,
+            "effective_window": {"start": 28800.0, "end": 39600.0},
+            "raw_text": "Food fest from 09:00 for 800 people",
+        },
+        source="test",
+    )
+    agent = DemandForecaster(bus, session_factory)
+    agent.run_forecast("test")
+
+    session = session_factory()
+    try:
+        stored = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        assert stored.multipliers["event"] == pytest.approx(1.8)
+        assert stored.forecast_qty < 100
+        log = next(
+            row for row in session.query(EventLog).filter(EventLog.category == "forecast").all()
+            if row.detail.get("forecast_id") == stored.id
+        )
+        assert "food fest attendance 800" in log.detail["explanations"]["event"]
+        assert "Station and qualified-staff capacity" not in str(log.detail["explanations"].values())
     finally:
         session.close()
 

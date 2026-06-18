@@ -446,7 +446,7 @@ class DemandForecaster(BaseAgent):
     ) -> Dict[str, Any]:
         baseline = self.baseline_qty(session, item.id, daypart, float(self.bus.sim_time))
         multipliers = self._deterministic_multipliers(session, item, baseline, daypart, window, live)
-        explanations = self._base_explanations(multipliers)
+        explanations = self._base_explanations(multipliers, item, window, live)
         hard_override = self._apply_hard_constraints(session, item, multipliers, explanations, live)
         return {
             "item": item,
@@ -492,16 +492,21 @@ class DemandForecaster(BaseAgent):
             "recent_velocity": round(self._velocity_multiplier(item.id, baseline, daypart), 3),
         }
 
-    @staticmethod
-    def _base_explanations(multipliers: Dict[str, float]) -> Dict[str, str]:
+    def _base_explanations(
+        self,
+        multipliers: Dict[str, float],
+        item: MenuItem,
+        window: Dict[str, float],
+        live: Iterable[Signal],
+    ) -> Dict[str, str]:
         labels = {
-            "settings_demand": "Simulation demand settings versus historical baseline.",
-            "event": "Active events from user facts.",
+            "settings_demand": self._settings_explanation(multipliers.get("settings_demand", 1.0)),
+            "event": self._event_explanation(multipliers.get("event", 1.0), window, live),
             "competitor": "Competitor intelligence and offer changes.",
             "review": "Recent review sentiment for this item.",
-            "staff_coverage": "Station and qualified-staff capacity.",
-            "weather": "Weather and temperature response.",
-            "recent_velocity": "Rolling POS velocity versus expectation.",
+            "staff_coverage": self._staff_explanation(multipliers.get("staff_coverage", 1.0)),
+            "weather": self._weather_explanation(item, multipliers.get("weather", 1.0)),
+            "recent_velocity": self._velocity_explanation(multipliers.get("recent_velocity", 1.0)),
         }
         return {key: labels.get(key, key) for key in multipliers}
 
@@ -621,11 +626,89 @@ class DemandForecaster(BaseAgent):
             fact_window = payload.get("effective_window")
             if fact_window and not windows_overlap(window, fact_window):
                 continue
+            mult *= self._event_fact_multiplier(payload)
+        return min(float(config.EVENT_STACK_MAX_MULT), mult)
+
+    @staticmethod
+    def _event_fact_multiplier(payload: Dict[str, Any]) -> float:
+        value = payload.get("value")
+        raw_text = str(payload.get("raw_text") or "").lower()
+        attribute = str(payload.get("attribute") or "").lower()
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is None:
+            return float(config.EVENT_MULT)
+        if 0 < numeric <= float(config.EVENT_ATTENDANCE_MAX_MULT) and attribute != "expected_attendance":
+            return numeric
+        attendance_words = ("people", "person", "crowd", "guests", "attendees", "pax")
+        looks_like_attendance = (
+            attribute == "expected_attendance"
+            or numeric > 10
+            or any(word in raw_text for word in attendance_words)
+        )
+        if looks_like_attendance:
+            reference = max(float(config.EVENT_ATTENDANCE_REFERENCE), 1.0)
+            attendance_ratio = max(0.0, min(1.0, numeric / reference))
+            return round(1.0 + attendance_ratio * (float(config.EVENT_ATTENDANCE_MAX_MULT) - 1.0), 3)
+        return min(float(config.EVENT_ATTENDANCE_MAX_MULT), max(0.0, numeric))
+
+    @staticmethod
+    def _settings_explanation(value: float) -> str:
+        if value > 1.05:
+            return f"Simulation demand settings lift this item to {value:.2f}x its historical baseline."
+        if value < 0.95:
+            return f"Simulation demand settings reduce this item to {value:.2f}x its historical baseline."
+        return "Simulation demand settings are aligned with the historical baseline."
+
+    def _event_explanation(self, value: float, window: Dict[str, float], live: Iterable[Signal]) -> str:
+        if abs(value - 1.0) < 0.01:
+            return "No active event is changing this item."
+        labels: List[str] = []
+        for sig in live:
+            payload = sig.payload or {}
+            if sig.type != SignalType.USER_FACT.value or payload.get("intent") != "add_event":
+                continue
+            fact_window = payload.get("effective_window")
+            if fact_window and not windows_overlap(window, fact_window):
+                continue
+            name = str(payload.get("entity_ref") or "event")
+            raw_value = payload.get("value")
             try:
-                mult *= float(payload.get("value") or config.EVENT_MULT)
+                numeric = float(raw_value)
             except (TypeError, ValueError):
-                mult *= config.EVENT_MULT
-        return mult
+                numeric = 0.0
+            if str(payload.get("attribute") or "").lower() == "expected_attendance" or numeric > 10:
+                labels.append(f"{name} attendance {int(numeric):d}")
+            else:
+                labels.append(name)
+        detail = "; ".join(labels[:2]) if labels else "active event"
+        return f"{detail} changes demand to {value:.2f}x after attendance guardrails."
+
+    @staticmethod
+    def _staff_explanation(value: float) -> str:
+        if value <= 0:
+            return "Station has no remaining qualified staff."
+        if value < 1:
+            return f"Staff coverage limits prep capacity to {value:.2f}x."
+        return "Staff coverage is available and is not changing demand."
+
+    @staticmethod
+    def _weather_explanation(item: MenuItem, value: float) -> str:
+        if value > 1.01:
+            return f"Weather conditions favor {item.name}, lifting demand to {value:.2f}x."
+        if value < 0.99:
+            return f"Weather conditions soften {item.name}, reducing demand to {value:.2f}x."
+        return "Weather is neutral for this item."
+
+    @staticmethod
+    def _velocity_explanation(value: float) -> str:
+        if value > 1.05:
+            return f"Recent POS velocity is above expectation at {value:.2f}x."
+        if value < 0.95:
+            return f"Recent POS velocity is below expectation at {value:.2f}x."
+        return "Recent POS velocity is near expectation."
 
     def _competitor_multiplier(self, item: MenuItem, live: Iterable[Signal]) -> float:
         value = 1.0

@@ -14,6 +14,19 @@ from core.seeding import Seeder
 from core.voice import VoiceProcessor
 
 
+class FakeEventLLM:
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site=""):
+        return {
+            "intent": "add_event",
+            "entity_type": "event",
+            "entity_ref": "food fest",
+            "attribute": "demand_multiplier",
+            "value": "800",
+            "effective_window": {},
+            "confidence": 0.95,
+        }
+
+
 @pytest.fixture
 def seeded(bus, session_factory, monkeypatch):
     """An in-memory DB loaded with the Bella's Kitchen preset + a voice
@@ -119,3 +132,14 @@ def test_station_absence_is_stored_as_operational_constraint(seeded):
     assert result["extracted"]["intent"] == "set_operational_constraint"
     assert result["extracted"]["value"]["all_qualified_staff"] is True
     assert result["signal_id"] is not None
+
+
+def test_event_attendance_is_not_stored_as_raw_multiplier(seeded):
+    voice, _session_factory = seeded
+    voice.llm = FakeEventLLM()
+
+    result = voice.process("Food fest from 21:00 for 800 people")
+
+    assert result["extracted"]["intent"] == "add_event"
+    assert result["extracted"]["attribute"] == "expected_attendance"
+    assert result["extracted"]["value"] == 800.0

@@ -355,9 +355,30 @@ function reasonSummary(reason: ReasonDetail | undefined, forecast: Forecast) {
       ? "Optimized forecast emitted through the LLM stack."
       : "Deterministic forecast emitted through the base stack.";
   }
-  const priority = ["llm_override", "availability", "staff_coverage", "weather", "event", "recent_velocity"];
-  for (const key of priority) {
+  const multipliers = forecast.multipliers ?? {};
+  const hardPriority = ["llm_override", "availability", "llm_target"];
+  for (const key of hardPriority) {
     if (reason.explanations[key]) return reason.explanations[key];
   }
-  return Object.values(reason.explanations)[0] ?? "Forecast generated.";
+  if ((multipliers.staff_coverage ?? 1) < 0.99 && reason.explanations.staff_coverage) {
+    return reason.explanations.staff_coverage;
+  }
+  const driverPriority = [
+    "event",
+    "settings_demand",
+    "llm_overall",
+    "weather",
+    "recent_velocity",
+    "competitor",
+    "review",
+  ];
+  for (const key of driverPriority) {
+    const value = Number(multipliers[key] ?? 1);
+    if (reason.explanations[key] && Math.abs(value - 1) >= 0.03) {
+      return reason.explanations[key];
+    }
+  }
+  return forecast.trigger_reason === "llm_manual"
+    ? "LLM optimization ran, with no major multiplier override for this item."
+    : "Forecast generated with no major active demand driver.";
 }
