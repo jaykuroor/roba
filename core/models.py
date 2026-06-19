@@ -292,7 +292,7 @@ class Batch(Base):
     decided_at = mapped_column(Float)
     serve_window = mapped_column(JSON)
     decision = mapped_column(String)           # cook | skip
-    planned_qty = mapped_column(Float)
+    planned_qty = mapped_column(Integer)
     actual_made_qty = mapped_column(Float)
     sold_qty = mapped_column(Float)
     wasted_qty = mapped_column(Float)
@@ -399,7 +399,7 @@ class Forecast(Base):
     menu_item_id = mapped_column(ForeignKey("menu_items.id"))
     window = mapped_column(JSON)
     daypart = mapped_column(String)
-    forecast_qty = mapped_column(Float)
+    forecast_qty = mapped_column(Integer)
     baseline_qty = mapped_column(Float)
     multipliers = mapped_column(JSON)
     confidence = mapped_column(Float)
@@ -409,6 +409,25 @@ class Forecast(Base):
     def __repr__(self):
         return (f"<Forecast id={self.id} menu_item_id={self.menu_item_id} "
                 f"daypart={self.daypart!r} forecast_qty={self.forecast_qty}>")
+
+
+class DemandForecasterMemory(Base):
+    __tablename__ = "demand_forecaster_memory"
+
+    id = _pk()
+    scope_type = mapped_column(String)         # global | menu_item | station | weather | constraint
+    scope_ref = mapped_column(String)
+    insight = mapped_column(JSON)
+    evidence = mapped_column(JSON)
+    confidence = mapped_column(Float)
+    created_at = mapped_column(Float)
+    last_seen_at = mapped_column(Float)
+    valid_until = mapped_column(Float)
+    source = mapped_column(String)             # deterministic | llm | evaluator | user_fact
+
+    def __repr__(self):
+        return (f"<DemandForecasterMemory id={self.id} "
+                f"scope_type={self.scope_type!r} scope_ref={self.scope_ref!r}>")
 
 
 class Signal(Base):
@@ -746,7 +765,7 @@ TRANSACTIONAL_MODELS = [
 ]
 
 INTELLIGENCE_MODELS = [
-    Forecast, Signal, CompetitorIntel,
+    Forecast, DemandForecasterMemory, Signal, CompetitorIntel,
     Review, ReviewInsight, SupplierPriceHistory, Negotiation,
     ApprovalRequest, Promotion, UserFact, WeatherLog, Call,
 ]

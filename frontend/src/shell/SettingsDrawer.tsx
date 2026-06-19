@@ -143,6 +143,7 @@ function PosMixPanel() {
           Object.keys(dishWeights).length > 0 ? normalise(dishWeights) : undefined,
         daypart_curve: daypartWeights,
       });
+      await apiPost("/api/track-a/forecast/run").catch(() => undefined);
       const updated = await apiGet<SimSettings>("/api/sim/pos");
       setSettings(updated);
     } catch {
@@ -397,6 +398,7 @@ function AnomaliesPanel() {
     setBusy(true);
     try {
       await apiPatch("/api/sim/pos", { anomaly_injections: injections });
+      await apiPost("/api/track-a/forecast/run").catch(() => undefined);
     } catch {
       /* ignore */
     } finally {

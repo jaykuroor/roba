@@ -3,6 +3,11 @@ import { ControlBar } from "./shell/ControlBar";
 import { ApprovalInbox } from "./shell/ApprovalInbox";
 import { SettingsDrawer } from "./shell/SettingsDrawer";
 import { wsClient } from "./ws";
+import { CompetitorPanel } from "./track_a/CompetitorPanel";
+import { ForecastDashboard } from "./track_a/ForecastDashboard";
+import { ReviewPanel } from "./track_a/ReviewPanel";
+import { SignalFeed } from "./track_a/SignalFeed";
+import { StaffPanel } from "./track_a/StaffPanel";
 import { apiGet } from "./api";
 import { actions } from "./store";
 import type { SimState, Weather } from "./types";
@@ -18,7 +23,12 @@ interface ActiveTab {
   name: string;
 }
 
-function TrackAPlaceholder({ label }: { label: string }) {
+function TrackAPanel({ label }: { label: string }) {
+  if (label === "Forecast") return <ForecastDashboard />;
+  if (label === "Competitors") return <CompetitorPanel />;
+  if (label === "Reviews") return <ReviewPanel />;
+  if (label === "Staff") return <StaffPanel />;
+  if (label === "Signal Feed") return <SignalFeed />;
   return (
     <div
       data-track="a"
@@ -76,14 +86,27 @@ export default function App() {
 
   useEffect(() => {
     wsClient.connect();
+    const hydrateSim = () => {
+      apiGet<Partial<SimState>>("/api/sim/state")
+        .then((s) => actions.setSimState(s))
+        .catch(() => undefined);
+    };
+    const hydrateWeather = () => {
+      apiGet<Weather>("/api/weather")
+        .then((w) => actions.setWeather(w))
+        .catch(() => undefined);
+    };
     // Hydrate from REST so the bar is populated before the first WS tick.
-    apiGet<Partial<SimState>>("/api/sim/state")
-      .then((s) => actions.setSimState(s))
-      .catch(() => undefined);
-    apiGet<Weather>("/api/weather")
-      .then((w) => actions.setWeather(w))
-      .catch(() => undefined);
-    return () => wsClient.close();
+    // Poll sim state as a fallback because dev WS setup can briefly reconnect.
+    hydrateSim();
+    hydrateWeather();
+    const simPoll = setInterval(hydrateSim, 1000);
+    const weatherPoll = setInterval(hydrateWeather, 10000);
+    return () => {
+      clearInterval(simPoll);
+      clearInterval(weatherPoll);
+      wsClient.close();
+    };
   }, []);
 
   return (
@@ -127,7 +150,7 @@ export default function App() {
 
           <div className="min-h-[60vh]">
             {activeTab.track === "A" ? (
-              <TrackAPlaceholder label={activeTab.name} />
+              <TrackAPanel label={activeTab.name} />
             ) : (
               <TrackBPlaceholder label={activeTab.name} />
             )}

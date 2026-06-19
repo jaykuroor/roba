@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,6 +77,7 @@ class WebSocketHub:
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self._queue = asyncio.Queue()
         self._drain_task = asyncio.create_task(self._drain())
 
     async def stop(self) -> None:
@@ -86,6 +88,8 @@ class WebSocketHub:
             except asyncio.CancelledError:
                 pass
             self._drain_task = None
+        self._loop = None
+        self.connections.clear()
 
     # -- connections --------------------------------------------------------
 
@@ -156,6 +160,7 @@ class AppContext:
         self.scenarios: Optional[ScenarioEngine] = None
         self.hub: WebSocketHub = WebSocketHub()
         self.loop_task: Optional[asyncio.Task] = None
+        self.track_a: Dict[str, Any] = {}
 
 
 ctx = AppContext()
@@ -184,7 +189,7 @@ def _bootstrap() -> None:
     """Create tables + singletons and wire every core object (§ app bootstrap)."""
     db.create_all()
 
-    factory = db.SessionLocal
+    factory = db.new_session
 
     # Singletons: sim_state (id=1) + sim_settings (id=1) if absent.
     session = factory()
@@ -196,7 +201,13 @@ def _bootstrap() -> None:
 
     bus = SignalBus(factory)
     clock = SimClock(factory, bus)
+    # Docker persists sim_state across container restarts. Seed the bus clock
+    # before registering interval triggers so their first next_due is relative
+    # to the restored sim time, not zero. Otherwise a running persisted sim can
+    # spend startup catching up every historical interval.
+    bus.sim_time = clock.sim_time
     orchestrator = Orchestrator(clock, bus, factory)
+    orchestrator.coordinator = db.DB_LOCK
     llm = LLMProvider()
     voice = VoiceProcessor(llm, bus, factory)
     seeder = Seeder(llm, factory)
@@ -231,6 +242,24 @@ def _bootstrap() -> None:
 
     # Ship the flagship Friday Rush scenario on first run.
     scenarios.seed_default_scenario()
+
+    # Track A: Demand & Sensing. In DEMO_MODE=track_a this also wires the
+    # Track A-owned MockInventory; in combined mode it stays disabled.
+    try:
+        from track_a import bootstrap_track_a
+
+        ctx.track_a = bootstrap_track_a(
+            bus=bus,
+            db_session_factory=factory,
+            orchestrator=orchestrator,
+            formatter=formatter,
+            calls=calls,
+            llm=llm,
+            ws_broadcast=sink,
+        )
+    except Exception:  # noqa: BLE001 - Track A must not prevent core startup.
+        logger.exception("Track A failed to bootstrap")
+        ctx.track_a = {}
 
     ctx.bus = bus
     ctx.clock = clock
@@ -286,7 +315,36 @@ app.add_middleware(
 
 def _row_to_dict(obj: Any) -> Dict[str, Any]:
     """Serialize any ORM row into a plain dict of its column values."""
-    return {col.key: getattr(obj, col.key) for col in obj.__table__.columns}
+    data = {col.key: getattr(obj, col.key) for col in obj.__table__.columns}
+    if isinstance(obj, models.Forecast):
+        data["forecast_qty"] = int(round(float(data.get("forecast_qty") or 0)))
+    elif isinstance(obj, models.Batch):
+        data["planned_qty"] = int(round(float(data.get("planned_qty") or 0)))
+    return data
+
+
+def _rows_to_dict(rows: List[Any]) -> List[Dict[str, Any]]:
+    """Serialize ORM rows immediately while their owning session is open."""
+    return [_row_to_dict(row) for row in rows]
+
+
+def _read_rows(
+    db_session: Any,
+    model: Any,
+    order_by: Optional[Any] = None,
+    limit: Optional[int] = None,
+    predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+) -> List[Dict[str, Any]]:
+    with db.DB_LOCK:
+        query = db_session.query(model)
+        if order_by is not None:
+            query = query.order_by(order_by)
+        if limit is not None:
+            query = query.limit(limit)
+        rows = _rows_to_dict(query.all())
+    if predicate is not None:
+        rows = [row for row in rows if predicate(row)]
+    return rows
 
 
 def _coerce_columns(model: Any, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -298,6 +356,12 @@ def _coerce_columns(model: Any, body: Dict[str, Any]) -> Dict[str, Any]:
 # ===========================================================================
 # Sim control (§20)
 # ===========================================================================
+
+@app.get("/api/health")
+def health() -> Dict[str, Any]:
+    """Cheap readiness probe for Docker/Vite startup coordination."""
+    return {"ok": True, "sim": ctx.clock.current_state()}
+
 
 class SpeedBody(BaseModel):
     speed: float
@@ -312,11 +376,23 @@ class PosBody(BaseModel):
     anomaly_injections: Optional[List[Dict[str, Any]]] = None
 
 
+def _ensure_loop_task() -> None:
+    """Start the orchestrator loop if it is absent or previously died."""
+    if ctx.orchestrator is None:
+        return
+    if ctx.loop_task is not None and not ctx.loop_task.done():
+        return
+    ctx.loop_task = asyncio.create_task(
+        ctx.orchestrator.run_loop(ctx.hub.broadcast_events)
+    )
+
+
 @app.post("/api/sim/play")
-def sim_play() -> Dict[str, Any]:
+async def sim_play() -> Dict[str, Any]:
     state = ctx.clock.current_state()
     if state["status"] == SimClock.RUNNING:
         raise HTTPException(status_code=409, detail="Simulation is already running")
+    _ensure_loop_task()
     result = ctx.clock.play()
     ctx.hub.broadcast("sim_state_changed", result)
     return result
@@ -341,31 +417,31 @@ def sim_stop() -> Dict[str, Any]:
 
 @app.post("/api/sim/restart")
 def sim_restart() -> Dict[str, Any]:
-    # Halt the tick loop before the destructive reseed so it cannot write to
-    # tables mid-wipe.
-    ctx.clock.stop()
-    _drain_loop()
+    with db.DB_LOCK:
+        # Halt the tick loop before the destructive reseed so it cannot write to
+        # tables mid-wipe.
+        ctx.clock.stop()
 
-    # Capture the active seed before wiping everything.
-    session = db.SessionLocal()
-    try:
-        state = session.get(models.SimState, 1)
-        active_seed = state.active_seed_id if state is not None else None
-    finally:
-        session.close()
+        # Capture the active seed before wiping everything.
+        session = db.new_session()
+        try:
+            state = session.get(models.SimState, 1)
+            active_seed = state.active_seed_id if state is not None else None
+        finally:
+            session.close()
 
-    def _reseed() -> None:
-        _wipe_for_seed()
-        if active_seed:
-            try:
-                data = ctx.seeder.load_preset(active_seed)
-                _apply_bundle_singletons(data, active_seed)
-            except FileNotFoundError:
-                logger.warning("Restart: active seed %r not found", active_seed)
-        # The wipe cleared scenarios — re-ship the flagship.
-        ctx.scenarios.seed_default_scenario()
+        def _reseed() -> None:
+            _wipe_for_seed()
+            if active_seed:
+                try:
+                    data = ctx.seeder.load_preset(active_seed)
+                    _apply_bundle_singletons(data, active_seed)
+                except FileNotFoundError:
+                    logger.warning("Restart: active seed %r not found", active_seed)
+            # The wipe cleared scenarios - re-ship the flagship.
+            ctx.scenarios.seed_default_scenario()
 
-    result = ctx.clock.restart(_reseed)
+        result = ctx.clock.restart(_reseed)
     ctx.hub.broadcast("sim_state_changed", result)
     return result
 
@@ -401,12 +477,13 @@ def sim_state() -> Dict[str, Any]:
 
 @app.get("/api/sim/pos")
 def get_sim_pos() -> Dict[str, Any]:
-    session = db.SessionLocal()
-    try:
-        settings = _ensure_settings_singleton(session)
-        return _row_to_dict(settings)
-    finally:
-        session.close()
+    with db.DB_LOCK:
+        session = db.new_session()
+        try:
+            settings = _ensure_settings_singleton(session)
+            return _row_to_dict(settings)
+        finally:
+            session.close()
 
 
 @app.patch("/api/sim/pos")
@@ -414,16 +491,17 @@ def sim_pos(body: PosBody) -> Dict[str, Any]:
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(status_code=422, detail="No POS settings provided")
-    session = db.SessionLocal()
-    try:
-        settings = _ensure_settings_singleton(session)
-        for field, value in updates.items():
-            setattr(settings, field, value)
-        session.commit()
-        session.refresh(settings)
-        return _row_to_dict(settings)
-    finally:
-        session.close()
+    with db.DB_LOCK:
+        session = db.new_session()
+        try:
+            settings = _ensure_settings_singleton(session)
+            for field, value in updates.items():
+                setattr(settings, field, value)
+            session.commit()
+            session.refresh(settings)
+            return _row_to_dict(settings)
+        finally:
+            session.close()
 
 
 # ===========================================================================
@@ -433,10 +511,6 @@ def sim_pos(body: PosBody) -> Dict[str, Any]:
 class GenerateBody(BaseModel):
     cuisine: str
     size_params: Dict[str, Any] = {}
-
-# How long to wait after halting the loop so any in-flight tick finishes before
-# a destructive reseed touches the tables (a couple of tick cadences).
-_LOOP_DRAIN_S = config.TICK_REAL_MS / 1000.0 * 2.0
 
 # Tables wiped on reseed — everything except the sim_state / sim_settings
 # singletons, which are kept in place (and updated from the bundle) so the
@@ -460,30 +534,20 @@ _SIM_SETTINGS_FIELDS = (
 )
 
 
-def _drain_loop() -> None:
-    """Give the tick loop time to observe the halted state and finish any
-    in-flight tick before a destructive reseed proceeds."""
-    import time
-
-    time.sleep(_LOOP_DRAIN_S)
-
-
 def _wipe_for_seed() -> None:
     """Delete every row except the sim singletons (idempotent reseed prep)."""
-    session = db.SessionLocal()
-    try:
-        for model in _WIPE_MODELS:
-            session.query(model).delete()
-        session.commit()
-    finally:
-        session.close()
+    with db.session_scope(coordinated=True) as session:
+        keep = {models.SimState.__tablename__, models.SimSettings.__tablename__}
+        for table in reversed(db.Base.metadata.sorted_tables):
+            if table.name in keep:
+                continue
+            session.execute(table.delete())
 
 
 def _apply_bundle_singletons(data: Dict[str, Any], preset_id: Optional[str]) -> None:
     """Apply a bundle's ``sim_state`` / ``sim_settings`` onto the kept
     singletons (in-place update, not insert) and stamp the active seed."""
-    session = db.SessionLocal()
-    try:
+    with db.session_scope(coordinated=True) as session:
         state = get_or_create_sim_state(session)
         bundle_state = data.get("sim_state") or {}
         for field in _SIM_STATE_FIELDS:
@@ -496,9 +560,6 @@ def _apply_bundle_singletons(data: Dict[str, Any], preset_id: Optional[str]) -> 
         for field in _SIM_SETTINGS_FIELDS:
             if field in bundle_settings:
                 setattr(settings, field, bundle_settings[field])
-        session.commit()
-    finally:
-        session.close()
 
 
 def _bundle_summary(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -519,28 +580,28 @@ def seed_presets() -> List[str]:
 def seed_preset(preset_id: str) -> Dict[str, Any]:
     if preset_id not in ctx.seeder.list_presets():
         raise HTTPException(status_code=404, detail=f"Unknown preset {preset_id!r}")
-    # Halt the loop, then wipe (keeping the singletons) so reseeding is
-    # idempotent without racing the loop on the sim_state singleton.
-    ctx.clock.stop()
-    _drain_loop()
-    _wipe_for_seed()
-    try:
-        data = ctx.seeder.load_preset(preset_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    _apply_bundle_singletons(data, preset_id)
-    ctx.scenarios.seed_default_scenario()
+    with db.DB_LOCK:
+        # Halt the loop, then wipe (keeping the singletons) so reseeding is
+        # idempotent without racing the loop on the sim_state singleton.
+        ctx.clock.stop()
+        _wipe_for_seed()
+        try:
+            data = ctx.seeder.load_preset(preset_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _apply_bundle_singletons(data, preset_id)
+        ctx.scenarios.seed_default_scenario()
     return {"preset_id": preset_id, "inserted": _bundle_summary(data)}
 
 
 @app.post("/api/seed/generate")
 def seed_generate(body: GenerateBody) -> Dict[str, Any]:
-    ctx.clock.stop()
-    _drain_loop()
-    _wipe_for_seed()
-    data = ctx.seeder.generate(body.cuisine, body.size_params)
-    _apply_bundle_singletons(data, None)
-    ctx.scenarios.seed_default_scenario()
+    with db.DB_LOCK:
+        ctx.clock.stop()
+        _wipe_for_seed()
+        data = ctx.seeder.generate(body.cuisine, body.size_params)
+        _apply_bundle_singletons(data, None)
+        ctx.scenarios.seed_default_scenario()
     return {"cuisine": body.cuisine, "inserted": _bundle_summary(data)}
 
 
@@ -565,7 +626,7 @@ def _register_crud(prefix: str, model: Any) -> None:
     tag = prefix
 
     def list_rows(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
-        return [_row_to_dict(r) for r in db_session.query(model).all()]
+        return _read_rows(db_session, model)
 
     def create_row(
         body: Dict[str, Any] = Body(...),
@@ -641,7 +702,8 @@ class WeatherOverrideBody(BaseModel):
 
 @app.get("/api/weather")
 def weather_current() -> Optional[Dict[str, Any]]:
-    row = ctx.weather.current()
+    with db.DB_LOCK:
+        row = ctx.weather.current()
     return _row_to_dict(row) if row is not None else None
 
 
@@ -767,6 +829,135 @@ def read_calls(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
 # Action endpoints (§20)
 # ===========================================================================
 
+# ===========================================================================
+# Track A reads/actions
+# ===========================================================================
+
+class TrackAStaffBody(BaseModel):
+    staff_id: Optional[int] = None
+    station_id: Optional[int] = None
+    daypart: Optional[str] = None
+    status: str = "sick"
+    reason: str = "called in sick"
+
+
+class TrackAForecastAutoBody(BaseModel):
+    enabled: bool
+
+
+def _track_a_agent(name: str) -> Any:
+    agent = ctx.track_a.get(name)
+    if agent is None:
+        raise HTTPException(status_code=503, detail=f"Track A agent {name!r} is not available")
+    return agent
+
+
+@app.get("/api/track-a/snapshot")
+def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    track_groups = {"forecasting", "sensing", "human"}
+    signals = _read_rows(
+        db_session,
+        models.Signal,
+        order_by=models.Signal.created_at.desc(),
+        predicate=lambda row: row.get("status") == "live"
+        and bool(track_groups.intersection(set(row.get("groups") or []))),
+    )
+    forecaster = ctx.track_a.get("forecaster")
+    return {
+        "demo_mode": os.getenv("DEMO_MODE", "combined"),
+        "menu_items": _read_rows(db_session, models.MenuItem, models.MenuItem.id.asc()),
+        "forecasts": _read_rows(db_session, models.Forecast, models.Forecast.generated_at.desc(), 100),
+        "batches": _read_rows(db_session, models.Batch, models.Batch.decided_at.desc(), 50),
+        "demand_memory": _read_rows(
+            db_session,
+            models.DemandForecasterMemory,
+            models.DemandForecasterMemory.last_seen_at.desc(),
+            40,
+        ),
+        "forecast_reasoning": _read_rows(
+            db_session,
+            models.EventLog,
+            models.EventLog.sim_time.desc(),
+            80,
+            predicate=lambda row: row.get("category") in {"forecast", "batch"},
+        ),
+        "competitors": _read_rows(db_session, models.Competitor, models.Competitor.id.asc()),
+        "competitor_offers": _read_rows(db_session, models.CompetitorOffer, models.CompetitorOffer.id.asc()),
+        "competitor_intel": _read_rows(db_session, models.CompetitorIntel, models.CompetitorIntel.sim_time.desc(), 50),
+        "reviews": _read_rows(db_session, models.Review, models.Review.sim_time.desc(), 50),
+        "review_insights": _read_rows(db_session, models.ReviewInsight, models.ReviewInsight.sim_time.desc(), 50),
+        "stations": _read_rows(db_session, models.Station, models.Station.id.asc()),
+        "staff": _read_rows(db_session, models.Staff, models.Staff.id.asc()),
+        "staff_stations": _read_rows(db_session, models.StaffStation, models.StaffStation.id.asc()),
+        "attendance": _read_rows(db_session, models.Attendance, models.Attendance.sim_time.desc(), 50),
+        "signals": signals,
+        "events": _read_rows(db_session, models.EventLog, models.EventLog.sim_time.desc(), 50),
+        "forecast_agent": {
+            "llm_auto_mode": bool(getattr(forecaster, "llm_auto_mode", False)),
+        },
+    }
+
+
+@app.post("/api/track-a/forecast/run")
+def track_a_run_forecast() -> Dict[str, Any]:
+    forecaster = _track_a_agent("forecaster")
+    with db.DB_LOCK:
+        forecasts = forecaster.run_forecast("manual")
+    return {"created": len(forecasts)}
+
+
+@app.post("/api/track-a/forecast/optimize")
+def track_a_optimize_forecast() -> Dict[str, Any]:
+    forecaster = _track_a_agent("forecaster")
+    with db.DB_LOCK:
+        forecasts = forecaster.optimize_forecast("manual")
+    return {"created": len(forecasts), "optimized": True}
+
+
+@app.post("/api/track-a/forecast/auto-mode")
+def track_a_forecast_auto_mode(body: TrackAForecastAutoBody) -> Dict[str, Any]:
+    forecaster = _track_a_agent("forecaster")
+    with db.DB_LOCK:
+        return forecaster.set_auto_mode(body.enabled)
+
+
+@app.post("/api/track-a/reviews/process")
+def track_a_process_reviews() -> Dict[str, Any]:
+    review = _track_a_agent("review")
+    rows = review.process_unprocessed()
+    return {"created": len(rows)}
+
+
+@app.post("/api/track-a/staff/recompute")
+def track_a_staff_recompute() -> Dict[str, Any]:
+    staff = _track_a_agent("staff")
+    return {"coverage": staff.recompute()}
+
+
+@app.post("/api/track-a/staff/call-in-sick")
+def track_a_staff_call_in_sick(body: TrackAStaffBody) -> Dict[str, Any]:
+    staff = _track_a_agent("staff")
+    return staff.call_in_sick(
+        staff_id=body.staff_id,
+        station_id=body.station_id,
+        daypart=body.daypart,
+        status=body.status,
+        reason=body.reason,
+    )
+
+
+@app.post("/api/track-a/competitors/{competitor_id}/research")
+def track_a_competitor_research(competitor_id: int) -> Dict[str, Any]:
+    session = db.new_session()
+    try:
+        if session.get(models.Competitor, competitor_id) is None:
+            raise HTTPException(status_code=404, detail=f"Competitor {competitor_id} not found")
+    finally:
+        session.close()
+    competitor = _track_a_agent("competitor")
+    return competitor.request_research(competitor_id)
+
+
 class VoiceBody(BaseModel):
     text: str
 
@@ -799,7 +990,7 @@ def voice_transcript(body: VoiceBody) -> Dict[str, Any]:
 
 @app.post("/api/calls/{call_id}/turn")
 def call_turn(call_id: int, body: CallTurnBody) -> Dict[str, Any]:
-    session = db.SessionLocal()
+    session = db.new_session()
     try:
         if session.get(models.Call, call_id) is None:
             raise HTTPException(status_code=404, detail=f"Call {call_id} not found")
@@ -810,7 +1001,7 @@ def call_turn(call_id: int, body: CallTurnBody) -> Dict[str, Any]:
 
 @app.post("/api/calls/{call_id}/end")
 def call_end(call_id: int) -> Dict[str, Any]:
-    session = db.SessionLocal()
+    session = db.new_session()
     try:
         if session.get(models.Call, call_id) is None:
             raise HTTPException(status_code=404, detail=f"Call {call_id} not found")

@@ -20,6 +20,7 @@ on the real-time cadence while the clock is ``RUNNING``.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional
@@ -114,6 +115,7 @@ class Orchestrator:
         self.triggers: List[Trigger] = []
         self.agents: List[BaseAgent] = []
         self._loop_running = False
+        self.coordinator: Optional[Any] = None
         # Let the clock query us for the next scheduled due time (``step``).
         clock.attach_orchestrator(self)
 
@@ -343,8 +345,13 @@ class Orchestrator:
         self._loop_running = True
         try:
             while self._loop_running:
-                if self.clock.current_state()["status"] == RUNNING:
-                    events = self.tick()
+                guard = self.coordinator or nullcontext()
+                with guard:
+                    if self.clock.current_state()["status"] != RUNNING:
+                        events = None
+                    else:
+                        events = self.tick()
+                if events is not None:
                     result = broadcast_fn(events)
                     if inspect.isawaitable(result):
                         await result

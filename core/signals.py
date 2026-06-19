@@ -172,7 +172,7 @@ class DemandForecastPayload(BaseModel):
     menu_item_id: int
     window: Dict[str, float]                  # {start, end}
     daypart: str
-    qty: float
+    qty: int
     baseline: float
     multipliers: Dict[str, float] = {}
     confidence: float
@@ -183,7 +183,7 @@ class BatchDecisionPayload(BaseModel):
     menu_item_id: int
     serve_window: Dict[str, float]
     decision: str                             # "cook" | "skip"
-    qty: float
+    qty: int
     by: str                                   # "agent" | "human"
 
 

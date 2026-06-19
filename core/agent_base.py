@@ -10,7 +10,7 @@ it ``subscribe``s to groups (the orchestrator routes in-group signals to its
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .bus import PayloadArg, SignalBus, SignalTypeArg
 from .models import EventLog, Signal
@@ -77,6 +77,30 @@ class BaseAgent(ABC):
             return row
         finally:
             session.close()
+
+    # -- deferred side effects ---------------------------------------------
+
+    def _broadcast(self, event: str, payload: Dict[str, Any]) -> None:
+        """Publish a WebSocket event when the agent has a broadcast sink."""
+        sink = getattr(self, "ws_broadcast", None)
+        if sink is not None:
+            sink(event, payload)
+
+    def _run_after_commit(self, actions: List[Tuple[str, Any]]) -> None:
+        """Run signal/log/broadcast work after an agent commits DB changes."""
+        for kind, payload in actions:
+            if kind == "emit":
+                signal_type, signal_payload, kwargs = payload
+                self.emit(signal_type, signal_payload, **kwargs)
+            elif kind == "log":
+                category, summary, detail = payload
+                self.log_event(category, summary, detail)
+            elif kind == "broadcast":
+                event, ws_payload = payload
+                self._broadcast(event, ws_payload)
+            elif kind == "remember":
+                remember = getattr(self, "_remember")
+                remember(*payload)
 
     # -- clock --------------------------------------------------------------
 
