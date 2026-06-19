@@ -161,20 +161,6 @@ class StaffAgent(BaseAgent):
         self.recompute()
         return result
 
-    def _broadcast(self, event: str, payload: Dict[str, Any]) -> None:
-        if self.ws_broadcast is not None:
-            self.ws_broadcast(event, payload)
-
-    def _run_after_commit(self, actions: List[tuple[str, Any]]) -> None:
-        for kind, payload in actions:
-            if kind == "emit":
-                signal_type, signal_payload, kwargs = payload
-                self.emit(signal_type, signal_payload, **kwargs)
-            elif kind == "log":
-                category, summary, detail = payload
-                self.log_event(category, summary, detail)
-
-
 def shift_ttl(now: float) -> float:
     day_end = (int(now // SECONDS_PER_DAY) + 1) * SECONDS_PER_DAY
     return max(day_end - now, 1.0)

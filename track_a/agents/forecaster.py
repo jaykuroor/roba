@@ -1430,24 +1430,6 @@ class DemandForecaster(BaseAgent):
         rounded = round(float(forecast_qty) / step) * step if step > 0 else nearest_int(float(forecast_qty))
         return int(max(0, min(maximum, max(minimum, rounded))))
 
-    def _broadcast(self, event: str, payload: Dict[str, Any]) -> None:
-        if self.ws_broadcast is not None:
-            self.ws_broadcast(event, payload)
-
-    def _run_after_commit(self, actions: List[Tuple[str, Any]]) -> None:
-        for kind, payload in actions:
-            if kind == "emit":
-                signal_type, signal_payload, kwargs = payload
-                self.emit(signal_type, signal_payload, **kwargs)
-            elif kind == "log":
-                category, summary, detail = payload
-                self.log_event(category, summary, detail)
-            elif kind == "broadcast":
-                event, ws_payload = payload
-                self._broadcast(event, ws_payload)
-            elif kind == "remember":
-                self._remember(*payload)
-
     @staticmethod
     def _forecast_to_dict(row: Forecast) -> Dict[str, Any]:
         data = {col.key: getattr(row, col.key) for col in row.__table__.columns}

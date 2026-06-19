@@ -179,16 +179,6 @@ class CompetitorAgent(BaseAgent):
             session.close()
         return None
 
-    def _broadcast(self, event: str, payload: Dict[str, Any]) -> None:
-        if self.ws_broadcast is not None:
-            self.ws_broadcast(event, payload)
-
-    def _run_after_commit(self, actions: List[tuple[str, Any]]) -> None:
-        for kind, payload in actions:
-            if kind == "emit":
-                signal_type, signal_payload, kwargs = payload
-                self.emit(signal_type, signal_payload, **kwargs)
-
     @staticmethod
     def _competitor_to_dict(row: Competitor) -> Dict[str, Any]:
         return {col.key: getattr(row, col.key) for col in row.__table__.columns}

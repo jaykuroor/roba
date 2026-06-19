@@ -240,22 +240,6 @@ class ReviewAgent(BaseAgent):
             return "high"
         return default
 
-    def _broadcast(self, event: str, payload: Dict[str, Any]) -> None:
-        if self.ws_broadcast is not None:
-            self.ws_broadcast(event, payload)
-
-    def _run_after_commit(self, actions: List[tuple[str, Any]]) -> None:
-        for kind, payload in actions:
-            if kind == "emit":
-                signal_type, signal_payload, kwargs = payload
-                self.emit(signal_type, signal_payload, **kwargs)
-            elif kind == "log":
-                category, summary, detail = payload
-                self.log_event(category, summary, detail)
-            elif kind == "broadcast":
-                event, ws_payload = payload
-                self._broadcast(event, ws_payload)
-
     @staticmethod
     def _insight_to_dict(row: ReviewInsight) -> Dict[str, Any]:
         return {col.key: getattr(row, col.key) for col in row.__table__.columns}
