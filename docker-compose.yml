@@ -1,13 +1,25 @@
 services:
+  base:
+    build: { context: ., dockerfile: Dockerfile.base }
+    image: roba-base:latest
+    profiles: ["build-only"]   # never started; just produces the pip-install layer for backend to build FROM
   backend:
     build: { context: ., dockerfile: Dockerfile.backend }
     ports: ["8000:8000"]
     env_file: [.env]
     environment: { DB_PATH: /app/dbdata/demo.db, DEMO_MODE: "${DEMO_MODE:-combined}" }
     volumes: ["dbdata:/app/dbdata"]            # SQLite persists here
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
   frontend:
     build: { context: ./frontend }
     ports: ["5173:5173"]
-    depends_on: [backend]
+    depends_on:
+      backend:
+        condition: service_healthy
     environment: { BACKEND_ORIGIN: http://backend:8000 }
 volumes: { dbdata: {} }

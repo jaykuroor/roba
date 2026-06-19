@@ -1,7 +1,5 @@
-FROM python:3.14-slim
+FROM roba-base:latest
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 COPY core ./core
 COPY track_a ./track_a
 COPY track_b ./track_b

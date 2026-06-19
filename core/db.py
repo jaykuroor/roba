@@ -8,8 +8,12 @@
   reference/config (and simulation/control) data, or reset everything.
 """
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, scoped_session, sessionmaker
+from contextlib import contextmanager
+import threading
+from typing import Iterator
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from . import config
 
@@ -24,9 +28,56 @@ engine = create_engine(
     pool_pre_ping=True,
 )
 
-SessionLocal = scoped_session(
-    sessionmaker(bind=engine, autoflush=False, autocommit=False)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+    expire_on_commit=False,
 )
+
+# Coordinates destructive reseeds, API read bursts, and the tick loop. It is
+# deliberately process-local because the demo runs a single uvicorn worker.
+DB_LOCK = threading.RLock()
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+    """Tune SQLite for the demo's concurrent FastAPI/tick-loop workload."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA journal_mode=WAL")
+    finally:
+        cursor.close()
+
+
+def new_session() -> Session:
+    """Return one independent ORM session owned by the caller."""
+    return SessionLocal()
+
+
+@contextmanager
+def session_scope(coordinated: bool = False) -> Iterator[Session]:
+    """Create a session, commit on success, rollback on error, always close.
+
+    ``coordinated=True`` also takes ``DB_LOCK`` for the block. Use that for
+    operations that must not interleave with the tick loop or frontend reads.
+    """
+    lock = DB_LOCK if coordinated else None
+    if lock is not None:
+        lock.acquire()
+    session = new_session()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+        if lock is not None:
+            lock.release()
 
 
 def create_all():
@@ -38,7 +89,7 @@ def create_all():
 
 def get_db():
     """FastAPI dependency: yield a session and always close it."""
-    db = SessionLocal()
+    db = new_session()
     try:
         yield db
     finally:
@@ -58,15 +109,16 @@ def reset_db(keep_reference=True):
     from . import models
 
     # Ensure the schema exists before we attempt selective drops.
-    Base.metadata.create_all(bind=engine)
-
-    if keep_reference:
-        tables = [
-            m.__table__
-            for m in (models.TRANSACTIONAL_MODELS + models.INTELLIGENCE_MODELS)
-        ]
-        Base.metadata.drop_all(bind=engine, tables=tables)
-        Base.metadata.create_all(bind=engine, tables=tables)
-    else:
-        Base.metadata.drop_all(bind=engine)
+    with DB_LOCK:
         Base.metadata.create_all(bind=engine)
+
+        if keep_reference:
+            tables = [
+                m.__table__
+                for m in (models.TRANSACTIONAL_MODELS + models.INTELLIGENCE_MODELS)
+            ]
+            Base.metadata.drop_all(bind=engine, tables=tables)
+            Base.metadata.create_all(bind=engine, tables=tables)
+        else:
+            Base.metadata.drop_all(bind=engine)
+            Base.metadata.create_all(bind=engine)
