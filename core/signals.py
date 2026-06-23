@@ -37,6 +37,7 @@ class SignalType(str, Enum):
     SUPPLIER_PRICE_UPDATE = "SUPPLIER_PRICE_UPDATE"
     COMPETITOR_UPDATE = "COMPETITOR_UPDATE"
     COMPETITOR_INTEL = "COMPETITOR_INTEL"
+    COMPETITOR_MARKET_SIGNAL = "COMPETITOR_MARKET_SIGNAL"
     REVIEW_INSIGHT = "REVIEW_INSIGHT"
     STAFF_COVERAGE = "STAFF_COVERAGE"
     PROMO_PROPOSAL = "PROMO_PROPOSAL"
@@ -109,6 +110,11 @@ SIGNAL_REGISTRY: Dict[SignalType, Dict[str, Any]] = {
         "groups": ["forecasting", "human"],
         "priority": 2,
         "default_ttl_sim_s": 86400.0,         # 24h
+    },
+    SignalType.COMPETITOR_MARKET_SIGNAL: {
+        "groups": ["forecasting", "human"],
+        "priority": 2,
+        "default_ttl_sim_s": None,            # per observation window
     },
     SignalType.REVIEW_INSIGHT: {
         "groups": ["forecasting", "human"],
@@ -261,6 +267,21 @@ class CompetitorIntelPayload(BaseModel):
     call_id: Optional[int] = None
 
 
+class CompetitorMarketSignalPayload(BaseModel):
+    signal_kind: str
+    source_channel: str                        # aggregator | web | probe | scenario
+    platform: str
+    competitor_id: Optional[int] = None
+    affected_menu_items: List[int] = []
+    affected_categories: List[str] = []
+    direction: str                             # opportunity | threat | drag | watch
+    impact_score: float
+    confidence: float
+    window: Dict[str, float]
+    evidence: List[str] = []
+    raw: Dict[str, Any] = {}
+
+
 class ReviewInsightPayload(BaseModel):
     review_id: Optional[int] = None
     severity: str
@@ -351,6 +372,7 @@ SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.SUPPLIER_PRICE_UPDATE: SupplierPriceUpdatePayload,
     SignalType.COMPETITOR_UPDATE: CompetitorUpdatePayload,
     SignalType.COMPETITOR_INTEL: CompetitorIntelPayload,
+    SignalType.COMPETITOR_MARKET_SIGNAL: CompetitorMarketSignalPayload,
     SignalType.REVIEW_INSIGHT: ReviewInsightPayload,
     SignalType.STAFF_COVERAGE: StaffCoveragePayload,
     SignalType.PROMO_PROPOSAL: PromoProposalPayload,

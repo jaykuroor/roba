@@ -567,6 +567,67 @@ class CompetitorIntel(Base):
                 f"method={self.method!r}>")
 
 
+class CompetitorObservation(Base):
+    __tablename__ = "competitor_observations"
+
+    id = _pk()
+    competitor_id = mapped_column(ForeignKey("competitors.id"), nullable=True)
+    source_channel = mapped_column(String)       # aggregator | web | probe | scenario
+    platform = mapped_column(String)
+    signal_kind = mapped_column(String)
+    direction = mapped_column(String)            # opportunity | threat | drag | watch
+    impact_score = mapped_column(Float)
+    confidence = mapped_column(Float)
+    affected_menu_items = mapped_column(JSON)
+    affected_categories = mapped_column(JSON)
+    window = mapped_column(JSON)
+    evidence = mapped_column(JSON)
+    raw = mapped_column(JSON)
+    state_hash = mapped_column(String)
+    sim_time = mapped_column(Float)
+
+    def __repr__(self):
+        return (f"<CompetitorObservation id={self.id} kind={self.signal_kind!r} "
+                f"competitor_id={self.competitor_id}>")
+
+
+class CompetitorMenuSnapshot(Base):
+    __tablename__ = "competitor_menu_snapshots"
+
+    id = _pk()
+    competitor_id = mapped_column(ForeignKey("competitors.id"))
+    source_channel = mapped_column(String)
+    platform = mapped_column(String)
+    menu_hash = mapped_column(String)
+    items = mapped_column(JSON)
+    compliance = mapped_column(JSON)
+    fetched_at = mapped_column(Float)
+
+    def __repr__(self):
+        return (f"<CompetitorMenuSnapshot id={self.id} competitor_id={self.competitor_id} "
+                f"menu_hash={self.menu_hash!r}>")
+
+
+class CompetitorProbeResult(Base):
+    __tablename__ = "competitor_probe_results"
+
+    id = _pk()
+    competitor_id = mapped_column(ForeignKey("competitors.id"))
+    source_channel = mapped_column(String)
+    platform = mapped_column(String)
+    estimated_wait_min = mapped_column(Float)
+    availability = mapped_column(String)
+    tactic_labels = mapped_column(JSON)
+    confidence = mapped_column(Float)
+    transcript = mapped_column(JSON)
+    raw = mapped_column(JSON)
+    sim_time = mapped_column(Float)
+
+    def __repr__(self):
+        return (f"<CompetitorProbeResult id={self.id} competitor_id={self.competitor_id} "
+                f"wait={self.estimated_wait_min}>")
+
+
 class Review(Base):
     __tablename__ = "reviews"
 
@@ -850,7 +911,8 @@ TRANSACTIONAL_MODELS = [
 
 INTELLIGENCE_MODELS = [
     Forecast, ForecastOverride, ForecastTrace, ForecastAdjustment,
-    DemandForecasterMemory, Signal, CompetitorIntel, Review, ReviewInsight,
+    DemandForecasterMemory, Signal, CompetitorIntel, CompetitorObservation,
+    CompetitorMenuSnapshot, CompetitorProbeResult, Review, ReviewInsight,
     SupplierPriceHistory, Negotiation,
     ApprovalRequest, ForecastJob, Promotion, UserFact, WeatherLog, Call,
 ]

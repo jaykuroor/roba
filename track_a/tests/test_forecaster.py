@@ -384,6 +384,76 @@ def test_forecast_applies_multipliers_and_explains(bus, session_factory, seeded)
         session.close()
 
 
+def test_competitor_market_opportunity_lifts_matched_item(bus, session_factory, seeded):
+    bus.emit(
+        SignalType.COMPETITOR_MARKET_SIGNAL,
+        {
+            "signal_kind": "competitor_offline",
+            "source_channel": "aggregator",
+            "platform": "swiggy",
+            "competitor_id": 1,
+            "affected_menu_items": [1],
+            "affected_categories": ["pizza"],
+            "direction": "opportunity",
+            "impact_score": 0.20,
+            "confidence": 1.0,
+            "window": {"start": 28800.0, "end": 39600.0},
+            "evidence": ["Mario is offline"],
+            "raw": {"is_open": False},
+        },
+        source="test",
+        ttl=10800.0,
+    )
+    agent = DemandForecaster(bus, session_factory)
+    agent.run_forecast("test")
+
+    session = session_factory()
+    try:
+        pizza = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        pasta = session.query(Forecast).filter(Forecast.menu_item_id == 2).first()
+        assert pizza.multipliers["competitor_market"] > 1.0
+        assert pasta.multipliers["competitor_market"] == pytest.approx(1.0)
+        trace = session.query(ForecastTrace).filter(ForecastTrace.forecast_id == pizza.id).one()
+        competitor_adjustment = next(
+            entry for entry in trace.trace["adjustments"]
+            if entry["key"] == "competitor_market"
+        )
+        assert competitor_adjustment["evidence"][0]["signal_kind"] == "competitor_offline"
+    finally:
+        session.close()
+
+
+def test_competitor_market_threat_suppresses_matched_item(bus, session_factory, seeded):
+    bus.emit(
+        SignalType.COMPETITOR_MARKET_SIGNAL,
+        {
+            "signal_kind": "promo_started",
+            "source_channel": "aggregator",
+            "platform": "zomato",
+            "competitor_id": 1,
+            "affected_menu_items": [1],
+            "affected_categories": ["pizza"],
+            "direction": "threat",
+            "impact_score": 0.20,
+            "confidence": 1.0,
+            "window": {"start": 28800.0, "end": 39600.0},
+            "evidence": ["Mario started a pizza discount"],
+            "raw": {"discount_pct": 20},
+        },
+        source="test",
+        ttl=10800.0,
+    )
+    agent = DemandForecaster(bus, session_factory)
+    agent.run_forecast("test")
+
+    session = session_factory()
+    try:
+        pizza = session.query(Forecast).filter(Forecast.menu_item_id == 1).first()
+        assert pizza.multipliers["competitor_market"] < 1.0
+    finally:
+        session.close()
+
+
 def test_large_event_value_is_treated_as_attendance_not_multiplier(bus, session_factory, seeded):
     bus.emit(
         SignalType.USER_FACT,

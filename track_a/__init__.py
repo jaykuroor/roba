@@ -19,6 +19,7 @@ TRACK_A_SIGNAL_TYPES = [
     SignalType.STAFF_COVERAGE,
     SignalType.COMPETITOR_UPDATE,
     SignalType.COMPETITOR_INTEL,
+    SignalType.COMPETITOR_MARKET_SIGNAL,
     SignalType.REVIEW_INSIGHT,
     SignalType.WEATHER_UPDATE,
     SignalType.USER_FACT,

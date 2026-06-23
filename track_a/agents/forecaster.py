@@ -24,6 +24,7 @@ from core.models import (
     Attendance,
     Batch,
     BatchDefinition,
+    Competitor,
     DemandForecasterMemory,
     Forecast,
     ForecastAdjustment,
@@ -74,6 +75,7 @@ MATERIAL_SIGNAL_TYPES = {
     SignalType.STAFF_COVERAGE.value,
     SignalType.COMPETITOR_UPDATE.value,
     SignalType.COMPETITOR_INTEL.value,
+    SignalType.COMPETITOR_MARKET_SIGNAL.value,
     SignalType.REVIEW_INSIGHT.value,
     SignalType.WEATHER_UPDATE.value,
     SignalType.MENU_TOGGLE.value,
@@ -124,6 +126,7 @@ class DemandForecaster(BaseAgent):
             SignalType.STAFF_COVERAGE.value,
             SignalType.COMPETITOR_UPDATE.value,
             SignalType.COMPETITOR_INTEL.value,
+            SignalType.COMPETITOR_MARKET_SIGNAL.value,
             SignalType.REVIEW_INSIGHT.value,
             SignalType.WEATHER_UPDATE.value,
             SignalType.USER_FACT.value,
@@ -310,6 +313,7 @@ class DemandForecaster(BaseAgent):
                             else None
                         )
                     ),
+                    live_signals=live,
                 )
                 forecast = Forecast(
                     menu_item_id=item.id,
@@ -787,7 +791,7 @@ class DemandForecaster(BaseAgent):
         return {
             "settings_demand": round(self._settings_multiplier(session, item, baseline, daypart), 3),
             "event": round(self._event_multiplier(item, window, live), 3),
-            "competitor": round(self._competitor_multiplier(item, live), 3),
+            "competitor_market": round(self._competitor_multiplier(session, item, live), 3),
             "review": round(self._review_multiplier(item, live), 3),
             "staff_coverage": round(self._staff_multiplier(item, live), 3),
             "weather": round(self._weather_multiplier(session, item), 3),
@@ -804,7 +808,7 @@ class DemandForecaster(BaseAgent):
         labels = {
             "settings_demand": self._settings_explanation(multipliers.get("settings_demand", 1.0)),
             "event": self._event_explanation(multipliers.get("event", 1.0), window, live),
-            "competitor": "Competitor intelligence and offer changes.",
+            "competitor_market": self._competitor_explanation(item, live),
             "review": "Recent review sentiment for this item.",
             "staff_coverage": self._staff_explanation(multipliers.get("staff_coverage", 1.0)),
             "weather": self._weather_explanation(item, multipliers.get("weather", 1.0)),
@@ -1021,12 +1025,45 @@ class DemandForecaster(BaseAgent):
             return f"Recent POS velocity is below expectation at {value:.2f}x."
         return "Recent POS velocity is near expectation."
 
-    def _competitor_multiplier(self, item: MenuItem, live: Iterable[Signal]) -> float:
+    def _competitor_multiplier(
+        self,
+        session: Any,
+        item: MenuItem,
+        live: Iterable[Signal],
+    ) -> float:
         value = 1.0
         name = (item.name or "").lower()
+        item_category = str(item.category or "").lower()
+        _daypart, forecast_window = current_window(float(self.bus.sim_time))
         for sig in live:
             payload = sig.payload or {}
-            if sig.type == SignalType.COMPETITOR_INTEL.value:
+            if sig.type == SignalType.COMPETITOR_MARKET_SIGNAL.value:
+                signal_window = payload.get("window") or {}
+                if signal_window and not windows_overlap(forecast_window, signal_window):
+                    continue
+                affinity = self._competitor_item_affinity(item, payload)
+                if affinity <= 0:
+                    continue
+                competitor = (
+                    session.get(Competitor, payload.get("competitor_id"))
+                    if payload.get("competitor_id") is not None
+                    else None
+                )
+                direction = str(payload.get("direction") or "watch").lower()
+                sign = 1.0 if direction == "opportunity" else -1.0 if direction in {"threat", "drag"} else 0.0
+                impact = max(0.0, min(0.30, float(payload.get("impact_score") or 0.0)))
+                confidence = max(0.0, min(1.0, float(payload.get("confidence") or 0.0)))
+                value *= (
+                    1.0
+                    + sign
+                    * impact
+                    * confidence
+                    * self._signal_freshness(sig, half_life_sim_s=10800.0)
+                    * self._competitor_proximity(competitor)
+                    * self._competitor_cuisine_overlap(competitor, item_category)
+                    * affinity
+                )
+            elif sig.type == SignalType.COMPETITOR_INTEL.value:
                 dishes = [str(d).lower() for d in payload.get("popular_dishes") or []]
                 if any(name in dish or dish in name for dish in dishes):
                     value *= 1.05
@@ -1034,7 +1071,61 @@ class DemandForecaster(BaseAgent):
                 summary = str(payload.get("summary") or "").lower()
                 if item.category and str(item.category).lower() in summary:
                     value *= 0.97
-        return value
+        return min(1.6, max(0.7, value))
+
+    @staticmethod
+    def _competitor_item_affinity(item: MenuItem, payload: Dict[str, Any]) -> float:
+        affected_items = {int(v) for v in (payload.get("affected_menu_items") or [])}
+        if int(item.id) in affected_items:
+            return 1.0
+        categories = {str(v).lower() for v in (payload.get("affected_categories") or [])}
+        item_category = str(item.category or "").lower()
+        item_name = str(item.name or "").lower()
+        if item_category and item_category in categories:
+            return 0.8
+        if item_name and any(category in item_name or item_name in category for category in categories):
+            return 0.6
+        return 0.3 if payload.get("competitor_id") is None and categories else 0.0
+
+    @staticmethod
+    def _competitor_proximity(competitor: Optional[Competitor]) -> float:
+        if competitor is None:
+            return 0.8
+        radius = max(float(config.COMPETITOR_RADIUS_KM), 0.1)
+        distance = max(float(competitor.distance_km or radius), 0.0)
+        return min(1.0, max(0.2, 1.0 - (distance / radius) + 0.2))
+
+    @staticmethod
+    def _competitor_cuisine_overlap(competitor: Optional[Competitor], item_category: str) -> float:
+        if competitor is None:
+            return 0.85
+        cuisine = {str(c).lower() for c in (competitor.cuisine or [])}
+        if not cuisine:
+            return 0.7
+        if item_category and item_category in cuisine:
+            return 1.0
+        return 0.75
+
+    def _signal_freshness(self, sig: Signal, half_life_sim_s: float) -> float:
+        age = max(0.0, float(self.bus.sim_time) - float(sig.created_at or self.bus.sim_time))
+        return max(0.25, 0.5 ** (age / max(half_life_sim_s, 1.0)))
+
+    def _competitor_explanation(self, item: MenuItem, live: Iterable[Signal]) -> str:
+        labels: List[str] = []
+        for sig in live:
+            payload = sig.payload or {}
+            if sig.type == SignalType.COMPETITOR_MARKET_SIGNAL.value and self._competitor_item_affinity(item, payload) > 0:
+                labels.append(str(payload.get("signal_kind") or "market signal").replace("_", " "))
+            elif sig.type == SignalType.COMPETITOR_INTEL.value:
+                dishes = [str(d).lower() for d in payload.get("popular_dishes") or []]
+                name = str(item.name or "").lower()
+                if any(name in dish or dish in name for dish in dishes):
+                    labels.append("competitor favourite dish")
+            elif sig.type == SignalType.COMPETITOR_UPDATE.value and payload.get("offers_changed"):
+                labels.append("competitor offer change")
+        if labels:
+            return f"Competitor market signals affecting this item: {', '.join(labels[:3])}."
+        return "No live competitor market signal is changing this item."
 
     def _review_multiplier(self, item: MenuItem, live: Iterable[Signal]) -> float:
         value = 1.0
@@ -2049,7 +2140,7 @@ class DemandForecaster(BaseAgent):
             "availability",
             "staff_coverage",
             "event",
-            "competitor",
+            "competitor_market",
             "review",
             "weather",
             "recent_velocity",
@@ -2443,6 +2534,7 @@ class DemandForecaster(BaseAgent):
                 SignalType.STOCKOUT_RISK.value,
                 SignalType.COMPETITOR_UPDATE.value,
                 SignalType.COMPETITOR_INTEL.value,
+                SignalType.COMPETITOR_MARKET_SIGNAL.value,
                 SignalType.REVIEW_INSIGHT.value,
                 SignalType.WEATHER_UPDATE.value,
             }:
@@ -2533,7 +2625,10 @@ class DemandForecaster(BaseAgent):
                     operation=str(entry.get("operation") or ""),
                     value={"value": entry.get("value")},
                     reason=str(entry.get("reason") or ""),
-                    evidence={"trace_version": trace.get("version", 1)},
+                    evidence={
+                        "trace_version": trace.get("version", 1),
+                        "signals": entry.get("evidence") or [],
+                    },
                     created_at=now,
                 )
             )
@@ -2557,6 +2652,7 @@ class DemandForecaster(BaseAgent):
         trigger_reason: str,
         deterministic_recommendation: Optional[Dict[str, Any]] = None,
         finalizer_decision: Optional[Dict[str, Any]] = None,
+        live_signals: Optional[Iterable[Signal]] = None,
     ) -> Dict[str, Any]:
         adjustments = [
             {
@@ -2566,6 +2662,7 @@ class DemandForecaster(BaseAgent):
                 "operation": self._modifier_operation(key, value),
                 "value": round(float(value), 3),
                 "reason": explanations.get(key, key),
+                "evidence": self._modifier_evidence(key, item, live_signals or []),
             }
             for key, value in multipliers.items()
         ]
@@ -2625,6 +2722,34 @@ class DemandForecaster(BaseAgent):
         if key.startswith("llm"):
             return "llm_proposal"
         return "demand_modifier"
+
+    def _modifier_evidence(
+        self,
+        key: str,
+        item: MenuItem,
+        live_signals: Iterable[Signal],
+    ) -> List[Dict[str, Any]]:
+        if key != "competitor_market":
+            return []
+        evidence: List[Dict[str, Any]] = []
+        for sig in live_signals:
+            if sig.type != SignalType.COMPETITOR_MARKET_SIGNAL.value:
+                continue
+            payload = sig.payload or {}
+            if self._competitor_item_affinity(item, payload) <= 0:
+                continue
+            evidence.append(
+                {
+                    "signal_id": sig.signal_id,
+                    "signal_kind": payload.get("signal_kind"),
+                    "competitor_id": payload.get("competitor_id"),
+                    "direction": payload.get("direction"),
+                    "impact_score": payload.get("impact_score"),
+                    "confidence": payload.get("confidence"),
+                    "evidence": payload.get("evidence") or [],
+                }
+            )
+        return evidence[:5]
 
     @staticmethod
     def _modifier_operation(key: str, value: float) -> str:

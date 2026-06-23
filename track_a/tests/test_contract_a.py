@@ -38,6 +38,25 @@ def test_track_a_emitted_payloads_validate(bus):
         source="test",
     )
     bus.emit(
+        SignalType.COMPETITOR_MARKET_SIGNAL,
+        {
+            "signal_kind": "competitor_offline",
+            "source_channel": "aggregator",
+            "platform": "swiggy",
+            "competitor_id": 1,
+            "affected_menu_items": [1],
+            "affected_categories": ["pizza"],
+            "direction": "opportunity",
+            "impact_score": 0.18,
+            "confidence": 0.85,
+            "window": {"start": 1.0, "end": 2.0},
+            "evidence": ["nearby rival unavailable"],
+            "raw": {"is_open": False},
+        },
+        source="test",
+        ttl=100.0,
+    )
+    bus.emit(
         SignalType.REVIEW_INSIGHT,
         {"review_id": 1, "severity": "low", "summary": "ok", "suggested_action": "none", "dish_mentions": []},
         source="test",

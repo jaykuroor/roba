@@ -948,6 +948,24 @@ def track_a_snapshot(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
         "competitors": _read_rows(db_session, models.Competitor, models.Competitor.id.asc()),
         "competitor_offers": _read_rows(db_session, models.CompetitorOffer, models.CompetitorOffer.id.asc()),
         "competitor_intel": _read_rows(db_session, models.CompetitorIntel, models.CompetitorIntel.sim_time.desc(), 50),
+        "competitor_observations": _read_rows(
+            db_session,
+            models.CompetitorObservation,
+            models.CompetitorObservation.sim_time.desc(),
+            80,
+        ),
+        "competitor_menu_snapshots": _read_rows(
+            db_session,
+            models.CompetitorMenuSnapshot,
+            models.CompetitorMenuSnapshot.fetched_at.desc(),
+            30,
+        ),
+        "competitor_probe_results": _read_rows(
+            db_session,
+            models.CompetitorProbeResult,
+            models.CompetitorProbeResult.sim_time.desc(),
+            30,
+        ),
         "reviews": _read_rows(db_session, models.Review, models.Review.sim_time.desc(), 50),
         "review_insights": _read_rows(db_session, models.ReviewInsight, models.ReviewInsight.sim_time.desc(), 50),
         "stations": _read_rows(db_session, models.Station, models.Station.id.asc()),
@@ -1120,6 +1138,31 @@ def track_a_competitor_research(competitor_id: int) -> Dict[str, Any]:
         session.close()
     competitor = _track_a_agent("competitor")
     return competitor.request_research(competitor_id)
+
+
+@app.post("/api/track-a/competitors/poll-aggregators")
+def track_a_competitor_poll_aggregators() -> Dict[str, Any]:
+    competitor = _track_a_agent("competitor")
+    with db.DB_LOCK:
+        _sync_bus_to_clock()
+        observations = competitor.poll_aggregators()
+    return {"created": len(observations), "observations": observations}
+
+
+@app.post("/api/track-a/competitors/{competitor_id}/refresh-menu")
+def track_a_competitor_refresh_menu(competitor_id: int) -> Dict[str, Any]:
+    competitor = _track_a_agent("competitor")
+    with db.DB_LOCK:
+        _sync_bus_to_clock()
+        return competitor.refresh_menu(competitor_id)
+
+
+@app.post("/api/track-a/competitors/{competitor_id}/probe")
+def track_a_competitor_probe(competitor_id: int) -> Dict[str, Any]:
+    competitor = _track_a_agent("competitor")
+    with db.DB_LOCK:
+        _sync_bus_to_clock()
+        return competitor.run_probe(competitor_id)
 
 
 class VoiceBody(BaseModel):

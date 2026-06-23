@@ -163,6 +163,49 @@ export interface CompetitorIntel {
   sim_time: number;
 }
 
+export interface CompetitorObservation {
+  id: number;
+  competitor_id: number | null;
+  source_channel: string;
+  platform: string;
+  signal_kind: string;
+  direction: string;
+  impact_score: number;
+  confidence: number;
+  affected_menu_items: number[];
+  affected_categories: string[];
+  window: { start: number; end: number };
+  evidence: string[];
+  raw: Record<string, unknown>;
+  state_hash: string;
+  sim_time: number;
+}
+
+export interface CompetitorMenuSnapshot {
+  id: number;
+  competitor_id: number;
+  source_channel: string;
+  platform: string;
+  menu_hash: string;
+  items: Array<Record<string, unknown>>;
+  compliance: Record<string, unknown>;
+  fetched_at: number;
+}
+
+export interface CompetitorProbeResult {
+  id: number;
+  competitor_id: number;
+  source_channel: string;
+  platform: string;
+  estimated_wait_min: number;
+  availability: string;
+  tactic_labels: string[];
+  confidence: number;
+  transcript: Array<Record<string, unknown>>;
+  raw: Record<string, unknown>;
+  sim_time: number;
+}
+
 export interface Review {
   id: number;
   source: string;
@@ -260,6 +303,9 @@ export interface TrackASnapshot {
   competitors: Competitor[];
   competitor_offers: CompetitorOffer[];
   competitor_intel: CompetitorIntel[];
+  competitor_observations: CompetitorObservation[];
+  competitor_menu_snapshots: CompetitorMenuSnapshot[];
+  competitor_probe_results: CompetitorProbeResult[];
   reviews: Review[];
   review_insights: ReviewInsight[];
   stations: Station[];
