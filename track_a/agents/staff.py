@@ -34,6 +34,10 @@ class StaffAgent(BaseAgent):
         )
 
     def on_signal(self, signal: Signal) -> None:
+        if signal.type == SignalType.STAFF_AVAILABILITY.value:
+            self._apply_staff_availability(signal.payload or {})
+            self.recompute()
+            return
         if signal.type == SignalType.USER_FACT.value:
             intent = (signal.payload or {}).get("intent")
             if intent in {"set_leave", "set_attendance"}:
@@ -160,6 +164,55 @@ class StaffAgent(BaseAgent):
             session.close()
         self.recompute()
         return result
+
+    def _apply_staff_availability(self, payload: Dict[str, Any]) -> None:
+        now = float(self.bus.sim_time)
+        status = str(payload.get("status") or "leave")
+        reason = str(payload.get("reason") or payload.get("raw_text") or "voice availability note")
+        staff_id = payload.get("staff_id")
+        staff_name = payload.get("staff_name")
+        daypart = current_daypart(now)
+        window = payload.get("window")
+        if isinstance(window, dict):
+            start = float(window.get("start", now) or now)
+            end = float(window.get("end", start) or start)
+        else:
+            start = end = now
+        first_day = int(start // SECONDS_PER_DAY)
+        last_day = int(max(end - 1.0, start) // SECONDS_PER_DAY)
+
+        session = self.db_session_factory()
+        try:
+            resolved_staff_id = int(staff_id) if staff_id is not None else None
+            if resolved_staff_id is None and staff_name:
+                row = session.query(Staff).filter(Staff.name.ilike(str(staff_name))).first()
+                if row is None:
+                    row = session.query(Staff).filter(Staff.name.ilike(f"{staff_name}%")).first()
+                resolved_staff_id = int(row.id) if row is not None else None
+            for day in range(first_day, last_day + 1):
+                session.add(
+                    Attendance(
+                        staff_id=resolved_staff_id,
+                        date_sim_day=day,
+                        status=status,
+                        daypart=None if first_day != last_day else daypart,
+                        reason=reason,
+                        sim_time=now,
+                    )
+                )
+            session.commit()
+        finally:
+            session.close()
+        self.log_event(
+            "attendance",
+            f"Voice availability update recorded: {staff_name or resolved_staff_id or 'staff'} {status}.",
+            {
+                "staff_id": staff_id,
+                "staff_name": staff_name,
+                "status": status,
+                "window": window,
+            },
+        )
 
 def shift_ttl(now: float) -> float:
     day_end = (int(now // SECONDS_PER_DAY) + 1) * SECONDS_PER_DAY

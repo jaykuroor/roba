@@ -1,9 +1,11 @@
 """Tests for the Gemini-only LLM provider layer."""
 
 import pytest
+from pydantic import BaseModel
 
 from core import config
 from core.llm import CANNED_NOTE, LLMProvider
+from core.models import LLMCallLog
 
 
 class _FakeGeminiResponse:
@@ -20,6 +22,11 @@ SCHEMA = {
     },
     "required": ["intent"],
 }
+
+
+class StructuredIntent(BaseModel):
+    intent: str
+    confidence: float = 0.0
 
 
 def _gemini_llm(monkeypatch, responses):
@@ -198,13 +205,85 @@ def test_json_mode_validation_failure_falls_back(monkeypatch):
     assert calls["n"] == 2
 
 
-def test_non_gemini_hosted_providers_are_ignored(monkeypatch):
+def test_hosted_provider_chain_falls_back_to_canned(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setenv("GROQ_API_KEY", "unused")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "unused")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter")
+    attempted = []
+
+    def fake_openai_compatible(self, provider, *_args, **_kwargs):
+        attempted.append(provider)
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(LLMProvider, "_openai_compatible", fake_openai_compatible)
 
     llm = LLMProvider(fallback=["groq", "openrouter"])
     result = llm.complete([{"role": "user", "content": "x"}], use_site="review")
 
-    assert llm.fallback == ["canned"]
+    assert llm.fallback == ["groq", "openrouter", "canned"]
+    assert attempted == ["groq", "openrouter"]
     assert result.get("note") == CANNED_NOTE
+
+
+def test_complete_structured_logs_success_and_cache(monkeypatch, session_factory):
+    body = '{"intent":"set_leave","confidence":0.8}'
+    llm, calls = _gemini_llm(monkeypatch, [body])
+    llm.db_session_factory = session_factory
+
+    first = llm.complete_structured(
+        "voice.route",
+        StructuredIntent,
+        {"text": "Ansi is on leave"},
+        use_site="voice",
+    )
+    second = llm.complete_structured(
+        "voice.route",
+        StructuredIntent,
+        {"text": "Ansi is on leave"},
+        use_site="voice",
+    )
+
+    assert first["data"] == {"intent": "set_leave", "confidence": pytest.approx(0.8)}
+    assert first["provider"] == "gemini"
+    assert first["fallback_used"] is False
+    assert first["error"] is None
+    assert second["provider"] == "cache"
+    assert second["cached"] is True
+    assert calls["n"] == 1
+
+    session = session_factory()
+    try:
+        rows = session.query(LLMCallLog).order_by(LLMCallLog.id.asc()).all()
+        assert len(rows) == 2
+        assert rows[0].prompt_id == "voice.route"
+        assert rows[0].provider == "gemini"
+        assert rows[0].status == "ok"
+        assert rows[1].provider == "cache"
+        assert rows[1].cached == 1
+    finally:
+        session.close()
+
+
+def test_complete_structured_canned_fallback_logs(monkeypatch, session_factory):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    llm = LLMProvider(fallback=["gemini", "canned"], db_session_factory=session_factory)
+
+    result = llm.complete_structured(
+        "review.trend",
+        StructuredIntent,
+        {"reviews": []},
+        use_site="review",
+    )
+
+    assert result["provider"] == "canned"
+    assert result["fallback_used"] is True
+    assert result["data"]["note"] == CANNED_NOTE
+
+    session = session_factory()
+    try:
+        row = session.query(LLMCallLog).one()
+        assert row.prompt_id == "review.trend"
+        assert row.provider == "canned"
+        assert row.fallback_used == 1
+    finally:
+        session.close()

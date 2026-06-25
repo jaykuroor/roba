@@ -356,15 +356,17 @@ def test_material_signal_keeps_later_interval_runs_llm_authoritative(bus, sessio
 
 def test_forecast_applies_multipliers_and_explains(bus, session_factory, seeded):
     bus.emit(
-        SignalType.USER_FACT,
+        SignalType.DEMAND_EVENT,
         {
-            "intent": "add_event",
-            "entity_type": "event",
-            "entity_ref": "parade",
-            "attribute": "demand_multiplier",
-            "value": 1.35,
-            "effective_window": {"start": 28800.0, "end": 39600.0},
+            "event_ref": "parade",
+            "event_kind": "demand_multiplier",
+            "expected_attendance": None,
+            "demand_multiplier": 1.35,
+            "affected_menu_item_ids": [],
+            "affected_categories": [],
+            "window": {"start": 28800.0, "end": 39600.0},
             "raw_text": "parade today",
+            "confidence": 0.9,
         },
         source="test",
     )
@@ -456,15 +458,17 @@ def test_competitor_market_threat_suppresses_matched_item(bus, session_factory, 
 
 def test_large_event_value_is_treated_as_attendance_not_multiplier(bus, session_factory, seeded):
     bus.emit(
-        SignalType.USER_FACT,
+        SignalType.DEMAND_EVENT,
         {
-            "intent": "add_event",
-            "entity_type": "event",
-            "entity_ref": "food fest",
-            "attribute": "demand_multiplier",
-            "value": 800,
-            "effective_window": {"start": 28800.0, "end": 39600.0},
+            "event_ref": "food fest",
+            "event_kind": "expected_attendance",
+            "expected_attendance": 800,
+            "demand_multiplier": None,
+            "affected_menu_item_ids": [],
+            "affected_categories": [],
+            "window": {"start": 28800.0, "end": 39600.0},
             "raw_text": "Food fest from 09:00 for 800 people",
+            "confidence": 0.9,
         },
         source="test",
     )
@@ -798,7 +802,7 @@ def test_manual_llm_target_persists_as_active_override(bus, session_factory, see
         session.close()
 
 
-def test_voice_overstock_constraint_persists_as_user_override(bus, session_factory, seeded):
+def test_production_constraint_hard_zeroes_matching_category(bus, session_factory, seeded):
     session = session_factory()
     try:
         session.add(
@@ -823,15 +827,17 @@ def test_voice_overstock_constraint_persists_as_user_override(bus, session_facto
         session.close()
 
     signal = bus.emit(
-        SignalType.USER_FACT,
+        SignalType.PRODUCTION_CONSTRAINT,
         {
-            "intent": "set_operational_constraint",
-            "entity_type": "menu_item_or_category",
-            "entity_ref": "desserts",
-            "attribute": "overstock",
-            "value": {"action": "reduce_forecast", "target_qty": 0},
-            "effective_window": {"start": 28800.0, "end": 39600.0},
+            "constraint_ref": "dessert",
+            "constraint_type": "category",
+            "action": "block",
+            "affected_menu_item_ids": [],
+            "affected_categories": ["dessert"],
+            "window": {"start": 28800.0, "end": 39600.0},
+            "reason": "Desserts are overstocked today",
             "raw_text": "Desserts are overstocked today",
+            "confidence": 0.9,
         },
         source="voice",
         ttl=10800.0,
@@ -843,11 +849,6 @@ def test_voice_overstock_constraint_persists_as_user_override(bus, session_facto
 
     session = session_factory()
     try:
-        override = session.query(ForecastOverride).filter(ForecastOverride.menu_item_id == 3).one()
-        assert override.source == "voice"
-        assert override.authority == "user_instruction"
-        assert "overstocked" in override.reason
-
         latest = (
             session.query(Forecast)
             .filter(Forecast.menu_item_id == 3)
@@ -856,11 +857,12 @@ def test_voice_overstock_constraint_persists_as_user_override(bus, session_facto
         )
         assert latest.trigger_reason == "manual"
         assert latest.forecast_qty == 0
+        assert latest.multipliers["production_constraint"] == 0.0
     finally:
         session.close()
 
 
-def test_voice_no_more_deserts_possible_persists_as_user_override(bus, session_factory, seeded):
+def test_production_constraint_uses_typed_signal_trace(bus, session_factory, seeded):
     session = session_factory()
     try:
         session.add(
@@ -885,15 +887,17 @@ def test_voice_no_more_deserts_possible_persists_as_user_override(bus, session_f
         session.close()
 
     signal = bus.emit(
-        SignalType.USER_FACT,
+        SignalType.PRODUCTION_CONSTRAINT,
         {
-            "intent": "set_operational_constraint",
-            "entity_type": "menu_item_or_category",
-            "entity_ref": "deserts",
-            "attribute": "production_unavailable",
-            "value": {"action": "halt_production", "target_qty": 0},
-            "effective_window": {"start": 28800.0, "end": 39600.0},
-            "raw_text": "No more deserts possible",
+            "constraint_ref": "dessert",
+            "constraint_type": "category",
+            "action": "block",
+            "affected_menu_item_ids": [],
+            "affected_categories": ["dessert"],
+            "window": {"start": 28800.0, "end": 39600.0},
+            "reason": "No more desserts possible",
+            "raw_text": "No more desserts possible",
+            "confidence": 0.9,
         },
         source="voice",
         ttl=10800.0,
@@ -905,11 +909,6 @@ def test_voice_no_more_deserts_possible_persists_as_user_override(bus, session_f
 
     session = session_factory()
     try:
-        override = session.query(ForecastOverride).filter(ForecastOverride.menu_item_id == 3).one()
-        assert override.source == "voice"
-        assert override.authority == "user_instruction"
-        assert "unavailable" in override.reason
-
         latest = (
             session.query(Forecast)
             .filter(Forecast.menu_item_id == 3)
@@ -918,20 +917,19 @@ def test_voice_no_more_deserts_possible_persists_as_user_override(bus, session_f
         )
         assert latest.trigger_reason == "manual"
         assert latest.forecast_qty == 0
-        assert latest.multipliers["voice_constraint"] == 0.0
-        assert latest.multipliers["authority_override"] == 0.0
+        assert latest.multipliers["production_constraint"] == 0.0
 
         log = next(
             row for row in session.query(EventLog).filter(EventLog.category == "forecast").all()
             if row.detail.get("forecast_id") == latest.id
         )
-        assert log.detail["trace"]["final"]["zero_reason"] == "voice_constraint"
-        assert "unavailable" in log.detail["trace"]["summary"]
+        assert log.detail["trace"]["final"]["zero_reason"] == "production_constraint"
+        assert "No more desserts possible" in log.detail["trace"]["summary"]
     finally:
         session.close()
 
 
-def test_voice_constraint_survives_later_llm_target_override(bus, session_factory, seeded):
+def test_production_constraint_survives_later_llm_target_override(bus, session_factory, seeded):
     session = session_factory()
     try:
         session.add(
@@ -956,15 +954,17 @@ def test_voice_constraint_survives_later_llm_target_override(bus, session_factor
         session.close()
 
     signal = bus.emit(
-        SignalType.USER_FACT,
+        SignalType.PRODUCTION_CONSTRAINT,
         {
-            "intent": "set_operational_constraint",
-            "entity_type": "menu_item_or_category",
-            "entity_ref": "desserts",
-            "attribute": "production_unavailable",
-            "value": {"action": "halt_production", "target_qty": 0},
-            "effective_window": {"start": 28800.0, "end": 39600.0},
+            "constraint_ref": "dessert",
+            "constraint_type": "category",
+            "action": "block",
+            "affected_menu_item_ids": [],
+            "affected_categories": ["dessert"],
+            "window": {"start": 28800.0, "end": 39600.0},
+            "reason": "No desserts possible",
             "raw_text": "No desserts possible",
+            "confidence": 0.9,
         },
         source="voice",
         ttl=10800.0,
@@ -977,17 +977,6 @@ def test_voice_constraint_survives_later_llm_target_override(bus, session_factor
 
     session = session_factory()
     try:
-        voice_override = (
-            session.query(ForecastOverride)
-            .filter(
-                ForecastOverride.menu_item_id == 3,
-                ForecastOverride.source == "voice",
-                ForecastOverride.authority == "user_instruction",
-            )
-            .one()
-        )
-        assert voice_override.status == "active"
-
         latest = (
             session.query(Forecast)
             .filter(Forecast.menu_item_id == 3)
@@ -995,7 +984,7 @@ def test_voice_constraint_survives_later_llm_target_override(bus, session_factor
             .first()
         )
         assert latest.forecast_qty == 0
-        assert latest.multipliers["voice_constraint"] == 0.0
+        assert latest.multipliers["production_constraint"] == 0.0
         assert latest.multipliers.get("llm_target") is None
     finally:
         session.close()

@@ -8,40 +8,35 @@ text:
    confidence``). When the LLM is unavailable (canned fallback) or unsure, a
    best-effort regex parser recovers the obvious intents (e.g. a "leave"
    keyword → ``set_leave``).
-2. **Apply** the fact deterministically per intent (``_apply``) — never
-   bypassing validation.
-3. **Persist** a ``user_facts`` row (raw_text, extracted JSON, resulting_writes).
-4. **Emit** a ``USER_FACT`` signal to all groups.
-5. **Return** ``{extracted, resulting_writes, signal_id}``.
+2. **Route** the fact into typed operational signals.
+3. **Persist** a ``user_facts`` audit row.
+4. **Optionally emit** the legacy ``USER_FACT`` compatibility signal.
+5. **Return** ``{extracted, routes, resulting_writes, signal_id}``.
 
-Voice is ``core`` infrastructure; per §11 it performs the receipt / leave /
-count writes itself (the deeper, track-owned reactions happen when each agent
-consumes the ``USER_FACT``).
+Voice is ``core`` infrastructure and no longer owns domain-table writes. Track
+agents consume the routed signals and apply their own deterministic changes.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from .clock import DAY_CLOSE_OFFSET, DAY_OPEN_OFFSET, SECONDS_PER_DAY
-from .config import EVENT_MULT
+from .config import EVENT_MULT, VOICE_EMIT_LEGACY_USER_FACT
 from .llm import CANNED_NOTE
+from .module_capabilities import capability_prompt_context
 from .models import (
-    Attendance,
-    EventLog,
     Ingredient,
-    InventoryLedger,
     InventoryLevel,
-    InventoryLot,
     MenuItem,
     Recipe,
     RecipeLine,
     Staff,
     Station,
     Supplier,
-    SupplierCatalog,
     UserFact,
 )
 from .signals import SignalType
@@ -88,7 +83,7 @@ _UNIT_WORDS = {
 
 
 class VoiceProcessor:
-    """STT text → LLM extraction → deterministic writes → ``USER_FACT`` (§11)."""
+    """STT text → LLM/regex extraction → typed routes + audit (§11)."""
 
     def __init__(self, llm: Any, bus: Any, db_session_factory: Callable[[], Any]):
         self.llm = llm
@@ -100,11 +95,25 @@ class VoiceProcessor:
     def process(self, raw_text: str) -> Dict[str, Any]:
         """Run the full §11 pipeline; see module docstring for the steps."""
         extracted = self._extract(raw_text)
-        resulting_writes = self._apply(extracted)
+        routes = self._emit_routes(extracted, raw_text)
+        resulting_writes = [
+            f"signal:{route['signal_type']}:{route['signal_id']}"
+            for route in routes
+            if route.get("signal_id")
+        ] or ["stored"]
         self._write_user_fact(raw_text, extracted, resulting_writes)
-        signal_id = self._emit_user_fact(extracted, raw_text)
+        legacy_signal_id = (
+            self._emit_user_fact(extracted, raw_text)
+            if VOICE_EMIT_LEGACY_USER_FACT
+            else None
+        )
+        signal_id = legacy_signal_id or next(
+            (route.get("signal_id") for route in routes if route.get("signal_id")),
+            None,
+        )
         return {
             "extracted": extracted,
+            "routes": routes,
             "resulting_writes": resulting_writes,
             "signal_id": signal_id,
         }
@@ -188,6 +197,20 @@ class VoiceProcessor:
                 "raw_value": out.get("value"),
                 "raw_text": raw_text,
             }
+        if out["intent"] == "add_event":
+            try:
+                numeric = float(out.get("value"))
+            except (TypeError, ValueError):
+                numeric = None
+            raw_low = raw_text.lower()
+            attendance_words = ("people", "person", "crowd", "guests", "attendees", "pax")
+            if numeric is not None and (
+                str(out.get("attribute") or "").lower() == "expected_attendance"
+                or numeric > 10
+                or any(word in raw_low for word in attendance_words)
+            ):
+                out["attribute"] = "expected_attendance"
+                out["value"] = numeric
         if out["intent"] == "set_operational_constraint":
             out = self._enrich_operational_constraint(out, raw_text)
         return out
@@ -246,6 +269,7 @@ class VoiceProcessor:
             "staff": staff_rows,
             "inventory": inventory_rows,
             "active_constraints": active_constraints,
+            "module_capabilities": capability_prompt_context(),
             "guidance": {
                 "specific_modifier_rule": "Ingredient/modifier words like bacon or mozzarella narrow the impact before category words like burger or pizza.",
                 "category_rule": "Category words like dessert, desserts, pizza, pasta, or beverages cascade to every active menu item in that category.",
@@ -640,6 +664,294 @@ class VoiceProcessor:
             "effective_window": None,
             "confidence": 0.2,
         }
+
+    # -- (2) route to typed signals ------------------------------------------
+
+    def _emit_routes(self, extracted: Dict[str, Any], raw_text: str) -> List[Dict[str, Any]]:
+        routes: List[Dict[str, Any]] = []
+        for spec in self._route_specs(extracted, raw_text):
+            route_id = str(uuid.uuid4())
+            signal_type = spec["signal_type"]
+            payload = spec["payload"]
+            route: Dict[str, Any] = {
+                "route_id": route_id,
+                "signal_type": signal_type.value,
+                "target_modules": spec["target_modules"],
+                "payload": payload,
+                "confidence": float(extracted.get("confidence") or payload.get("confidence") or 0.0),
+                "status": "pending",
+                "signal_id": None,
+            }
+            try:
+                signal = self.bus.emit(
+                    signal_type,
+                    payload,
+                    source="voice",
+                    ttl=self._ttl_for_payload(payload),
+                    dedup_key=spec.get("dedup_key"),
+                )
+            except Exception as exc:  # noqa: BLE001 - bad voice parse must not crash.
+                route["status"] = "failed"
+                route["error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                route["status"] = "emitted" if signal is not None else "dropped"
+                route["signal_id"] = signal.signal_id if signal is not None else None
+            routes.append(route)
+        return routes
+
+    def _route_specs(self, extracted: Dict[str, Any], raw_text: str) -> List[Dict[str, Any]]:
+        intent = str(extracted.get("intent") or "other")
+        entity_ref = extracted.get("entity_ref")
+        entity_ref_s = str(entity_ref or "").strip()
+        value = extracted.get("value")
+        value_dict = value if isinstance(value, dict) else {}
+        window = extracted.get("effective_window")
+        confidence = float(extracted.get("confidence") or 0.0)
+
+        if intent == "record_receipt":
+            ingredient_id = self._resolve_ingredient_id(entity_ref_s, value_dict.get("unit") or "each")
+            supplier_name = value_dict.get("supplier")
+            supplier_id = self._resolve_supplier_id(str(supplier_name)) if supplier_name else None
+            payload = {
+                "ingredient_id": ingredient_id,
+                "ingredient_ref": entity_ref_s,
+                "qty": float(value_dict.get("qty") or 0.0),
+                "unit": str(value_dict.get("unit") or "each"),
+                "supplier_id": supplier_id,
+                "supplier_ref": supplier_name,
+                "price": value_dict.get("price"),
+                "raw_text": raw_text,
+                "confidence": confidence,
+            }
+            return [{
+                "signal_type": SignalType.INVENTORY_RECEIPT_REPORTED,
+                "target_modules": ["track_b.ledger"],
+                "payload": payload,
+            }]
+
+        if intent == "add_inventory_count":
+            ingredient_id = self._resolve_ingredient_id(entity_ref_s, value_dict.get("unit") or "each")
+            payload = {
+                "ingredient_id": ingredient_id,
+                "ingredient_ref": entity_ref_s,
+                "qty": float(value_dict.get("qty") or 0.0),
+                "unit": str(value_dict.get("unit") or "each"),
+                "raw_text": raw_text,
+                "confidence": confidence,
+            }
+            return [{
+                "signal_type": SignalType.INVENTORY_COUNT_REPORTED,
+                "target_modules": ["track_b.ledger"],
+                "payload": payload,
+            }]
+
+        if intent in {"set_leave", "set_attendance"}:
+            status = self._leave_status(extracted)
+            payload = {
+                "staff_id": self._resolve_staff_id(entity_ref_s),
+                "staff_name": entity_ref_s or None,
+                "station_id": None,
+                "station_ref": None,
+                "status": status,
+                "window": window,
+                "reason": str(extracted.get("attribute") or status),
+                "raw_text": raw_text,
+                "confidence": confidence,
+            }
+            return [{
+                "signal_type": SignalType.STAFF_AVAILABILITY,
+                "target_modules": ["track_a.staff"],
+                "payload": payload,
+            }]
+
+        if intent == "add_event":
+            payload = {
+                "event_ref": entity_ref_s or "event",
+                "event_kind": str(extracted.get("attribute") or "event"),
+                "expected_attendance": (
+                    float(value)
+                    if extracted.get("attribute") == "expected_attendance"
+                    and isinstance(value, (int, float))
+                    else None
+                ),
+                "demand_multiplier": (
+                    float(value)
+                    if extracted.get("attribute") != "expected_attendance"
+                    and isinstance(value, (int, float))
+                    else None
+                ),
+                "affected_menu_item_ids": [],
+                "affected_categories": [],
+                "window": window,
+                "raw_text": raw_text,
+                "confidence": confidence,
+            }
+            return [{
+                "signal_type": SignalType.DEMAND_EVENT,
+                "target_modules": ["track_a.forecaster"],
+                "payload": payload,
+            }]
+
+        if intent == "set_operational_constraint":
+            affected = value_dict.get("affected_menu_item_ids") or []
+            categories = []
+            dep_type = str(value_dict.get("dependency_type") or extracted.get("entity_type") or "constraint")
+            if dep_type == "category" and value_dict.get("dependency_ref"):
+                categories = [str(value_dict["dependency_ref"])]
+            action = str(value_dict.get("action") or "block")
+            payload = {
+                "constraint_ref": str(value_dict.get("dependency_ref") or entity_ref_s or "constraint"),
+                "constraint_type": dep_type,
+                "action": "reduce" if action == "reduce_forecast" else "block",
+                "affected_menu_item_ids": [int(i) for i in affected],
+                "affected_categories": categories,
+                "window": window,
+                "reason": raw_text,
+                "raw_text": raw_text,
+                "confidence": confidence,
+            }
+            return [{
+                "signal_type": SignalType.PRODUCTION_CONSTRAINT,
+                "target_modules": ["track_a.forecaster"],
+                "payload": payload,
+            }]
+
+        if intent == "set_supplier_price":
+            payload = {
+                "supplier_id": self._resolve_supplier_id(entity_ref_s),
+                "supplier_ref": entity_ref_s or "supplier",
+                "ingredient_id": self._resolve_ingredient_id(str(value_dict.get("ingredient") or ""), "each"),
+                "ingredient_ref": value_dict.get("ingredient"),
+                "availability": value_dict.get("availability"),
+                "price": value_dict.get("price"),
+                "lead_time_days": value_dict.get("lead_time_days"),
+                "raw_text": raw_text,
+                "confidence": confidence,
+            }
+            return [{
+                "signal_type": SignalType.SUPPLIER_CATALOG_NOTE,
+                "target_modules": ["track_b.market_spectator"],
+                "payload": payload,
+            }]
+
+        if intent == "add_review":
+            return [{
+                "signal_type": SignalType.CUSTOMER_FEEDBACK_NOTE,
+                "target_modules": ["track_a.review"],
+                "payload": {
+                    "summary": str(value if value is not None else raw_text),
+                    "dish_mentions": [entity_ref_s] if entity_ref_s else [],
+                    "sentiment": None,
+                    "severity": None,
+                    "raw_text": raw_text,
+                    "confidence": confidence,
+                },
+            }]
+
+        if intent == "set_competitor":
+            return [{
+                "signal_type": SignalType.COMPETITOR_NOTE,
+                "target_modules": ["track_a.competitor"],
+                "payload": {
+                    "summary": str(value if value is not None else raw_text),
+                    "competitor_ref": entity_ref_s or None,
+                    "affected_menu_item_ids": [],
+                    "affected_categories": [],
+                    "raw_text": raw_text,
+                    "confidence": confidence,
+                },
+            }]
+
+        return self._qualitative_inventory_routes(extracted, raw_text)
+
+    def _qualitative_inventory_routes(
+        self, extracted: Dict[str, Any], raw_text: str
+    ) -> List[Dict[str, Any]]:
+        low = raw_text.lower()
+        if any(phrase in low for phrase in ("almost out", "nearly out", "running out", "low on")):
+            ref = self._ingredient_phrase_from_text(raw_text)
+            return [{
+                "signal_type": SignalType.INGREDIENT_SHORTAGE_REPORTED,
+                "target_modules": ["track_b.ledger", "track_b.optimizer"],
+                "payload": {
+                    "ingredient_id": self._resolve_ingredient_id(ref, "each"),
+                    "ingredient_ref": ref or str(extracted.get("entity_ref") or "ingredient"),
+                    "severity": "critical" if "out" in low else "low",
+                    "qty": None,
+                    "unit": None,
+                    "raw_text": raw_text,
+                    "confidence": max(float(extracted.get("confidence") or 0.0), 0.55),
+                },
+            }]
+        if "expire" in low or "expires" in low or "expiring" in low:
+            ref = self._ingredient_phrase_from_text(raw_text)
+            return [{
+                "signal_type": SignalType.EXPIRY_USE_PRIORITY,
+                "target_modules": ["track_b.optimizer", "track_a.forecaster"],
+                "payload": {
+                    "ingredient_id": self._resolve_ingredient_id(ref, "each"),
+                    "ingredient_ref": ref or str(extracted.get("entity_ref") or "ingredient"),
+                    "lot_id": None,
+                    "expiry": None,
+                    "qty": None,
+                    "desired_action": "use_up",
+                    "raw_text": raw_text,
+                    "confidence": max(float(extracted.get("confidence") or 0.0), 0.55),
+                },
+            }]
+        return []
+
+    def _ttl_for_payload(self, payload: Dict[str, Any]) -> Optional[float]:
+        window = payload.get("window")
+        if isinstance(window, dict) and window.get("end") is not None:
+            try:
+                return max(float(window["end"]) - float(self.bus.sim_time), 1.0)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _resolve_ingredient_id(self, ref: str, unit: str) -> Optional[int]:
+        if not ref:
+            return None
+        session = self.db_session_factory()
+        try:
+            ingredient = self._resolve_ingredient(session, ref, unit, create=False)
+            return int(ingredient.id) if ingredient is not None else None
+        finally:
+            session.close()
+
+    def _resolve_supplier_id(self, ref: str) -> Optional[int]:
+        if not ref:
+            return None
+        session = self.db_session_factory()
+        try:
+            supplier = self._resolve_supplier(session, ref, create=False)
+            return int(supplier.id) if supplier is not None else None
+        finally:
+            session.close()
+
+    def _resolve_staff_id(self, ref: str) -> Optional[int]:
+        if not ref:
+            return None
+        session = self.db_session_factory()
+        try:
+            row = session.query(Staff).filter(Staff.name.ilike(ref)).first()
+            if row is None:
+                row = session.query(Staff).filter(Staff.name.ilike(f"{ref}%")).first()
+            return int(row.id) if row is not None else None
+        finally:
+            session.close()
+
+    def _ingredient_phrase_from_text(self, text: str) -> str:
+        low = text.lower()
+        for phrase in ("almost out of", "nearly out of", "running out of", "low on"):
+            if phrase in low:
+                tail = text[low.index(phrase) + len(phrase):].strip(" .,!;:")
+                return tail.split(" and ")[0].strip()
+        match = re.search(r"([A-Za-z][A-Za-z ]+?)\s+expir", text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return str(self._constraint_target(text, low) or "").strip()
 
     @staticmethod
     def _looks_like_station_absence(low: str, name: Optional[str]) -> bool:
@@ -1037,91 +1349,6 @@ class VoiceProcessor:
             "confidence": 0.6,
         }
 
-    # -- (2) apply (deterministic per intent, §11) -------------------------
-
-    def _apply(self, extracted: Dict[str, Any]) -> List[str]:
-        intent = extracted.get("intent")
-        handler = {
-            "set_leave": self._apply_set_leave,
-            "set_attendance": self._apply_set_leave,
-            "record_receipt": self._apply_record_receipt,
-            "add_event": self._apply_add_event,
-            "add_menu_item": self._apply_add_menu_item,
-            "add_inventory_count": self._apply_add_inventory_count,
-        }.get(intent)
-        if handler is None:
-            return ["stored"]
-        try:
-            return handler(extracted)
-        except Exception as exc:  # never let a bad parse crash the demo
-            return [f"error:{type(exc).__name__}"]
-
-    def _apply_set_leave(self, extracted: Dict[str, Any]) -> List[str]:
-        """Write structured ``attendance`` rows — one per affected day in the
-        window — as the queryable source of truth (§11). The Staff agent
-        (Track A) joins these with ``staff_stations`` to compute coverage. A
-        single human-readable ``event_log`` row is also written for the
-        narrative feed (display only, §16)."""
-        name = extracted.get("entity_ref")
-        status = self._leave_status(extracted)
-        window = extracted.get("effective_window") or self._window_from_text("today")
-        start = float(window["start"])
-        end = float(window["end"])
-        start_day = int(start // SECONDS_PER_DAY)
-        end_day = int(end // SECONDS_PER_DAY)
-        reason = str(extracted.get("attribute") or status)
-
-        writes: List[str] = []
-        session = self.db_session_factory()
-        try:
-            staff = None
-            if name:
-                staff = (
-                    session.query(Staff)
-                    .filter(Staff.name.ilike(str(name)))
-                    .first()
-                )
-            staff_id = staff.id if staff is not None else None
-            staff_name = staff.name if staff is not None else (name or "unknown")
-
-            for day in range(start_day, end_day + 1):
-                row = Attendance(
-                    staff_id=staff_id,
-                    date_sim_day=day,
-                    status=status,
-                    daypart=None,  # whole day
-                    reason=reason,
-                    sim_time=day * SECONDS_PER_DAY + DAY_OPEN_OFFSET,
-                )
-                session.add(row)
-                session.flush()
-                writes.append(f"attendance:{row.id}")
-
-            # Display-only narrative row (the queryable truth is in attendance).
-            log = EventLog(
-                sim_time=float(self.bus.sim_time),
-                category="attendance",
-                actor="voice",
-                summary=(
-                    f"{staff_name} marked {status} for "
-                    f"day{start_day}" + (f"–day{end_day}" if end_day > start_day else "")
-                ),
-                detail={
-                    "staff_id": staff_id,
-                    "staff_name": staff_name,
-                    "status": status,
-                    "start_day": start_day,
-                    "end_day": end_day,
-                },
-            )
-            session.add(log)
-            session.flush()
-            writes.append(f"event_log:{log.id}")
-            session.commit()
-        finally:
-            session.close()
-        return writes
-
     @staticmethod
     def _leave_status(extracted: Dict[str, Any]) -> str:
         """Resolve ``leave`` vs ``sick`` (vs ``present``) from the extracted
@@ -1134,190 +1361,6 @@ class VoiceProcessor:
         if "present" in blob or "back" in blob:
             return "present"
         return "leave"
-
-    def _apply_record_receipt(self, extracted: Dict[str, Any]) -> List[str]:
-        """Create an ``InventoryLot`` + a ``receipt`` ledger row (§11)."""
-        value = extracted.get("value") or {}
-        ing_name = extracted.get("entity_ref")
-        qty = float(value.get("qty") or 0.0)
-        unit = value.get("unit") or "each"
-        supplier_name = value.get("supplier")
-        price = value.get("price")
-        now = float(self.bus.sim_time)
-
-        writes: List[str] = []
-        session = self.db_session_factory()
-        try:
-            ingredient = self._resolve_ingredient(session, ing_name, unit, create=True)
-            supplier = self._resolve_supplier(session, supplier_name, create=True)
-
-            # Ensure validation invariant: a newly-introduced ingredient must be
-            # sold by ≥1 supplier (§12.3) — wire a catalog row if none exists.
-            self._ensure_catalog(session, ingredient, supplier, price, unit)
-
-            prior_on_hand = self._ledger_on_hand(session, ingredient.id)
-            shelf_life = float(ingredient.shelf_life_days or 5.0)
-            lot = InventoryLot(
-                ingredient_id=ingredient.id,
-                qty_on_hand=qty,
-                unit=unit,
-                purchase_price=float(price) if price is not None else 0.0,
-                purchase_date=now,
-                received_date=now,
-                expiry_date=now + shelf_life * SECONDS_PER_DAY,
-                supplier_id=supplier.id if supplier is not None else None,
-                storage_location="main",
-                status="active",
-            )
-            session.add(lot)
-            session.flush()
-
-            balance_after = prior_on_hand + qty
-            ledger = InventoryLedger(
-                ingredient_id=ingredient.id,
-                lot_id=lot.id,
-                delta_qty=qty,
-                reason="receipt",
-                ref_id=lot.id,
-                sim_time=now,
-                balance_after=balance_after,
-            )
-            session.add(ledger)
-            session.flush()
-
-            self._update_level_cache(session, ingredient.id, balance_after)
-
-            writes.append(f"inventory_lot:{lot.id}")
-            writes.append(f"inventory_ledger:{ledger.id}")
-            session.commit()
-        finally:
-            session.close()
-        return writes
-
-    def _apply_add_event(self, extracted: Dict[str, Any]) -> List[str]:
-        """An event is stored as the ``USER_FACT`` itself (with its
-        ``effective_window`` + demand multiplier); the Forecaster reads it
-        (§18.4). Ensure the multiplier is carried on the fact."""
-        if extracted.get("value") in (None, ""):
-            extracted["value"] = EVENT_MULT
-        else:
-            try:
-                numeric_value = float(extracted.get("value"))
-            except (TypeError, ValueError):
-                numeric_value = None
-            if numeric_value is not None and numeric_value > 10:
-                extracted["value"] = numeric_value
-                extracted["attribute"] = "expected_attendance"
-        if not extracted.get("attribute"):
-            extracted["attribute"] = "demand_multiplier"
-        return ["event_stored"]
-
-    def _apply_add_menu_item(self, extracted: Dict[str, Any]) -> List[str]:
-        """Create a ``menu_items`` row and an LLM-drafted (validated) recipe
-        (§11). Prices must be > 0 (§12.3) so a missing price is rejected."""
-        name = extracted.get("entity_ref")
-        price = extracted.get("value")
-        try:
-            price = float(price)
-        except (TypeError, ValueError):
-            price = 0.0
-        if not name or price <= 0:
-            return ["rejected:invalid_menu_item"]
-
-        writes: List[str] = []
-        session = self.db_session_factory()
-        try:
-            station = session.query(Station).first()
-            station_id = station.id if station is not None else None
-            item = MenuItem(
-                name=str(name),
-                category="main",
-                station_id=station_id,
-                dine_in_price=price,
-                online_price=round(price * 1.15, 2),
-                prep_time_min=10.0,
-                is_batchable=0,
-                active=1,
-                weather_tags=[],
-                description=f"Added via voice: {name}",
-            )
-            session.add(item)
-            session.flush()
-            writes.append(f"menu_item:{item.id}")
-
-            recipe = Recipe(menu_item_id=item.id)
-            session.add(recipe)
-            session.flush()
-            writes.append(f"recipe:{recipe.id}")
-
-            for line in self._draft_recipe_lines(session, str(name)):
-                session.add(
-                    RecipeLine(
-                        recipe_id=recipe.id,
-                        ingredient_id=line["ingredient_id"],
-                        qty=line["qty"],
-                        unit=line["unit"],
-                        optional=0,
-                    )
-                )
-                writes.append(f"recipe_line:{line['ingredient_id']}")
-            session.commit()
-        finally:
-            session.close()
-        return writes
-
-    def _apply_add_inventory_count(self, extracted: Dict[str, Any]) -> List[str]:
-        """Update ``inventory_levels.last_counted_*`` and write a
-        ``reconciliation`` ledger delta (§11 / §18.8)."""
-        value = extracted.get("value") or {}
-        ing_name = extracted.get("entity_ref")
-        counted = float(value.get("qty") or 0.0)
-        now = float(self.bus.sim_time)
-
-        writes: List[str] = []
-        session = self.db_session_factory()
-        try:
-            ingredient = self._resolve_ingredient(session, ing_name, "each", create=False)
-            if ingredient is None:
-                return ["rejected:unknown_ingredient"]
-
-            ledger_on_hand = self._ledger_on_hand(session, ingredient.id)
-            delta = counted - ledger_on_hand
-
-            level = (
-                session.query(InventoryLevel)
-                .filter(InventoryLevel.ingredient_id == ingredient.id)
-                .first()
-            )
-            if level is None:
-                level = InventoryLevel(
-                    ingredient_id=ingredient.id,
-                    par_level=0.0, reorder_point=0.0, safety_stock=0.0,
-                    yield_factor=1.0, on_hand_cached=counted,
-                )
-                session.add(level)
-            level.last_counted_at = now
-            level.last_counted_qty = counted
-            level.on_hand_cached = counted
-            session.flush()
-            writes.append(f"inventory_level:{ingredient.id}:count")
-
-            ledger = InventoryLedger(
-                ingredient_id=ingredient.id,
-                lot_id=None,
-                delta_qty=delta,
-                reason="reconciliation",
-                ref_id=ingredient.id,
-                sim_time=now,
-                balance_after=counted,
-            )
-            session.add(ledger)
-            session.flush()
-            writes.append(f"inventory_ledger:{ledger.id}")
-            session.commit()
-        finally:
-            session.close()
-        return writes
 
     # -- DB resolve / helpers ----------------------------------------------
 
@@ -1380,111 +1423,6 @@ class VoiceProcessor:
         session.add(sup)
         session.flush()
         return sup
-
-    def _ensure_catalog(
-        self,
-        session: Any,
-        ingredient: Ingredient,
-        supplier: Optional[Supplier],
-        price: Optional[float],
-        unit: str,
-    ) -> None:
-        if supplier is None:
-            return
-        existing = (
-            session.query(SupplierCatalog)
-            .filter(SupplierCatalog.ingredient_id == ingredient.id)
-            .first()
-        )
-        if existing is not None:
-            return
-        session.add(
-            SupplierCatalog(
-                supplier_id=supplier.id,
-                ingredient_id=ingredient.id,
-                current_price=float(price) if price else 1.0,
-                unit=unit,
-                pack_size=1.0,
-                availability="in_stock",
-                updated_at=float(self.bus.sim_time),
-            )
-        )
-        session.flush()
-
-    @staticmethod
-    def _ledger_on_hand(session: Any, ingredient_id: int) -> float:
-        """Authoritative on-hand = Σ ledger deltas (§18.4)."""
-        rows = (
-            session.query(InventoryLedger.delta_qty)
-            .filter(InventoryLedger.ingredient_id == ingredient_id)
-            .all()
-        )
-        return float(sum((r[0] or 0.0) for r in rows))
-
-    @staticmethod
-    def _update_level_cache(session: Any, ingredient_id: int, on_hand: float) -> None:
-        level = (
-            session.query(InventoryLevel)
-            .filter(InventoryLevel.ingredient_id == ingredient_id)
-            .first()
-        )
-        if level is None:
-            level = InventoryLevel(
-                ingredient_id=ingredient_id,
-                par_level=0.0, reorder_point=0.0, safety_stock=0.0,
-                yield_factor=1.0, on_hand_cached=on_hand,
-            )
-            session.add(level)
-        else:
-            level.on_hand_cached = on_hand
-        session.flush()
-
-    def _draft_recipe_lines(self, session: Any, dish_name: str) -> List[Dict[str, Any]]:
-        """Ask the LLM for an ingredient list; map names to existing ingredients
-        (skip unknowns so the recipe always validates). Canned/empty → no lines
-        (a recipe with zero lines trivially satisfies §12.3)."""
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Draft a simple recipe ingredient list for a dish. Respond "
-                    "with JSON {\"ingredients\": [{\"name\":str,\"qty\":number,"
-                    "\"unit\":\"g|ml|each\"}]}."
-                ),
-            },
-            {"role": "user", "content": f"Dish: {dish_name}"},
-        ]
-        schema = {
-            "type": "object",
-            "properties": {"ingredients": {"type": "array"}},
-            "required": ["ingredients"],
-        }
-        drafted = self.llm.complete(
-            messages, json_schema=schema, max_tokens=300, use_site="generation"
-        )
-        ingredients = []
-        if isinstance(drafted, dict):
-            ingredients = drafted.get("ingredients") or []
-
-        lines: List[Dict[str, Any]] = []
-        for entry in ingredients:
-            if not isinstance(entry, dict):
-                continue
-            ing = self._resolve_ingredient(
-                session, entry.get("name"), entry.get("unit") or "g", create=False
-            )
-            if ing is None:
-                continue
-            try:
-                qty = float(entry.get("qty") or 0.0)
-            except (TypeError, ValueError):
-                qty = 0.0
-            if qty <= 0:
-                continue
-            lines.append(
-                {"ingredient_id": ing.id, "qty": qty, "unit": entry.get("unit") or ing.base_unit}
-            )
-        return lines
 
     # -- (3) persist the user fact -----------------------------------------
 

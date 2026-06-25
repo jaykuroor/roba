@@ -48,6 +48,18 @@ class SignalType(str, Enum):
     CALL_STARTED = "CALL_STARTED"
     CALL_OUTCOME = "CALL_OUTCOME"
     USER_FACT = "USER_FACT"
+    DEMAND_EVENT = "DEMAND_EVENT"
+    PRODUCTION_CONSTRAINT = "PRODUCTION_CONSTRAINT"
+    STAFF_AVAILABILITY = "STAFF_AVAILABILITY"
+    MENU_TOGGLE_REQUEST = "MENU_TOGGLE_REQUEST"
+    INVENTORY_RECEIPT_REPORTED = "INVENTORY_RECEIPT_REPORTED"
+    INVENTORY_COUNT_REPORTED = "INVENTORY_COUNT_REPORTED"
+    INGREDIENT_SHORTAGE_REPORTED = "INGREDIENT_SHORTAGE_REPORTED"
+    EXPIRY_USE_PRIORITY = "EXPIRY_USE_PRIORITY"
+    SUPPLIER_CATALOG_NOTE = "SUPPLIER_CATALOG_NOTE"
+    CUSTOMER_FEEDBACK_NOTE = "CUSTOMER_FEEDBACK_NOTE"
+    COMPETITOR_NOTE = "COMPETITOR_NOTE"
+    OPERATIONAL_BRIEFING = "OPERATIONAL_BRIEFING"
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +177,66 @@ SIGNAL_REGISTRY: Dict[SignalType, Dict[str, Any]] = {
         "groups": ["forecasting", "inventory", "procurement", "human"],
         "priority": 2,
         "default_ttl_sim_s": None,            # per fact
+    },
+    SignalType.DEMAND_EVENT: {
+        "groups": ["forecasting", "human"],
+        "priority": 2,
+        "default_ttl_sim_s": None,            # until event window end
+    },
+    SignalType.PRODUCTION_CONSTRAINT: {
+        "groups": ["forecasting", "kitchen", "human", "frontend"],
+        "priority": 4,
+        "default_ttl_sim_s": None,            # until constraint window end
+    },
+    SignalType.STAFF_AVAILABILITY: {
+        "groups": ["forecasting", "human"],
+        "priority": 3,
+        "default_ttl_sim_s": None,            # until shift/window end
+    },
+    SignalType.MENU_TOGGLE_REQUEST: {
+        "groups": ["inventory", "procurement", "kitchen", "forecasting", "human", "frontend"],
+        "priority": 3,
+        "default_ttl_sim_s": 86400.0,
+    },
+    SignalType.INVENTORY_RECEIPT_REPORTED: {
+        "groups": ["inventory", "procurement", "human"],
+        "priority": 3,
+        "default_ttl_sim_s": 21600.0,
+    },
+    SignalType.INVENTORY_COUNT_REPORTED: {
+        "groups": ["inventory", "human"],
+        "priority": 3,
+        "default_ttl_sim_s": 21600.0,
+    },
+    SignalType.INGREDIENT_SHORTAGE_REPORTED: {
+        "groups": ["inventory", "procurement", "forecasting", "human"],
+        "priority": 3,
+        "default_ttl_sim_s": 14400.0,
+    },
+    SignalType.EXPIRY_USE_PRIORITY: {
+        "groups": ["inventory", "procurement", "forecasting", "human"],
+        "priority": 3,
+        "default_ttl_sim_s": None,            # until expiry/window end
+    },
+    SignalType.SUPPLIER_CATALOG_NOTE: {
+        "groups": ["procurement", "inventory", "forecasting", "human"],
+        "priority": 2,
+        "default_ttl_sim_s": 86400.0,
+    },
+    SignalType.CUSTOMER_FEEDBACK_NOTE: {
+        "groups": ["sensing", "forecasting", "human"],
+        "priority": 2,
+        "default_ttl_sim_s": 43200.0,
+    },
+    SignalType.COMPETITOR_NOTE: {
+        "groups": ["sensing", "forecasting", "human"],
+        "priority": 2,
+        "default_ttl_sim_s": 43200.0,
+    },
+    SignalType.OPERATIONAL_BRIEFING: {
+        "groups": ["human", "frontend"],
+        "priority": 1,
+        "default_ttl_sim_s": 7200.0,
     },
 }
 
@@ -359,6 +431,131 @@ class UserFactPayload(BaseModel):
     raw_text: str
 
 
+class DemandEventPayload(BaseModel):
+    event_ref: str
+    event_kind: str = "event"
+    expected_attendance: Optional[float] = None
+    demand_multiplier: Optional[float] = None
+    affected_menu_item_ids: List[int] = []
+    affected_categories: List[str] = []
+    window: Optional[Dict[str, float]] = None
+    raw_text: str
+    confidence: float = 0.0
+
+
+class ProductionConstraintPayload(BaseModel):
+    constraint_ref: str
+    constraint_type: str
+    action: str = "block"
+    affected_menu_item_ids: List[int] = []
+    affected_categories: List[str] = []
+    window: Optional[Dict[str, float]] = None
+    reason: str = ""
+    raw_text: str
+    confidence: float = 0.0
+
+
+class StaffAvailabilityPayload(BaseModel):
+    staff_id: Optional[int] = None
+    staff_name: Optional[str] = None
+    station_id: Optional[int] = None
+    station_ref: Optional[str] = None
+    status: str
+    window: Optional[Dict[str, float]] = None
+    reason: str = ""
+    raw_text: str
+    confidence: float = 0.0
+
+
+class MenuToggleRequestPayload(BaseModel):
+    menu_item_id: Optional[int] = None
+    item_ref: str
+    action: str
+    reason: str = ""
+    window: Optional[Dict[str, float]] = None
+    raw_text: str
+    confidence: float = 0.0
+
+
+class InventoryReceiptReportedPayload(BaseModel):
+    ingredient_id: Optional[int] = None
+    ingredient_ref: str
+    qty: float
+    unit: str = "each"
+    supplier_id: Optional[int] = None
+    supplier_ref: Optional[str] = None
+    price: Optional[float] = None
+    raw_text: str
+    confidence: float = 0.0
+
+
+class InventoryCountReportedPayload(BaseModel):
+    ingredient_id: Optional[int] = None
+    ingredient_ref: str
+    qty: float
+    unit: str = "each"
+    raw_text: str
+    confidence: float = 0.0
+
+
+class IngredientShortageReportedPayload(BaseModel):
+    ingredient_id: Optional[int] = None
+    ingredient_ref: str
+    severity: str = "low"
+    qty: Optional[float] = None
+    unit: Optional[str] = None
+    raw_text: str
+    confidence: float = 0.0
+
+
+class ExpiryUsePriorityPayload(BaseModel):
+    ingredient_id: Optional[int] = None
+    ingredient_ref: str
+    lot_id: Optional[int] = None
+    expiry: Optional[float] = None
+    qty: Optional[float] = None
+    desired_action: str = "use_up"
+    raw_text: str
+    confidence: float = 0.0
+
+
+class SupplierCatalogNotePayload(BaseModel):
+    supplier_id: Optional[int] = None
+    supplier_ref: str
+    ingredient_id: Optional[int] = None
+    ingredient_ref: Optional[str] = None
+    availability: Optional[str] = None
+    price: Optional[float] = None
+    lead_time_days: Optional[float] = None
+    raw_text: str
+    confidence: float = 0.0
+
+
+class CustomerFeedbackNotePayload(BaseModel):
+    summary: str
+    dish_mentions: List[str] = []
+    sentiment: Optional[str] = None
+    severity: Optional[str] = None
+    raw_text: str
+    confidence: float = 0.0
+
+
+class CompetitorNotePayload(BaseModel):
+    summary: str
+    competitor_ref: Optional[str] = None
+    affected_menu_item_ids: List[int] = []
+    affected_categories: List[str] = []
+    raw_text: str
+    confidence: float = 0.0
+
+
+class OperationalBriefingPayload(BaseModel):
+    summary: str
+    recommendations: List[str] = []
+    source_signal_ids: List[str] = []
+    confidence: float = 0.0
+
+
 # Convenience map: SignalType -> its payload model.
 SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.DEMAND_FORECAST: DemandForecastPayload,
@@ -383,4 +580,16 @@ SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.CALL_STARTED: CallStartedPayload,
     SignalType.CALL_OUTCOME: CallOutcomePayload,
     SignalType.USER_FACT: UserFactPayload,
+    SignalType.DEMAND_EVENT: DemandEventPayload,
+    SignalType.PRODUCTION_CONSTRAINT: ProductionConstraintPayload,
+    SignalType.STAFF_AVAILABILITY: StaffAvailabilityPayload,
+    SignalType.MENU_TOGGLE_REQUEST: MenuToggleRequestPayload,
+    SignalType.INVENTORY_RECEIPT_REPORTED: InventoryReceiptReportedPayload,
+    SignalType.INVENTORY_COUNT_REPORTED: InventoryCountReportedPayload,
+    SignalType.INGREDIENT_SHORTAGE_REPORTED: IngredientShortageReportedPayload,
+    SignalType.EXPIRY_USE_PRIORITY: ExpiryUsePriorityPayload,
+    SignalType.SUPPLIER_CATALOG_NOTE: SupplierCatalogNotePayload,
+    SignalType.CUSTOMER_FEEDBACK_NOTE: CustomerFeedbackNotePayload,
+    SignalType.COMPETITOR_NOTE: CompetitorNotePayload,
+    SignalType.OPERATIONAL_BRIEFING: OperationalBriefingPayload,
 }

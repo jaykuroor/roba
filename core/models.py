@@ -518,6 +518,30 @@ class Signal(Base):
                 f"status={self.status!r} dedup_key={self.dedup_key!r}>")
 
 
+class SignalDelivery(Base):
+    __tablename__ = "signal_deliveries"
+
+    id = _pk()
+    signal_id = mapped_column(String, ForeignKey("signals.signal_id"), nullable=True)
+    signal_type = mapped_column(String)
+    consumer = mapped_column(String)
+    delivery_kind = mapped_column(String)         # subscriber | agent | dead_letter
+    status = mapped_column(String)                # pending | ack | failed | unrouted
+    error = mapped_column(Text)
+    duration_ms = mapped_column(Float)
+    created_at = mapped_column(Float)
+    acknowledged_at = mapped_column(Float)
+
+    __table_args__ = (
+        Index("ix_signal_deliveries_signal", "signal_id"),
+        Index("ix_signal_deliveries_status", "status"),
+    )
+
+    def __repr__(self):
+        return (f"<SignalDelivery id={self.id} signal_id={self.signal_id!r} "
+                f"consumer={self.consumer!r} status={self.status!r}>")
+
+
 class Competitor(Base):
     __tablename__ = "competitors"
 
@@ -767,6 +791,27 @@ class UserFact(Base):
         return f"<UserFact id={self.id} source={self.source!r} applied={self.applied}>"
 
 
+class LLMCallLog(Base):
+    __tablename__ = "llm_call_logs"
+
+    id = _pk()
+    prompt_id = mapped_column(String)
+    use_site = mapped_column(String)
+    provider = mapped_column(String)
+    status = mapped_column(String)
+    latency_ms = mapped_column(Float)
+    cached = mapped_column(Integer, default=0)
+    fallback_used = mapped_column(Integer, default=0)
+    error = mapped_column(Text)
+    created_at = mapped_column(Float)
+    request = mapped_column(JSON)
+    response = mapped_column(JSON)
+
+    def __repr__(self):
+        return (f"<LLMCallLog id={self.id} use_site={self.use_site!r} "
+                f"provider={self.provider!r} status={self.status!r}>")
+
+
 class WeatherLog(Base):
     __tablename__ = "weather_log"
 
@@ -911,10 +956,10 @@ TRANSACTIONAL_MODELS = [
 
 INTELLIGENCE_MODELS = [
     Forecast, ForecastOverride, ForecastTrace, ForecastAdjustment,
-    DemandForecasterMemory, Signal, CompetitorIntel, CompetitorObservation,
+    DemandForecasterMemory, Signal, SignalDelivery, CompetitorIntel, CompetitorObservation,
     CompetitorMenuSnapshot, CompetitorProbeResult, Review, ReviewInsight,
     SupplierPriceHistory, Negotiation,
-    ApprovalRequest, ForecastJob, Promotion, UserFact, WeatherLog, Call,
+    ApprovalRequest, ForecastJob, Promotion, UserFact, LLMCallLog, WeatherLog, Call,
 ]
 
 CONTROL_MODELS = [

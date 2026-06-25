@@ -54,6 +54,10 @@ class ReviewAgent(BaseAgent):
         )
 
     def on_signal(self, signal: Signal) -> None:
+        if signal.type == SignalType.CUSTOMER_FEEDBACK_NOTE.value:
+            self._record_feedback_note(signal.payload or {})
+            self.process_unprocessed()
+            return
         if signal.type == SignalType.USER_FACT.value and (signal.payload or {}).get("intent") == "add_review":
             self.process_unprocessed()
 
@@ -149,6 +153,27 @@ class ReviewAgent(BaseAgent):
             session.close()
         self._run_after_commit(after_commit)
         return rows
+
+    def _record_feedback_note(self, payload: Dict[str, Any]) -> None:
+        now = float(self.bus.sim_time)
+        mentions = payload.get("dish_mentions") or []
+        sentiment = payload.get("sentiment")
+        session = self.db_session_factory()
+        try:
+            session.add(
+                Review(
+                    source="voice",
+                    rating=3.0,
+                    text=str(payload.get("raw_text") or payload.get("summary") or ""),
+                    dish_mentions=mentions,
+                    sentiment=sentiment,
+                    sim_time=now,
+                    processed=0,
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
 
     def _analyze(self, review: Dict[str, Any]) -> Dict[str, Any]:
         if self.llm is not None:

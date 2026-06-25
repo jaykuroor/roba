@@ -79,6 +79,8 @@ class CompetitorAgent(BaseAgent):
     def on_signal(self, signal: Signal) -> None:
         if signal.type == SignalType.CALL_OUTCOME.value:
             self.handle_call_outcome(signal)
+        elif signal.type == SignalType.COMPETITOR_NOTE.value:
+            self._handle_competitor_note(signal.payload or {})
 
     def passive_monitor(self) -> List[Dict[str, Any]]:
         updates: List[Dict[str, Any]] = []
@@ -387,6 +389,31 @@ class CompetitorAgent(BaseAgent):
                 priority=priority,
                 dedup_key=dedup_key_for_observation(obs),
             )
+
+    def _handle_competitor_note(self, payload: Dict[str, Any]) -> None:
+        now = float(self.bus.sim_time)
+        window = {"start": now, "end": now + 43200.0}
+        signal_payload = {
+            "signal_kind": "voice_competitor_note",
+            "source_channel": "voice",
+            "platform": "operator",
+            "competitor_id": None,
+            "affected_menu_items": payload.get("affected_menu_item_ids") or [],
+            "affected_categories": payload.get("affected_categories") or [],
+            "direction": "watch",
+            "impact_score": 0.05,
+            "confidence": float(payload.get("confidence") or 0.5),
+            "window": window,
+            "evidence": [str(payload.get("summary") or payload.get("raw_text") or "voice note")],
+            "raw": payload,
+        }
+        self.emit(
+            SignalType.COMPETITOR_MARKET_SIGNAL,
+            signal_payload,
+            ttl=43200.0,
+            dedup_key=f"competitor_note:{hash(str(payload))}",
+        )
+        self.log_event("competitor", signal_payload["evidence"][0], signal_payload)
 
     @staticmethod
     def _market_window(now: float, duration: float) -> Dict[str, float]:

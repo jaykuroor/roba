@@ -73,6 +73,27 @@ class InventoryOptimizer(BaseAgent):
             self._maybe_reorder(ingredient_id)
         elif signal.type == SignalType.EXPIRY_RISK.value:
             self._propose_promo(signal.payload or {})
+        elif signal.type == SignalType.EXPIRY_USE_PRIORITY.value:
+            payload = dict(signal.payload or {})
+            ingredient_id = payload.get("ingredient_id") or self._resolve_ingredient_id(
+                payload.get("ingredient_ref")
+            )
+            if ingredient_id is None:
+                return
+            payload["ingredient_id"] = ingredient_id
+            self._propose_promo(payload)
+        elif signal.type == SignalType.MENU_TOGGLE_REQUEST.value:
+            payload = signal.payload or {}
+            menu_item_id = payload.get("menu_item_id") or self._resolve_menu_item_id(
+                payload.get("item_ref")
+            )
+            if menu_item_id is None:
+                return
+            self._manual_toggle(
+                int(menu_item_id),
+                str(payload.get("action") or "disable"),
+                str(payload.get("reason") or payload.get("raw_text") or "manual voice request"),
+            )
 
     # -- reorder (§18.8) ------------------------------------------------------
 
@@ -371,6 +392,74 @@ class InventoryOptimizer(BaseAgent):
             f"Re-enabled menu item {menu_item_id}: stock recovered above reorder point.",
             {"menu_item_id": menu_item_id},
         )
+
+    def _manual_toggle(self, menu_item_id: int, action: str, reason: str) -> None:
+        now = self.sim_time
+        action = "enable" if action == "enable" else "disable"
+        session = self.db_session_factory()
+        try:
+            item = session.get(MenuItem, menu_item_id)
+            if item is None:
+                return
+            desired_active = 1 if action == "enable" else 0
+            if item.active == desired_active:
+                return
+            item.active = desired_active
+            if action == "enable":
+                (
+                    session.query(MenuToggle)
+                    .filter(MenuToggle.menu_item_id == menu_item_id, MenuToggle.active == 1)
+                    .update({MenuToggle.active: 0})
+                )
+            session.add(
+                MenuToggle(
+                    menu_item_id=menu_item_id,
+                    action=action,
+                    reason=reason,
+                    triggered_by=self.name,
+                    sim_time=now,
+                    active=1,
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        self.emit(
+            SignalType.MENU_TOGGLE,
+            {"menu_item_id": menu_item_id, "action": action, "reason": reason},
+            dedup_key=f"toggle:{menu_item_id}",
+        )
+        self.broadcast("menu_toggled", {"menu_item_id": menu_item_id, "action": action})
+        self.log_event(
+            "menu_toggle",
+            f"{'Enabled' if action == 'enable' else 'Disabled'} menu item {menu_item_id}: {reason}.",
+            {"menu_item_id": menu_item_id, "action": action, "reason": reason},
+        )
+
+    def _resolve_ingredient_id(self, ref: Any) -> Optional[int]:
+        if not ref:
+            return None
+        session = self.db_session_factory()
+        try:
+            row = session.query(Ingredient).filter(Ingredient.name.ilike(str(ref))).first()
+            if row is None:
+                row = session.query(Ingredient).filter(Ingredient.name.ilike(f"{ref}%")).first()
+            return int(row.id) if row is not None else None
+        finally:
+            session.close()
+
+    def _resolve_menu_item_id(self, ref: Any) -> Optional[int]:
+        if not ref:
+            return None
+        session = self.db_session_factory()
+        try:
+            row = session.query(MenuItem).filter(MenuItem.name.ilike(str(ref))).first()
+            if row is None:
+                row = session.query(MenuItem).filter(MenuItem.name.ilike(f"{ref}%")).first()
+            return int(row.id) if row is not None else None
+        finally:
+            session.close()
 
     # -- expiry → promo (§18.8) ----------------------------------------------
 

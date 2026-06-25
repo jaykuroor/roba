@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { apiGet, apiPatch } from "../../api";
 import { useSimState } from "../../store";
-import type { SimState } from "../../types";
+import type { InventorySignalPolicy, SimState } from "../../types";
 import { SectionHeading, ApplyButton } from "./shared";
 
 export function SimConfigPanel() {
@@ -12,6 +12,8 @@ export function SimConfigPanel() {
   const [closeHour, setCloseHour] = useState(23);
   const [skipClosed, setSkipClosed] = useState(true);
   const [callMode, setCallMode] = useState<"freeze" | "slow">("freeze");
+  const [inventoryPolicy, setInventoryPolicy] = useState<InventorySignalPolicy | null>(null);
+  const [policyBusy, setPolicyBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -25,6 +27,9 @@ export function SimConfigPanel() {
       setSkipClosed(s.skip_closed_hours ?? true);
       setCallMode((s.call_mode as "freeze" | "slow") ?? "freeze");
     }).catch(() => undefined);
+    apiGet<InventorySignalPolicy>("/api/runtime/inventory-signal-policy")
+      .then(setInventoryPolicy)
+      .catch(() => undefined);
   }, []);
 
   async function apply() {
@@ -42,6 +47,19 @@ export function SimConfigPanel() {
       setTimeout(() => setSaved(false), 2000);
     } catch { /* ignore */ } finally { setBusy(false); }
   }
+
+  async function setShortageSignals(enabled: boolean) {
+    setPolicyBusy(true);
+    try {
+      const next = await apiPatch<InventorySignalPolicy>(
+        "/api/runtime/inventory-signal-policy",
+        { shortage_signals_enabled: enabled },
+      );
+      setInventoryPolicy(next);
+    } catch { /* server state remains source of truth */ } finally { setPolicyBusy(false); }
+  }
+
+  const shortageSignalsEnabled = inventoryPolicy?.shortage_signals_enabled ?? true;
 
   return (
     <div className="space-y-6">
@@ -102,6 +120,34 @@ export function SimConfigPanel() {
               </span>
             </label>
           ))}
+        </div>
+      </div>
+
+      <div>
+        <SectionHeading>Inventory Signals</SectionHeading>
+        <div className="flex items-center justify-between gap-4 rounded-md border border-muted bg-primary px-3 py-2">
+          <div>
+            <div className="text-sm font-medium text-text">Shortage signal output</div>
+            <div className="text-[10px] text-text/40">LOW_STOCK and STOCKOUT_RISK</div>
+          </div>
+          <button
+            type="button"
+            disabled={policyBusy || inventoryPolicy == null}
+            onClick={() => void setShortageSignals(!shortageSignalsEnabled)}
+            className={
+              "relative h-7 w-12 rounded-full border transition-colors disabled:opacity-50 " +
+              (shortageSignalsEnabled ? "border-success bg-success/30" : "border-muted bg-muted")
+            }
+            aria-label="Toggle shortage signals"
+            title="Toggle shortage signals"
+          >
+            <span
+              className={
+                "absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform " +
+                (shortageSignalsEnabled ? "translate-x-5" : "translate-x-0.5")
+              }
+            />
+          </button>
         </div>
       </div>
 

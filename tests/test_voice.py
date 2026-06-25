@@ -11,7 +11,10 @@ from core.models import (
     UserFact,
 )
 from core.seeding import Seeder
+from core.signals import SignalType
 from core.voice import VoiceProcessor
+from track_a.agents.staff import StaffAgent
+from track_b.agents.ledger import InventoryLedger as TrackBInventoryLedger
 
 
 class FakeEventLLM:
@@ -54,15 +57,20 @@ def seeded(bus, session_factory, monkeypatch):
 
 
 def test_set_leave_writes_attendance(seeded):
-    """Gate 2: a leave fact extracts intent set_leave and writes 7 structured
-    attendance rows (Mon–Sun next week) plus one display-only event_log row."""
+    """Gate 2: voice routes leave to StaffAgent, which owns attendance writes."""
     voice, session_factory = seeded
     result = voice.process("Ansi is on leave the whole next week")
 
     assert result["extracted"]["intent"] == "set_leave"
     assert result["signal_id"] is not None
-    assert any(w.startswith("attendance:") for w in result["resulting_writes"])
-    assert any(w.startswith("event_log:") for w in result["resulting_writes"])
+    assert result["routes"][0]["signal_type"] == SignalType.STAFF_AVAILABILITY.value
+    assert any(
+        w.startswith(f"signal:{SignalType.STAFF_AVAILABILITY.value}:")
+        for w in result["resulting_writes"]
+    )
+
+    routed_signal = voice.bus.live(type=SignalType.STAFF_AVAILABILITY)[0]
+    StaffAgent(voice.bus, session_factory).on_signal(routed_signal)
 
     session = session_factory()
     try:
@@ -85,9 +93,13 @@ def test_set_leave_writes_attendance(seeded):
 
 
 def test_set_sick_writes_sick_status(seeded):
-    """A 'sick' fact records status='sick' in attendance."""
+    """A 'sick' fact routes to StaffAgent, which records status='sick'."""
     voice, session_factory = seeded
-    voice.process("Marco is off sick today")
+    result = voice.process("Marco is off sick today")
+    assert result["routes"][0]["signal_type"] == SignalType.STAFF_AVAILABILITY.value
+    routed_signal = voice.bus.live(type=SignalType.STAFF_AVAILABILITY)[0]
+    StaffAgent(voice.bus, session_factory).on_signal(routed_signal)
+
     session = session_factory()
     try:
         rows = session.query(Attendance).all()
@@ -100,13 +112,17 @@ def test_set_sick_writes_sick_status(seeded):
 
 
 def test_record_receipt_writes_lot_and_ledger(seeded):
-    """Gate 3: a receipt fact writes an InventoryLot + a receipt ledger row."""
+    """Gate 3: voice routes a receipt to Track B's ledger for durable writes."""
     voice, session_factory = seeded
     result = voice.process(
         "We received 20 kg of tomatoes from GreenFarm at 2 dollars a kilo"
     )
 
     assert result["extracted"]["intent"] == "record_receipt"
+    assert result["routes"][0]["signal_type"] == SignalType.INVENTORY_RECEIPT_REPORTED.value
+
+    routed_signal = voice.bus.live(type=SignalType.INVENTORY_RECEIPT_REPORTED)[0]
+    TrackBInventoryLedger(voice.bus, session_factory).on_signal(routed_signal)
 
     session = session_factory()
     try:

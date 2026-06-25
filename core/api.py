@@ -31,6 +31,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, Web
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from . import config, db, models
 from .approvals import ApprovalsHub
@@ -41,6 +42,7 @@ from .formatter import DataFormatter, line_to_dict, order_to_dict
 from .llm import LLMProvider
 from .orchestrator import Orchestrator
 from .pos_simulator import POSSimulator
+from .runtime_policy import InventorySignalPolicy
 from .scenarios import ScenarioEngine
 from .seeding import Seeder
 from .signals import SignalType
@@ -161,6 +163,7 @@ class AppContext:
         self.formatter: Optional[DataFormatter] = None
         self.pos: Optional[POSSimulator] = None
         self.scenarios: Optional[ScenarioEngine] = None
+        self.inventory_signal_policy: Optional[InventorySignalPolicy] = None
         self.forecast_jobs: Optional[ForecastJobRunner] = None
         self.hub: WebSocketHub = WebSocketHub()
         self.loop_task: Optional[asyncio.Task] = None
@@ -188,8 +191,14 @@ def _ensure_settings_singleton(session: Any) -> models.SimSettings:
             anomaly_injections=None,
         )
         session.add(settings)
-        session.commit()
-        session.refresh(settings)
+        try:
+            session.commit()
+            session.refresh(settings)
+        except IntegrityError:
+            session.rollback()
+            settings = session.get(models.SimSettings, 1)
+            if settings is None:
+                raise
     return settings
 
 
@@ -216,7 +225,10 @@ def _bootstrap() -> None:
     bus.sim_time = clock.sim_time
     orchestrator = Orchestrator(clock, bus, factory)
     orchestrator.coordinator = db.DB_LOCK
-    llm = LLMProvider()
+    llm = LLMProvider(db_session_factory=factory)
+    inventory_signal_policy = InventorySignalPolicy(
+        config.INVENTORY_SHORTAGE_SIGNALS_ENABLED
+    )
     voice = VoiceProcessor(llm, bus, factory)
     seeder = Seeder(llm, factory)
     weather = WeatherProvider(bus, factory, clock)
@@ -310,12 +322,14 @@ def _bootstrap() -> None:
         calls=calls,
         approvals=approvals,
         ws_broadcast=sink,
+        inventory_signal_policy=inventory_signal_policy,
     )
 
     ctx.bus = bus
     ctx.clock = clock
     ctx.orchestrator = orchestrator
     ctx.llm = llm
+    ctx.inventory_signal_policy = inventory_signal_policy
     ctx.voice = voice
     ctx.seeder = seeder
     ctx.weather = weather
@@ -458,6 +472,10 @@ class PosBody(BaseModel):
     channel_mix: Optional[Dict[str, Any]] = None
     daypart_curve: Optional[Dict[str, Any]] = None
     anomaly_injections: Optional[List[Dict[str, Any]]] = None
+
+
+class InventorySignalPolicyBody(BaseModel):
+    shortage_signals_enabled: bool
 
 
 def _ensure_loop_task() -> None:
@@ -620,6 +638,24 @@ def sim_pos(body: PosBody) -> Dict[str, Any]:
             return _row_to_dict(settings)
         finally:
             session.close()
+
+
+@app.get("/api/runtime/inventory-signal-policy")
+def get_inventory_signal_policy() -> Dict[str, Any]:
+    if ctx.inventory_signal_policy is None:
+        raise HTTPException(status_code=503, detail="Inventory signal policy unavailable")
+    return ctx.inventory_signal_policy.snapshot().__dict__
+
+
+@app.patch("/api/runtime/inventory-signal-policy")
+def patch_inventory_signal_policy(body: InventorySignalPolicyBody) -> Dict[str, Any]:
+    if ctx.inventory_signal_policy is None:
+        raise HTTPException(status_code=503, detail="Inventory signal policy unavailable")
+    snapshot = ctx.inventory_signal_policy.set_shortage_signals_enabled(
+        body.shortage_signals_enabled
+    )
+    ctx.hub.broadcast("inventory_signal_policy_changed", snapshot.__dict__)
+    return snapshot.__dict__
 
 
 # ===========================================================================

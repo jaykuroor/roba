@@ -40,12 +40,18 @@ def register(
     calls: Any = None,
     approvals: Any = None,
     ws_broadcast: Any = None,
+    inventory_signal_policy: Any = None,
     **_kwargs: Any,
 ) -> Dict[str, Any]:
     """Wire Track B into the running core (agents, services, triggers, mock).
 
     Returns a dict of the constructed components (handy for tests)."""
-    ledger = InventoryLedger(bus, db_session_factory, ws_broadcast=ws_broadcast)
+    ledger = InventoryLedger(
+        bus,
+        db_session_factory,
+        ws_broadcast=ws_broadcast,
+        inventory_signal_policy=inventory_signal_policy,
+    )
     procurement = Procurement(
         bus, db_session_factory, orchestrator, ledger,
         approvals=approvals, ws_broadcast=ws_broadcast,

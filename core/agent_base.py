@@ -45,6 +45,9 @@ class BaseAgent(ABC):
     def subscribed_groups(self) -> List[str]:
         return list(self._subscribed_groups)
 
+    def capabilities(self) -> Dict[str, Any]:
+        return {"module": self.name, "subscribed_groups": self.subscribed_groups}
+
     # -- signal handling ----------------------------------------------------
 
     @abstractmethod

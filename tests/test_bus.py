@@ -4,7 +4,9 @@ import json
 
 import pytest
 
-from core.models import Signal
+from core.models import Signal, SignalDelivery
+from core.clock import SimClock
+from core.orchestrator import Orchestrator
 from core.signals import LowStockPayload, SignalType
 
 
@@ -70,7 +72,7 @@ def test_subscribe_fires_callback_on_emit(bus):
     assert received[0].type == SignalType.LOW_STOCK.value
 
 
-def test_multiple_subscribers_all_fire_and_isolate_failures(bus):
+def test_multiple_subscribers_all_fire_and_isolate_failures(bus, session_factory):
     """Multiple subscribers per type all fire in order; a raising subscriber
     does not stop siblings or break the emit."""
     order = []
@@ -82,6 +84,57 @@ def test_multiple_subscribers_all_fire_and_isolate_failures(bus):
 
     assert signal is not None  # emit still succeeds
     assert order == ["a", "c"]  # the failing subscriber is isolated
+
+    session = session_factory()
+    try:
+        deliveries = (
+            session.query(SignalDelivery)
+            .filter(SignalDelivery.signal_id == signal.signal_id)
+            .order_by(SignalDelivery.id.asc())
+            .all()
+        )
+    finally:
+        session.close()
+    assert [row.status for row in deliveries] == ["ack", "failed", "ack"]
+    assert all(row.delivery_kind == "subscriber" for row in deliveries)
+
+
+def test_subscribe_is_idempotent(bus):
+    """Registering the same callback twice must still dispatch it once."""
+    fired = []
+
+    def callback(signal):
+        fired.append(signal.signal_id)
+
+    bus.subscribe(SignalType.LOW_STOCK, callback)
+    bus.subscribe(SignalType.LOW_STOCK, callback)
+
+    signal = bus.emit(SignalType.LOW_STOCK, _low_stock(), source="t", now=1.0)
+
+    assert fired == [signal.signal_id]
+
+
+def test_orchestrator_records_dead_letter_when_unrouted(bus, session_factory):
+    """No matching agent capability becomes an auditable dead-letter row."""
+    orchestrator = Orchestrator(SimClock(session_factory, bus), bus, session_factory)
+    signal = bus.emit(SignalType.LOW_STOCK, _low_stock(), source="t", now=1.0)
+
+    orchestrator.on_signal(signal)
+
+    session = session_factory()
+    try:
+        row = (
+            session.query(SignalDelivery)
+            .filter(
+                SignalDelivery.signal_id == signal.signal_id,
+                SignalDelivery.delivery_kind == "dead_letter",
+            )
+            .one()
+        )
+    finally:
+        session.close()
+    assert row.status == "unrouted"
+    assert row.consumer == "orchestrator"
 
 
 def test_dedup_refresh_does_not_refire_subscribers(bus, session_factory):

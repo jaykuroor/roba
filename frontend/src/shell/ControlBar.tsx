@@ -87,6 +87,13 @@ type VoiceExtraction = {
 
 type VoiceResponse = {
   extracted?: VoiceExtraction;
+  routes?: Array<{
+    route_id: string;
+    signal_type: string;
+    target_modules: string[];
+    status: string;
+    signal_id?: string | null;
+  }>;
   resulting_writes?: string[];
   signal_id?: string | null;
   error?: string;
@@ -141,6 +148,7 @@ function VoiceResultCard({ result }: { result: unknown }) {
   const extracted = response.extracted;
   const confidence = Math.round(Number(extracted?.confidence ?? 0) * 100);
   const writes = response.resulting_writes ?? [];
+  const routes = response.routes ?? [];
   const intent = extracted?.intent ? String(extracted.intent).replaceAll("_", " ") : null;
 
   return (
@@ -158,6 +166,11 @@ function VoiceResultCard({ result }: { result: unknown }) {
         {voiceTargetLabel(extracted)} · {voiceWindowLabel(extracted?.effective_window)}
       </span>
       <span className="text-text/45">{confidence}%</span>
+      {routes.length > 0 && (
+        <span className="truncate text-text/55">
+          {routes.map((route) => route.signal_type).join(", ")}
+        </span>
+      )}
       <span className="truncate text-text/45">{writes.length ? writes.join(", ") : "stored"}</span>
       {response.signal_id && (
         <span className="hidden truncate text-[10px] text-text/35 xl:inline">{response.signal_id}</span>

@@ -11,13 +11,14 @@ drain. It also carries the in-process order-line callback (§10) and the current
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from pydantic import BaseModel, ValidationError
 
 from . import config
-from .models import Signal
+from .models import Signal, SignalDelivery
 from .signals import SIGNAL_PAYLOADS, SIGNAL_REGISTRY, SignalType
 
 logger = logging.getLogger(__name__)
@@ -298,18 +299,70 @@ class SignalBus:
         a caller supplies a ``dedup_key``.
         """
         key = _coerce_type(signal_type).value
-        self._subscribers.setdefault(key, []).append(callback)
+        callbacks = self._subscribers.setdefault(key, [])
+        if callback not in callbacks:
+            callbacks.append(callback)
 
     def _dispatch_subscribers(self, signal: Signal) -> None:
         """Invoke every subscriber registered for ``signal.type``; a failing
         subscriber must never break the emit path or sibling subscribers."""
         for callback in list(self._subscribers.get(signal.type, ())):
+            consumer = getattr(callback, "__qualname__", repr(callback))
+            started = time.perf_counter()
             try:
                 callback(signal)
             except Exception:  # noqa: BLE001 — isolate subscriber failures.
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                self.record_delivery(
+                    signal,
+                    consumer=consumer,
+                    delivery_kind="subscriber",
+                    status="failed",
+                    duration_ms=duration_ms,
+                    error="subscriber raised",
+                )
                 logger.exception(
                     "Subscriber for %s raised during emit", signal.type
                 )
+            else:
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                self.record_delivery(
+                    signal,
+                    consumer=consumer,
+                    delivery_kind="subscriber",
+                    status="ack",
+                    duration_ms=duration_ms,
+                )
+
+    def record_delivery(
+        self,
+        signal: Signal,
+        consumer: str,
+        delivery_kind: str,
+        status: str,
+        duration_ms: float = 0.0,
+        error: Optional[str] = None,
+    ) -> None:
+        session = self.db_session_factory()
+        try:
+            session.add(
+                SignalDelivery(
+                    signal_id=signal.signal_id,
+                    signal_type=signal.type,
+                    consumer=consumer,
+                    delivery_kind=delivery_kind,
+                    status=status,
+                    error=error,
+                    duration_ms=float(duration_ms or 0.0),
+                    created_at=float(self.sim_time),
+                    acknowledged_at=float(self.sim_time)
+                    if status in {"ack", "failed", "unrouted"}
+                    else None,
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
 
     # -- order-line callback (§10) -----------------------------------------
 

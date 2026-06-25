@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from sqlalchemy.exc import IntegrityError
+
 from . import config
 from .bus import SignalBus
 from .models import ScenarioEvent, SimState
@@ -59,9 +61,48 @@ def get_or_create_sim_state(session: Any) -> SimState:
             active_seed_id=None,
         )
         session.add(state)
-        session.commit()
-        session.refresh(state)
+        try:
+            session.commit()
+            session.refresh(state)
+        except IntegrityError:
+            session.rollback()
+            state = session.get(SimState, 1)
+            if state is None:
+                raise
     return state
+
+
+def _window_endpoint_seconds(value: Any, default: float) -> float:
+    if isinstance(value, str):
+        parts = value.split(":")
+        if len(parts) >= 2:
+            try:
+                return float(int(parts[0]) * 3600 + int(parts[1]) * 60)
+            except ValueError:
+                return default
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _operating_window_snapshot(value: Any) -> Dict[str, float]:
+    """Return the UI/API shape for an operating window."""
+    if isinstance(value, dict):
+        return {
+            "open": _window_endpoint_seconds(value.get("open"), DAY_OPEN_OFFSET),
+            "close": _window_endpoint_seconds(value.get("close"), DAY_CLOSE_OFFSET),
+        }
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return {
+            "open": _window_endpoint_seconds(value[0], DAY_OPEN_OFFSET),
+            "close": _window_endpoint_seconds(value[1], DAY_CLOSE_OFFSET),
+        }
+    return {"open": float(DAY_OPEN_OFFSET), "close": float(DAY_CLOSE_OFFSET)}
 
 
 class SimClock:
@@ -112,6 +153,8 @@ class SimClock:
                 "status": state.status,
                 "call_mode": state.call_mode,
                 "active_seed_id": state.active_seed_id,
+                "operating_window": _operating_window_snapshot(state.operating_window),
+                "skip_closed_hours": bool(state.skip_closed_hours),
             }
         finally:
             session.close()

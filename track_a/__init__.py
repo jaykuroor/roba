@@ -22,7 +22,13 @@ TRACK_A_SIGNAL_TYPES = [
     SignalType.COMPETITOR_MARKET_SIGNAL,
     SignalType.REVIEW_INSIGHT,
     SignalType.WEATHER_UPDATE,
-    SignalType.USER_FACT,
+    SignalType.DEMAND_EVENT,
+    SignalType.PRODUCTION_CONSTRAINT,
+    SignalType.STAFF_AVAILABILITY,
+    SignalType.INGREDIENT_SHORTAGE_REPORTED,
+    SignalType.EXPIRY_USE_PRIORITY,
+    SignalType.CUSTOMER_FEEDBACK_NOTE,
+    SignalType.COMPETITOR_NOTE,
     SignalType.MENU_TOGGLE,
     SignalType.STOCKOUT_RISK,
     SignalType.CALL_OUTCOME,
@@ -54,9 +60,6 @@ def bootstrap_track_a(
     for agent in agents.values():
         orchestrator.register_agent(agent)
         agent.register(orchestrator)
-
-    for signal_type in TRACK_A_SIGNAL_TYPES:
-        bus.subscribe(signal_type, orchestrator.on_signal)
 
     mock_inventory = None
     if os.getenv("DEMO_MODE", "combined") == "track_a":

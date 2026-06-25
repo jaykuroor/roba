@@ -3,7 +3,7 @@
 This module owns the Track A forecasting stack:
 
 1. deterministic baseline and multiplier calculation,
-2. operational constraint resolution from live signals and vague user facts,
+2. operational constraint resolution from typed live signals,
 3. optional LLM multiplier/batch optimization,
 4. integer forecast emission over the Signal Bus,
 5. durable forecaster memory for the MVP dashboard.
@@ -21,7 +21,6 @@ from core.agent_base import BaseAgent
 from core.clock import DAY_CLOSE_OFFSET, DAY_OPEN_OFFSET, SECONDS_PER_DAY
 from core.llm import CANNED_NOTE
 from core.models import (
-    Attendance,
     Batch,
     BatchDefinition,
     Competitor,
@@ -30,17 +29,10 @@ from core.models import (
     ForecastAdjustment,
     ForecastOverride,
     ForecastTrace,
-    Ingredient,
     MenuItem,
     OrderLine,
-    Recipe,
-    RecipeLine,
     Signal,
     SimSettings,
-    Staff,
-    StaffDishSkill,
-    StaffStation,
-    Station,
     WeatherLog,
 )
 from core.pos_simulator import WINDOW_SECONDS, active_injections
@@ -58,20 +50,16 @@ DAYPART_SECONDS = {
 }
 
 
-STATION_ALIASES: Dict[str, List[str]] = {
-    "chinese": ["chinese", "wok", "asian", "noodle", "dim sum", "stir fry"],
-    "pizza": ["pizza", "oven", "grill"],
-    "pasta": ["pasta", "noodle"],
-    "cold": ["cold", "salad", "dessert", "beverage", "ice cream"],
-    "bar": ["bar", "drink", "beverage"],
-    "fry": ["fry", "fries", "fryer"],
-    "grill": ["grill", "burger", "steak", "tandoor"],
-}
-
 LLM_AUTHORITY_FORECAST = "llm_authority_forecast"
 
 MATERIAL_SIGNAL_TYPES = {
-    SignalType.USER_FACT.value,
+    SignalType.DEMAND_EVENT.value,
+    SignalType.PRODUCTION_CONSTRAINT.value,
+    SignalType.STAFF_AVAILABILITY.value,
+    SignalType.INGREDIENT_SHORTAGE_REPORTED.value,
+    SignalType.EXPIRY_USE_PRIORITY.value,
+    SignalType.CUSTOMER_FEEDBACK_NOTE.value,
+    SignalType.COMPETITOR_NOTE.value,
     SignalType.STAFF_COVERAGE.value,
     SignalType.COMPETITOR_UPDATE.value,
     SignalType.COMPETITOR_INTEL.value,
@@ -129,12 +117,16 @@ class DemandForecaster(BaseAgent):
             SignalType.COMPETITOR_MARKET_SIGNAL.value,
             SignalType.REVIEW_INSIGHT.value,
             SignalType.WEATHER_UPDATE.value,
-            SignalType.USER_FACT.value,
+            SignalType.DEMAND_EVENT.value,
+            SignalType.PRODUCTION_CONSTRAINT.value,
+            SignalType.STAFF_AVAILABILITY.value,
+            SignalType.INGREDIENT_SHORTAGE_REPORTED.value,
+            SignalType.EXPIRY_USE_PRIORITY.value,
+            SignalType.CUSTOMER_FEEDBACK_NOTE.value,
+            SignalType.COMPETITOR_NOTE.value,
             SignalType.MENU_TOGGLE.value,
             SignalType.STOCKOUT_RISK.value,
         }:
-            if signal.type == SignalType.USER_FACT.value:
-                self._persist_user_forecast_overrides(signal)
             kind = (
                 LLM_AUTHORITY_FORECAST
                 if self.llm_auto_mode and self._signal_requires_llm_authority(signal)
@@ -177,13 +169,16 @@ class DemandForecaster(BaseAgent):
         if signal.type not in MATERIAL_SIGNAL_TYPES:
             return False
         payload = signal.payload or {}
-        if signal.type == SignalType.USER_FACT.value:
-            return payload.get("intent") in {
-                "add_event",
-                "set_operational_constraint",
-                "set_leave",
-                "set_attendance",
-            }
+        if signal.type in {
+            SignalType.DEMAND_EVENT.value,
+            SignalType.PRODUCTION_CONSTRAINT.value,
+            SignalType.STAFF_AVAILABILITY.value,
+            SignalType.INGREDIENT_SHORTAGE_REPORTED.value,
+            SignalType.EXPIRY_USE_PRIORITY.value,
+            SignalType.CUSTOMER_FEEDBACK_NOTE.value,
+            SignalType.COMPETITOR_NOTE.value,
+        }:
+            return True
         if signal.type == SignalType.STAFF_COVERAGE.value:
             return payload.get("covered") is False
         if signal.type == SignalType.COMPETITOR_UPDATE.value:
@@ -933,41 +928,36 @@ class DemandForecaster(BaseAgent):
     def _event_multiplier(self, item: MenuItem, window: Dict[str, float], live: Iterable[Signal]) -> float:
         mult = 1.0
         for sig in live:
-            if sig.type != SignalType.USER_FACT.value:
-                continue
             payload = sig.payload or {}
-            if payload.get("intent") != "add_event":
-                continue
-            fact_window = payload.get("effective_window")
-            if fact_window and not windows_overlap(window, fact_window):
-                continue
-            mult *= self._event_fact_multiplier(payload)
+            if sig.type == SignalType.DEMAND_EVENT.value:
+                event_window = payload.get("window")
+                if event_window and not windows_overlap(window, event_window):
+                    continue
+                mult *= self._demand_event_multiplier(payload)
         return min(float(config.EVENT_STACK_MAX_MULT), mult)
 
     @staticmethod
-    def _event_fact_multiplier(payload: Dict[str, Any]) -> float:
-        value = payload.get("value")
-        raw_text = str(payload.get("raw_text") or "").lower()
-        attribute = str(payload.get("attribute") or "").lower()
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            numeric = None
-        if numeric is None:
-            return float(config.EVENT_MULT)
-        if 0 < numeric <= float(config.EVENT_ATTENDANCE_MAX_MULT) and attribute != "expected_attendance":
-            return numeric
-        attendance_words = ("people", "person", "crowd", "guests", "attendees", "pax")
-        looks_like_attendance = (
-            attribute == "expected_attendance"
-            or numeric > 10
-            or any(word in raw_text for word in attendance_words)
-        )
-        if looks_like_attendance:
+    def _demand_event_multiplier(payload: Dict[str, Any]) -> float:
+        if payload.get("demand_multiplier") is not None:
+            try:
+                return min(
+                    float(config.EVENT_ATTENDANCE_MAX_MULT),
+                    max(0.0, float(payload["demand_multiplier"])),
+                )
+            except (TypeError, ValueError):
+                return float(config.EVENT_MULT)
+        if payload.get("expected_attendance") is not None:
+            try:
+                attendance = float(payload["expected_attendance"])
+            except (TypeError, ValueError):
+                return float(config.EVENT_MULT)
             reference = max(float(config.EVENT_ATTENDANCE_REFERENCE), 1.0)
-            attendance_ratio = max(0.0, min(1.0, numeric / reference))
-            return round(1.0 + attendance_ratio * (float(config.EVENT_ATTENDANCE_MAX_MULT) - 1.0), 3)
-        return min(float(config.EVENT_ATTENDANCE_MAX_MULT), max(0.0, numeric))
+            attendance_ratio = max(0.0, min(1.0, attendance / reference))
+            return round(
+                1.0 + attendance_ratio * (float(config.EVENT_ATTENDANCE_MAX_MULT) - 1.0),
+                3,
+            )
+        return float(config.EVENT_MULT)
 
     @staticmethod
     def _settings_explanation(value: float) -> str:
@@ -983,21 +973,16 @@ class DemandForecaster(BaseAgent):
         labels: List[str] = []
         for sig in live:
             payload = sig.payload or {}
-            if sig.type != SignalType.USER_FACT.value or payload.get("intent") != "add_event":
-                continue
-            fact_window = payload.get("effective_window")
-            if fact_window and not windows_overlap(window, fact_window):
-                continue
-            name = str(payload.get("entity_ref") or "event")
-            raw_value = payload.get("value")
-            try:
-                numeric = float(raw_value)
-            except (TypeError, ValueError):
-                numeric = 0.0
-            if str(payload.get("attribute") or "").lower() == "expected_attendance" or numeric > 10:
-                labels.append(f"{name} attendance {int(numeric):d}")
-            else:
-                labels.append(name)
+            if sig.type == SignalType.DEMAND_EVENT.value:
+                event_window = payload.get("window")
+                if event_window and not windows_overlap(window, event_window):
+                    continue
+                name = str(payload.get("event_ref") or "event")
+                attendance = payload.get("expected_attendance")
+                if attendance is not None:
+                    labels.append(f"{name} attendance {int(float(attendance)):d}")
+                else:
+                    labels.append(name)
         detail = "; ".join(labels[:2]) if labels else "active event"
         return f"{detail} changes demand to {value:.2f}x after attendance guardrails."
 
@@ -1214,19 +1199,6 @@ class DemandForecaster(BaseAgent):
         live: Iterable[Signal],
     ) -> Optional[int]:
         hard_override: Optional[int] = None
-        voice_override = self._active_voice_constraint_override(
-            session,
-            int(item.id),
-            daypart,
-            window,
-            float(self.bus.sim_time),
-        )
-        if voice_override is not None:
-            hard_override = 0
-            multipliers["voice_constraint"] = 0.0
-            explanations["voice_constraint"] = str(
-                voice_override.reason or "Voice instruction blocks production for this item."
-            )
         for sig in live:
             payload = sig.payload or {}
             if sig.type == SignalType.MENU_TOGGLE.value and payload.get("menu_item_id") == item.id:
@@ -1238,6 +1210,17 @@ class DemandForecaster(BaseAgent):
                 hard_override = 0
                 multipliers["availability"] = 0.0
                 explanations["availability"] = f"Stockout risk on ingredient {payload.get('ingredient_id')}."
+            elif sig.type == SignalType.PRODUCTION_CONSTRAINT.value:
+                affected = payload.get("affected_menu_item_ids") or []
+                categories = {str(cat).lower() for cat in (payload.get("affected_categories") or [])}
+                category_match = str(item.category or "").lower() in categories
+                if item.id in affected or category_match:
+                    hard_override = 0
+                    multipliers["production_constraint"] = 0.0
+                    explanations["production_constraint"] = str(
+                        payload.get("reason")
+                        or f"Production constraint: {payload.get('constraint_ref')}"
+                    )
             elif sig.type == SignalType.STAFF_COVERAGE.value:
                 affected = payload.get("affected_items") or []
                 if payload.get("covered") is False and (item.id in affected or item.station_id == payload.get("station_id")):
@@ -1245,201 +1228,7 @@ class DemandForecaster(BaseAgent):
                     multipliers["staff_coverage"] = 0.0
                     explanations["staff_coverage"] = "Station has no remaining qualified staff."
 
-        vague = self._vague_capacity_constraint(session, item, live)
-        if vague:
-            if vague["remaining"] <= 0:
-                hard_override = 0
-                multipliers["staff_coverage"] = 0.0
-            else:
-                multipliers["staff_coverage"] = round(
-                    min(multipliers.get("staff_coverage", 1.0), vague["multiplier"]),
-                    3,
-                )
-            explanations["staff_coverage"] = vague["reason"]
         return hard_override
-
-    def _active_voice_constraint_override(
-        self,
-        session: Any,
-        item_id: int,
-        daypart: str,
-        window: Dict[str, float],
-        now: float,
-    ) -> Optional[ForecastOverride]:
-        rows = (
-            session.query(ForecastOverride)
-            .filter(
-                ForecastOverride.menu_item_id == item_id,
-                ForecastOverride.status == "active",
-                ForecastOverride.source == "voice",
-                ForecastOverride.authority == "user_instruction",
-                ForecastOverride.operation == "hard_zero_production",
-            )
-            .order_by(ForecastOverride.created_at.desc(), ForecastOverride.id.desc())
-            .all()
-        )
-        candidates: List[ForecastOverride] = []
-        for row in rows:
-            if float(row.valid_until or 0.0) <= now:
-                row.status = "expired"
-                continue
-            if windows_overlap(row.window or {}, window):
-                candidates.append(row)
-        if not candidates:
-            return None
-        return candidates[0]
-
-    def _vague_capacity_constraint(
-        self,
-        session: Any,
-        item: MenuItem,
-        live: Iterable[Signal],
-    ) -> Optional[Dict[str, Any]]:
-        best: Optional[Dict[str, Any]] = None
-        for sig in live:
-            if sig.type != SignalType.USER_FACT.value:
-                continue
-            payload = sig.payload or {}
-            raw = str(payload.get("raw_text") or payload.get("value") or "").lower()
-            if not self._is_absence_fact(payload, raw):
-                continue
-            if not self._fact_targets_item(session, item, payload, raw):
-                continue
-            all_staff = self._all_staff_absent(payload, raw)
-            qualified = self._qualified_staff_ids(session, item.id, item.station_id)
-            available = [
-                sid for sid in qualified
-                if self._staff_available(session, sid, int(self.bus.sim_time // SECONDS_PER_DAY), current_daypart(self.bus.sim_time))
-            ]
-            absent_count = len(qualified) if all_staff else 1
-            remaining = max(0, len(available) - absent_count)
-            multiplier = 0.0 if len(available) <= 0 else max(0.25, remaining / max(len(available), 1))
-            target = payload.get("entity_ref") or self._target_phrase(raw)
-            reason = (
-                f"Operational note '{target}' leaves no qualified staff."
-                if remaining <= 0
-                else f"Operational note '{target}' reduces station capacity to {remaining}/{len(available)} qualified staff."
-            )
-            candidate = {
-                "remaining": remaining,
-                "qualified": len(qualified),
-                "available": len(available),
-                "multiplier": multiplier,
-                "reason": reason,
-            }
-            if best is None or candidate["remaining"] < best["remaining"]:
-                best = candidate
-        return best
-
-    @staticmethod
-    def _is_absence_fact(payload: Dict[str, Any], raw: str) -> bool:
-        if payload.get("intent") == "set_operational_constraint":
-            attribute = str(payload.get("attribute") or "").lower()
-            value = payload.get("value")
-            value_blob = str(value or "").lower()
-            return (
-                attribute == "capacity_absence"
-                or any(w in raw for w in ("absent", "unavailable", "missing", "off sick", "sick"))
-                or any(w in value_blob for w in ("absent", "unavailable", "missing", "off sick", "sick"))
-            )
-        return any(w in raw for w in ("absent", "unavailable", "missing", "off sick", "sick")) and any(
-            w in raw for w in ("station", "worker", "cook", "chef", "staff", "making")
-        )
-
-    @staticmethod
-    def _all_staff_absent(payload: Dict[str, Any], raw: str) -> bool:
-        value = payload.get("value")
-        if isinstance(value, dict) and value.get("all_qualified_staff"):
-            return True
-        return any(
-            phrase in raw
-            for phrase in ("all ", "every ", "no one", "nobody", "none of", "all the possible", "everyone")
-        )
-
-    def _fact_targets_item(self, session: Any, item: MenuItem, payload: Dict[str, Any], raw: str) -> bool:
-        phrase = " ".join(
-            str(part or "")
-            for part in (
-                payload.get("entity_ref"),
-                payload.get("attribute"),
-                payload.get("raw_text"),
-                raw,
-            )
-        ).lower()
-        tokens = self._target_tokens(phrase)
-        if not tokens:
-            return False
-        station = session.get(Station, item.station_id)
-        haystacks = [
-            item.name or "",
-            item.category or "",
-            item.description or "",
-            station.name if station is not None else "",
-        ]
-        joined = " ".join(haystacks).lower()
-        for token in tokens:
-            if token in joined:
-                return True
-            aliases = STATION_ALIASES.get(token, [])
-            if aliases and any(alias in joined for alias in aliases):
-                return True
-        return False
-
-    @staticmethod
-    def _target_tokens(phrase: str) -> List[str]:
-        words = re.findall(r"[a-z0-9]+", phrase.lower())
-        ignored = {
-            "the", "all", "possible", "staff", "worker", "workers", "cook",
-            "chef", "station", "making", "make", "are", "is", "was", "were",
-            "absent", "unavailable", "missing", "sick", "off", "for",
-        }
-        return [word for word in words if word not in ignored and len(word) > 2]
-
-    @staticmethod
-    def _target_phrase(raw: str) -> str:
-        for pattern in (
-            r"(?:the\s+)?([a-z0-9 '&-]+?)\s+station",
-            r"(?:making|make|prep|prepping)\s+([a-z0-9 '&-]+?)(?:\s+are|\s+is|\s+absent|$)",
-        ):
-            m = re.search(pattern, raw, re.IGNORECASE)
-            if m:
-                return m.group(1).strip()
-        return raw[:80]
-
-    @staticmethod
-    def _qualified_staff_ids(session: Any, menu_item_id: int, station_id: int) -> List[int]:
-        station_staff = {
-            row[0]
-            for row in session.query(StaffStation.staff_id)
-            .filter(StaffStation.station_id == station_id)
-            .all()
-        }
-        dish_staff = {
-            row[0]
-            for row in session.query(StaffDishSkill.staff_id)
-            .filter(StaffDishSkill.menu_item_id == menu_item_id)
-            .all()
-        }
-        return sorted(station_staff.union(dish_staff))
-
-    @staticmethod
-    def _staff_available(session: Any, staff_id: int, day: int, daypart: str) -> bool:
-        staff = session.get(Staff, staff_id)
-        if staff is None or not staff.active:
-            return False
-        rows = (
-            session.query(Attendance)
-            .filter(Attendance.staff_id == staff_id, Attendance.date_sim_day == day)
-            .order_by(Attendance.sim_time.desc(), Attendance.id.desc())
-            .all()
-        )
-        status = "present"
-        for row in rows:
-            if row.daypart not in (None, daypart):
-                continue
-            status = row.status or "present"
-            break
-        return status not in {"leave", "sick"}
 
     @staticmethod
     def _is_blocked_for_batch(item_id: int, station_id: int, live: Iterable[Signal], reasons: List[str]) -> bool:
@@ -1456,229 +1245,6 @@ class DemandForecaster(BaseAgent):
                 reasons.append("station unstaffed")
                 blocked = True
         return blocked
-
-    def _persist_user_forecast_overrides(self, signal: Signal) -> None:
-        payload = signal.payload or {}
-        if not self._is_user_forecast_constraint(payload):
-            return
-
-        now = float(self.bus.sim_time)
-        daypart, window = current_window(now)
-        fact_window = payload.get("effective_window")
-        if isinstance(fact_window, dict) and fact_window.get("end") is not None:
-            if not windows_overlap(window, fact_window):
-                return
-            window = {
-                "start": max(now, float(fact_window.get("start", window["start"]))),
-                "end": float(fact_window["end"]),
-            }
-
-        session = self.db_session_factory()
-        try:
-            items = self._items_for_user_fact(session, payload)
-        finally:
-            session.close()
-
-        reason = self._user_forecast_override_reason(payload)
-        for item in items:
-            self._persist_override(
-                int(item.id),
-                daypart,
-                window,
-                "hard_zero_production",
-                {"qty": 0},
-                reason,
-                "voice",
-                "user_instruction",
-                {
-                    "signal_id": signal.signal_id,
-                    "raw_text": payload.get("raw_text"),
-                    "payload": payload,
-                },
-            )
-
-    @staticmethod
-    def _is_user_forecast_constraint(payload: Dict[str, Any]) -> bool:
-        if payload.get("intent") != "set_operational_constraint":
-            return False
-        attribute = str(payload.get("attribute") or "").lower()
-        if attribute == "capacity_absence":
-            return False
-        value_text = str(payload.get("value") or "").lower()
-        if attribute in {"availability", "available", "production_available"} and value_text in {
-            "false",
-            "0",
-            "no",
-            "none",
-            "unavailable",
-            "not available",
-        }:
-            return True
-        blob = " ".join(
-            str(value or "")
-            for value in (
-                attribute,
-                payload.get("entity_ref"),
-                payload.get("raw_text"),
-                payload.get("value"),
-            )
-        ).lower()
-        return any(
-            word in blob
-            for word in (
-                "overstock", "over-stock", "over stocked", "overstocked",
-                "too much", "too many", "excess", "surplus", "overproduced",
-                "over-produced", "reduce_forecast", "production_unavailable",
-                "halt_production", "no more", "not possible", "impossible",
-                "not available", "unavailable", "cannot make", "can't make",
-            )
-        )
-
-    def _items_for_user_fact(self, session: Any, payload: Dict[str, Any]) -> List[MenuItem]:
-        # Prefer the VoiceProcessor's context-aware resolution. The fallback
-        # token matcher exists only for older USER_FACT payload shapes.
-        explicit_ids = self._affected_item_ids_from_user_fact(payload)
-        if explicit_ids:
-            return (
-                session.query(MenuItem)
-                .filter(MenuItem.active == 1, MenuItem.id.in_(sorted(explicit_ids)))
-                .all()
-            )
-
-        dependency_items = self._items_for_dependency_fact(session, payload)
-        if dependency_items:
-            return dependency_items
-
-        target = str(payload.get("entity_ref") or payload.get("raw_text") or "").lower()
-        tokens = self._target_tokens(target)
-        if not tokens:
-            return []
-        items = session.query(MenuItem).filter(MenuItem.active == 1).all()
-        matched = [
-            item for item in items
-            if self._item_matches_tokens(item, tokens)
-        ]
-        return matched
-
-    @staticmethod
-    def _affected_item_ids_from_user_fact(payload: Dict[str, Any]) -> set[int]:
-        value = payload.get("value")
-        candidates: List[Any] = []
-        if isinstance(value, dict):
-            candidates.extend(value.get("affected_menu_item_ids") or [])
-            candidates.extend(value.get("menu_item_ids") or [])
-            candidates.extend(value.get("affected_items") or [])
-        candidates.extend(payload.get("affected_menu_item_ids") or [])
-        ids: set[int] = set()
-        for raw in candidates:
-            try:
-                item_id = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if item_id > 0:
-                ids.add(item_id)
-        return ids
-
-    def _items_for_dependency_fact(self, session: Any, payload: Dict[str, Any]) -> List[MenuItem]:
-        value = payload.get("value") if isinstance(payload.get("value"), dict) else {}
-        dependency_type = str(value.get("dependency_type") or payload.get("entity_type") or "").lower()
-        dependency_ref = str(value.get("dependency_ref") or payload.get("entity_ref") or "").lower().strip()
-        if not dependency_ref:
-            return []
-        items = session.query(MenuItem).filter(MenuItem.active == 1).all()
-        if "ingredient" in dependency_type or "dependency" in dependency_type:
-            item_ids = self._item_ids_requiring_ingredient(session, dependency_ref)
-            matched = [item for item in items if int(item.id) in item_ids]
-            if matched:
-                return matched
-        if "equipment" in dependency_type or "dependency" in dependency_type:
-            return [
-                item for item in items
-                if self._item_matches_equipment_dependency(session, item, dependency_ref)
-            ]
-        return []
-
-    @staticmethod
-    def _item_ids_requiring_ingredient(session: Any, dependency_ref: str) -> set[int]:
-        target_tokens = {
-            singularize_token(token)
-            for token in re.findall(r"[a-z0-9]+", dependency_ref)
-            if len(token) > 2
-        }
-        if not target_tokens:
-            return set()
-        recipe_to_item = {
-            int(recipe.id): int(recipe.menu_item_id)
-            for recipe in session.query(Recipe).all()
-        }
-        ingredient_names = {
-            int(ingredient.id): str(ingredient.name or "").lower()
-            for ingredient in session.query(Ingredient).all()
-        }
-        item_ids: set[int] = set()
-        for line in session.query(RecipeLine).all():
-            name = ingredient_names.get(int(line.ingredient_id), "")
-            name_tokens = {
-                singularize_token(token)
-                for token in re.findall(r"[a-z0-9]+", name)
-                if len(token) > 2
-            }
-            if target_tokens.intersection(name_tokens):
-                item_id = recipe_to_item.get(int(line.recipe_id))
-                if item_id is not None:
-                    item_ids.add(item_id)
-        return item_ids
-
-    def _item_matches_equipment_dependency(self, session: Any, item: MenuItem, dependency_ref: str) -> bool:
-        station = session.get(Station, item.station_id)
-        haystack = " ".join(
-            str(value or "")
-            for value in (
-                item.name,
-                item.category,
-                item.description,
-                station.name if station is not None else "",
-            )
-        ).lower()
-        tokens = self._target_tokens(dependency_ref)
-        if not tokens:
-            return False
-        if len(tokens) > 1:
-            return all(
-                token in haystack or any(alias in haystack for alias in STATION_ALIASES.get(token, []))
-                for token in tokens
-            )
-        for token in tokens:
-            if token in haystack:
-                return True
-            aliases = STATION_ALIASES.get(token, [])
-            if aliases and any(alias in haystack for alias in aliases):
-                return True
-        return False
-
-    @staticmethod
-    def _item_matches_tokens(item: MenuItem, tokens: List[str]) -> bool:
-        singular_tokens = {singularize_token(token) for token in tokens}
-        haystacks = [
-            item.name or "",
-            item.category or "",
-            item.description or "",
-        ]
-        joined = " ".join(haystacks).lower()
-        joined_tokens = {singularize_token(token) for token in re.findall(r"[a-z0-9]+", joined)}
-        return bool(singular_tokens.intersection(joined_tokens))
-
-    @staticmethod
-    def _user_forecast_override_reason(payload: Dict[str, Any]) -> str:
-        target = payload.get("entity_ref") or "item"
-        attribute = str(payload.get("attribute") or "").lower()
-        value_text = str(payload.get("value") or "").lower()
-        if attribute == "production_unavailable" or (
-            attribute in {"availability", "available", "production_available"}
-            and value_text in {"false", "0", "no", "none", "unavailable", "not available"}
-        ):
-            return f"Voice instruction marks {target} as unavailable; production forecast locked to zero for this window."
-        return f"Voice instruction marks {target} as overstocked; production forecast locked to zero for this window."
 
     def _active_override(
         self,
@@ -1714,9 +1280,7 @@ class DemandForecaster(BaseAgent):
         operation = str(override.operation or "")
         source = str(override.source or "")
         authority = str(override.authority or "")
-        if operation == "hard_zero_production" and source == "voice":
-            priority = 0
-        elif operation == "hard_zero_production":
+        if operation == "hard_zero_production":
             priority = 1
         elif authority == "user_instruction":
             priority = 2
@@ -1738,14 +1302,11 @@ class DemandForecaster(BaseAgent):
         source = str(override.source or "")
         value = override.value or {}
         if operation == "hard_zero_production":
-            if source == "voice":
-                multipliers["voice_constraint"] = 0.0
-                explanations["voice_constraint"] = reason
             multipliers["authority_override"] = 0.0
             explanations["authority_override"] = reason
             return 0
         if operation == "set_target":
-            if hard_override == 0 and float(multipliers.get("voice_constraint", 1.0)) <= 0:
+            if hard_override == 0 and DemandForecaster._has_zero_feasibility_constraint(multipliers):
                 return hard_override
             try:
                 qty = nearest_int(float(value.get("qty")))
@@ -2130,14 +1691,20 @@ class DemandForecaster(BaseAgent):
     def _has_zero_feasibility_constraint(multipliers: Dict[str, float]) -> bool:
         return any(
             float(multipliers.get(key, 1.0)) <= 0
-            for key in ("voice_constraint", "availability", "staff_coverage", "authority_override", "llm_override")
+            for key in (
+                "availability",
+                "production_constraint",
+                "staff_coverage",
+                "authority_override",
+                "llm_override",
+            )
         )
 
     @staticmethod
     def _has_material_change_evidence(multipliers: Dict[str, float]) -> bool:
         material_keys = {
-            "voice_constraint",
             "availability",
+            "production_constraint",
             "staff_coverage",
             "event",
             "competitor_market",
@@ -2233,7 +1800,7 @@ class DemandForecaster(BaseAgent):
         else:
             target_qty = self._target_qty_from_adjustment(adjustment)
             if target_qty is not None:
-                if hard_override == 0 and float(multipliers.get("voice_constraint", 1.0)) <= 0:
+                if hard_override == 0 and self._has_zero_feasibility_constraint(multipliers):
                     return hard_override
                 hard_override = max(0, target_qty)
                 multipliers["llm_target"] = 1.0
@@ -2528,7 +2095,13 @@ class DemandForecaster(BaseAgent):
         active_signals = []
         for signal in live:
             if signal.type in {
-                SignalType.USER_FACT.value,
+                SignalType.DEMAND_EVENT.value,
+                SignalType.PRODUCTION_CONSTRAINT.value,
+                SignalType.STAFF_AVAILABILITY.value,
+                SignalType.INGREDIENT_SHORTAGE_REPORTED.value,
+                SignalType.EXPIRY_USE_PRIORITY.value,
+                SignalType.CUSTOMER_FEEDBACK_NOTE.value,
+                SignalType.COMPETITOR_NOTE.value,
                 SignalType.STAFF_COVERAGE.value,
                 SignalType.MENU_TOGGLE.value,
                 SignalType.STOCKOUT_RISK.value,
@@ -2701,23 +2274,19 @@ class DemandForecaster(BaseAgent):
 
     @staticmethod
     def _modifier_source(key: str) -> str:
-        if key == "voice_constraint":
-            return "voice"
         if key == "authority_override":
             return "authority_resolver"
         if key.startswith("llm"):
             return "llm"
-        if key in {"availability", "staff_coverage"}:
+        if key in {"availability", "production_constraint", "staff_coverage"}:
             return "operational_constraint"
         return "deterministic"
 
     @staticmethod
     def _modifier_stage(key: str) -> str:
-        if key == "voice_constraint":
-            return "feasibility"
         if key == "authority_override":
             return "authority"
-        if key in {"availability", "staff_coverage"}:
+        if key in {"availability", "production_constraint", "staff_coverage"}:
             return "feasibility"
         if key.startswith("llm"):
             return "llm_proposal"
@@ -2755,8 +2324,8 @@ class DemandForecaster(BaseAgent):
     def _modifier_operation(key: str, value: float) -> str:
         if float(value) <= 0 and key in {
             "availability",
+            "production_constraint",
             "staff_coverage",
-            "voice_constraint",
             "llm_override",
             "authority_override",
         }:
@@ -2769,10 +2338,10 @@ class DemandForecaster(BaseAgent):
     def _zero_reason(hard_override: Optional[int], multipliers: Dict[str, float]) -> Optional[str]:
         if hard_override != 0:
             return None
-        if float(multipliers.get("voice_constraint", 1.0)) <= 0:
-            return "voice_constraint"
         if float(multipliers.get("availability", 1.0)) <= 0:
             return "availability_blocked"
+        if float(multipliers.get("production_constraint", 1.0)) <= 0:
+            return "production_constraint"
         if float(multipliers.get("staff_coverage", 1.0)) <= 0:
             return "staff_unavailable"
         if float(multipliers.get("llm_override", 1.0)) <= 0:
@@ -2836,7 +2405,7 @@ class DemandForecaster(BaseAgent):
 
     @staticmethod
     def _counts_toward_latent_demand(key: str, value: float) -> bool:
-        if key in {"availability", "staff_coverage", "voice_constraint"}:
+        if key in {"availability", "production_constraint", "staff_coverage"}:
             return False
         if key in {"llm_override", "authority_override"} and value <= 0:
             return False
@@ -2883,18 +2452,6 @@ def forecast_window_matches(candidate: Dict[str, Any], window: Dict[str, float])
     except (TypeError, ValueError):
         return False
 
-
-def singularize_token(value: str) -> str:
-    token = value.strip().lower()
-    if token in {"desert", "deserts"}:
-        return "dessert"
-    if token.endswith("ies"):
-        return token[:-3] + "y"
-    if token.endswith("ses"):
-        return token[:-2]
-    if token.endswith("s") and not token.endswith("ss"):
-        return token[:-1]
-    return token
 
 
 def nearest_int(value: float) -> int:

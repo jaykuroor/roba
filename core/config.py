@@ -66,6 +66,9 @@ EXPIRY_SCAN_SIM_S = 3600
 EXPIRY_WINDOW_SIM_S = 172800               # 2 sim-days
 PROMO_DISCOUNT_PCT = 20
 APPROVAL_PO_THRESHOLD = 200                # currency units; above -> needs approval
+INVENTORY_SHORTAGE_SIGNALS_ENABLED = os.getenv(
+    "INVENTORY_SHORTAGE_SIGNALS_ENABLED", "true"
+).strip().lower() not in {"0", "false", "no", "off"}
 
 # signals
 SIGNAL_COOLDOWN_SIM_S = 1800
@@ -79,10 +82,13 @@ COMPETITOR_MENU_REFRESH_SIM_S = 7200
 
 # llm
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-LLM_FALLBACK = ["gemini", "canned"]
+LLM_FALLBACK = ["gemini", "groq", "openrouter", "canned"]
 LLM_RETRIES = 3
 LLM_BACKOFF_BASE_S = 1.5
 LLM_INTER_CALL_SLEEP_S = 2
+VOICE_EMIT_LEGACY_USER_FACT = os.getenv(
+    "VOICE_EMIT_LEGACY_USER_FACT", "true"
+).strip().lower() not in {"0", "false", "no", "off"}
 
 # weather
 WEATHER_FETCH_SIM_S = 10800                # every 3 sim-h

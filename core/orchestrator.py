@@ -23,6 +23,7 @@ import asyncio
 from contextlib import nullcontext
 import inspect
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from . import config
@@ -194,9 +195,41 @@ class Orchestrator:
         """Fan a signal out to every agent whose groups intersect the
         signal's ``groups`` (§14.4)."""
         signal_groups = set(signal.groups or [])
+        routed = False
         for agent in self.agents:
             if signal_groups.intersection(set(agent.subscribed_groups)):
-                agent.on_signal(signal)
+                routed = True
+                started = time.perf_counter()
+                try:
+                    agent.on_signal(signal)
+                except Exception as exc:  # noqa: BLE001 - isolate agent failures.
+                    duration_ms = (time.perf_counter() - started) * 1000.0
+                    self.bus.record_delivery(
+                        signal,
+                        consumer=agent.name,
+                        delivery_kind="agent",
+                        status="failed",
+                        duration_ms=duration_ms,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    logger.exception("Agent %s failed handling %s", agent.name, signal.type)
+                else:
+                    duration_ms = (time.perf_counter() - started) * 1000.0
+                    self.bus.record_delivery(
+                        signal,
+                        consumer=agent.name,
+                        delivery_kind="agent",
+                        status="ack",
+                        duration_ms=duration_ms,
+                    )
+        if not routed:
+            self.bus.record_delivery(
+                signal,
+                consumer="orchestrator",
+                delivery_kind="dead_letter",
+                status="unrouted",
+                error="No registered agent subscribed to the signal groups.",
+            )
 
     # -- the tick (§6.1 / §17) ---------------------------------------------
 

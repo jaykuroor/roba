@@ -348,3 +348,7 @@ export interface SignalEnvelope {
   status: "live" | "consumed" | "expired";
   correlation_id: string | null;
 }
+
+export interface InventorySignalPolicy {
+  shortage_signals_enabled: boolean;
+}

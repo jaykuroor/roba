@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.models import (
+    EventLog,
     Ingredient,
     InventoryLedger,
     InventoryLevel,
@@ -17,6 +18,7 @@ from core.models import (
     Station,
     Supplier,
 )
+from core.runtime_policy import InventorySignalPolicy
 from core.signals import SignalType
 from track_b.agents.ledger import InventoryLedger as Ledger
 
@@ -186,6 +188,126 @@ def test_low_stock_then_stockout_signals(ledger, bus, session_factory):
     stockout = bus.live(type=SignalType.STOCKOUT_RISK)
     assert any(s.payload["ingredient_id"] == ing_id for s in stockout)
     assert item_id in stockout[0].payload["affected_items"]
+
+
+def test_muted_shortage_policy_audits_without_live_signals(bus, session_factory):
+    ing_id, item_id = _seed_recipe(session_factory, recipe_qty=100.0, safety=50.0)
+    _add_lot(session_factory, ing_id, qty=120.0, expiry_date=1000.0)
+    ledger = Ledger(
+        bus,
+        session_factory,
+        inventory_signal_policy=InventorySignalPolicy(shortage_signals_enabled=False),
+    )
+    bus.sim_time = 10.0
+
+    line = SimpleNamespace(status="sold", menu_item_id=item_id, qty=1.0, id=1, sim_time=10.0)
+    ledger.handle_order_line(line)
+
+    assert _on_hand(session_factory, ing_id) == pytest.approx(20.0)
+    assert bus.live(type=SignalType.LOW_STOCK) == []
+    assert bus.live(type=SignalType.STOCKOUT_RISK) == []
+
+    session = session_factory()
+    try:
+        muted = (
+            session.query(EventLog)
+            .filter(EventLog.category == "inventory_signal_muted")
+            .one()
+        )
+    finally:
+        session.close()
+    assert muted.detail["signal_type"] == SignalType.LOW_STOCK.value
+    assert muted.detail["payload"]["ingredient_id"] == ing_id
+
+
+def test_forecast_aware_threshold_emits_stockout_before_resupply(ledger, bus, session_factory):
+    ing_id, item_id = _seed_recipe(session_factory, recipe_qty=100.0, safety=50.0)
+    _add_lot(session_factory, ing_id, qty=500.0, expiry_date=1000.0)
+    bus.sim_time = 10.0
+    bus.emit(
+        SignalType.DEMAND_FORECAST,
+        {
+            "menu_item_id": item_id,
+            "window": {"start": 10.0, "end": 3610.0},
+            "daypart": "lunch",
+            "qty": 6.0,
+            "baseline": 6.0,
+            "multipliers": {},
+            "confidence": 0.8,
+        },
+        source="forecaster",
+        now=10.0,
+    )
+
+    ledger._check_thresholds(ing_id, 500.0, 10.0)
+
+    stockout = bus.live(type=SignalType.STOCKOUT_RISK)
+    assert len(stockout) == 1
+    assert stockout[0].payload["ingredient_id"] == ing_id
+    assert stockout[0].payload["affected_items"] == [item_id]
+    assert stockout[0].payload["projected_runout"] < 3610.0
+
+
+def test_forecast_aware_threshold_uses_resupply_eta(ledger, bus, session_factory):
+    ing_id, item_id = _seed_recipe(session_factory, recipe_qty=100.0, safety=50.0)
+    _add_lot(session_factory, ing_id, qty=500.0, expiry_date=1000.0)
+    session = session_factory()
+    try:
+        supplier = Supplier(
+            name="GreenFarm",
+            lead_time_days=1.0,
+            reliability_score=0.9,
+            min_order_value=0.0,
+            contact="",
+        )
+        session.add(supplier)
+        session.flush()
+        po = PurchaseOrder(
+            supplier_id=supplier.id,
+            status="placed",
+            created_at=0.0,
+            expected_delivery=1000.0,
+            total_cost=20.0,
+            created_by="optimizer",
+            approval_id=None,
+        )
+        session.add(po)
+        session.flush()
+        session.add(
+            PurchaseOrderLine(
+                po_id=po.id,
+                ingredient_id=ing_id,
+                qty=1000.0,
+                unit="g",
+                unit_price=1.0,
+                line_total=1000.0,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+    bus.sim_time = 10.0
+    bus.emit(
+        SignalType.DEMAND_FORECAST,
+        {
+            "menu_item_id": item_id,
+            "window": {"start": 10.0, "end": 3610.0},
+            "daypart": "lunch",
+            "qty": 6.0,
+            "baseline": 6.0,
+            "multipliers": {},
+            "confidence": 0.8,
+        },
+        source="forecaster",
+        now=10.0,
+    )
+
+    ledger._check_thresholds(ing_id, 500.0, 10.0)
+
+    assert bus.live(type=SignalType.STOCKOUT_RISK) == []
+    low_stock = bus.live(type=SignalType.LOW_STOCK)
+    assert len(low_stock) == 1
+    assert low_stock[0].payload["ingredient_id"] == ing_id
 
 
 def test_receive_creates_lot_and_ledger(ledger, bus, session_factory):
