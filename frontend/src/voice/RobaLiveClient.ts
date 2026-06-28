@@ -18,6 +18,7 @@ export type LiveClientEvent =
   | { type: "speaking" }       // first audio byte of a turn started playing
   | { type: "turn_complete" }  // server signalled the turn is done generating
   | { type: "playback_done" }  // turn done AND all audio finished playing
+  | { type: "interrupted" }    // barge-in: Roba stopped, mic should stay open
   | { type: "error"; message: string }
   | { type: "disconnected" };
 
@@ -59,11 +60,18 @@ export class RobaLiveClient {
   private handlers: EventHandler[] = [];
   private role: string;
   private mode: string;
+  private _micMode: "ptt" | "conversation" = "ptt";
   private _listening = false;
+  // Monotonically increasing session id — incremented on each startListening/
+  // stopListening call so any in-flight startListening can detect staleness.
+  private _micSession = 0;
+  // True if at least one audio chunk was sent during the current mic session.
+  private _audioSentThisTurn = false;
 
-  constructor(role = "manager", mode = "confirm") {
+  constructor(role = "manager", mode = "confirm", micMode: "ptt" | "conversation" = "ptt") {
     this.role = role;
     this.mode = mode;
+    this._micMode = micMode;
   }
 
   on(handler: EventHandler): () => void {
@@ -79,6 +87,10 @@ export class RobaLiveClient {
 
   get listening() {
     return this._listening;
+  }
+
+  setMicMode(m: "ptt" | "conversation") {
+    this._micMode = m;
   }
 
   // ---------------------------------------------------------------------------
@@ -134,30 +146,75 @@ export class RobaLiveClient {
     this._listening = true;
     this.stopPlayback(); // barge-in: stop Roba audio when user starts speaking
 
+    // Capture the session id BEFORE any await so we can detect if stopListening
+    // was called while we were awaiting getUserMedia or addModule.
+    const session = ++this._micSession;
+    this._audioSentThisTurn = false;
+
+    let stream: MediaStream | null = null;
+    let ctx: AudioContext | null = null;
     try {
-      this.micStream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, sampleRate: 48000, echoCancellation: true },
       });
-      this.audioCtx = new AudioContext({ sampleRate: 48000 });
-      await this.audioCtx.audioWorklet.addModule("/mic-processor.js");
-      this.micSource = this.audioCtx.createMediaStreamSource(this.micStream);
-      this.workletNode = new AudioWorkletNode(this.audioCtx, "mic-processor");
-      this.workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+
+      // After each await: bail if stopListening() was called in the interim.
+      if (!this._listening || session !== this._micSession) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      ctx = new AudioContext({ sampleRate: 48000 });
+      await ctx.audioWorklet.addModule("/mic-processor.js");
+
+      if (!this._listening || session !== this._micSession) {
+        ctx.close();
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      // Graph is fully wired — commit to instance fields now.
+      const src = ctx.createMediaStreamSource(stream);
+      const node = new AudioWorkletNode(ctx, "mic-processor");
+
+      node.port.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
+        if (typeof e.data === "string") return; // control messages
         if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(e.data);
+          this.ws.send(e.data as ArrayBuffer);
+          this._audioSentThisTurn = true;
         }
       };
-      this.micSource.connect(this.workletNode);
-      this.workletNode.connect(this.audioCtx.destination);
+      src.connect(node);
+      node.connect(ctx.destination);
+
+      this.micStream = stream;
+      this.audioCtx = ctx;
+      this.micSource = src;
+      this.workletNode = node;
     } catch (err) {
-      this._listening = false;
-      this.emit({ type: "error", message: String(err) });
+      // Only surface the error if this session is still active.
+      if (session === this._micSession) {
+        this._listening = false;
+        ctx?.close();
+        stream?.getTracks().forEach((t) => t.stop());
+        this.emit({ type: "error", message: String(err) });
+      } else {
+        // Superseded by a stopListening() call — clean up silently.
+        ctx?.close();
+        stream?.getTracks().forEach((t) => t.stop());
+      }
     }
   }
 
   stopListening(): void {
     if (!this._listening) return;
     this._listening = false;
+    // Increment session id so any in-flight startListening bails on its next check.
+    this._micSession++;
+
+    // Ask the worklet to flush its partial buffer before we disconnect it.
+    try { this.workletNode?.port.postMessage("flush"); } catch { /* ignore */ }
+
     this.micSource?.disconnect();
     this.workletNode?.disconnect();
     this.micStream?.getTracks().forEach((t) => t.stop());
@@ -166,10 +223,18 @@ export class RobaLiveClient {
     this.workletNode = null;
     this.micStream = null;
     this.audioCtx = null;
-    // Signal end-of-turn to Gemini.
-    if (this.ws?.readyState === WebSocket.OPEN) {
+
+    // In push-to-talk mode, send end_of_turn only when audio was actually captured.
+    // In conversation mode, Gemini's auto-VAD handles turn boundaries — never send
+    // end_of_turn on client stop (the conversation just ends cleanly).
+    if (
+      this._micMode === "ptt" &&
+      this._audioSentThisTurn &&
+      this.ws?.readyState === WebSocket.OPEN
+    ) {
       this.ws.send(JSON.stringify({ type: "end_of_turn" }));
     }
+    this._audioSentThisTurn = false;
   }
 
   // ---------------------------------------------------------------------------
@@ -234,6 +299,10 @@ export class RobaLiveClient {
       this.emit({ type: "turn_complete" });
       // No audio still playing (text-only turn or already drained) → end now.
       if (this.playbackSources === 0) this.finishTurn();
+    } else if (t === "interrupted") {
+      // Server-side barge-in: stop any Roba audio immediately.
+      this.stopPlayback();
+      this.emit({ type: "interrupted" });
     } else if (t === "error") {
       this.emit({ type: "error", message: String(msg.message ?? "") });
     }

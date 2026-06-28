@@ -865,9 +865,19 @@ class VoiceProcessor:
             },
             {"role": "user", "content": f"Restaurant context:\n{context}\n\nSpoken note:\n{raw_text}"},
         ]
-        result = self.llm.complete(
-            messages, json_schema=EXTRACTION_SCHEMA, max_tokens=400, use_site="voice"
-        )
+        # Voice needs a fast response — cap to 8 s so we degrade to regex/canned
+        # quickly instead of leaving the user in "Thinking…" for 20+ seconds.
+        # Guard with getattr so test stubs that don't expose timeout_s still work.
+        _orig_timeout = getattr(self.llm, "timeout_s", None)
+        if _orig_timeout is not None:
+            self.llm.timeout_s = 8.0
+        try:
+            result = self.llm.complete(
+                messages, json_schema=EXTRACTION_SCHEMA, max_tokens=400, use_site="voice"
+            )
+        finally:
+            if _orig_timeout is not None:
+                self.llm.timeout_s = _orig_timeout
 
         if not isinstance(result, dict):
             return self._regex_extract(raw_text)

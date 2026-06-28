@@ -524,6 +524,7 @@ class LLMProvider:
             want_json=want_json,
             temperature=temperature,
             top_p=top_p,
+            timeout_s=self.timeout_s,
         )
 
         try:
@@ -572,6 +573,7 @@ class LLMProvider:
         want_json: bool,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        timeout_s: Optional[float] = None,
     ) -> Any:
         kwargs: Dict[str, Any] = {"max_output_tokens": max_tokens}
         if temperature is not None:
@@ -587,6 +589,11 @@ class LLMProvider:
         try:
             from google.genai import types
 
+            if timeout_s:
+                # google-genai expects the HTTP timeout in milliseconds.
+                kwargs["http_options"] = types.HttpOptions(
+                    timeout=int(timeout_s * 1000)
+                )
             return types.GenerateContentConfig(**kwargs)
         except Exception:
             return kwargs

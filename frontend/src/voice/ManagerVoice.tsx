@@ -4,6 +4,7 @@ import { useVoiceLive } from "./useVoiceLive";
 import { MicButton } from "./MicButton";
 import { PlanConfirmCard } from "./PlanConfirmCard";
 import { ModeToggle } from "./ModeToggle";
+import { MicModeToggle } from "./MicModeToggle";
 import { apiGet, apiPost } from "../api";
 import type { ApprovalRequest } from "../types";
 
@@ -128,10 +129,16 @@ export function ManagerVoice() {
 
   return (
     <div className="flex flex-col gap-5">
-      {/* Header row: mode toggle */}
-      <div className="flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Mode</span>
-        <ModeToggle mode={live.mode} onChange={live.setMode} disabled={live.state === "listening"} />
+      {/* Header row: mode toggles */}
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Plan mode</span>
+          <ModeToggle mode={live.mode} onChange={live.setMode} disabled={live.state === "listening"} />
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Mic mode</span>
+          <MicModeToggle micMode={live.micMode} onChange={live.setMicMode} disabled={live.state === "listening"} />
+        </div>
       </div>
 
       {/* Error / info strip */}
@@ -157,6 +164,7 @@ export function ManagerVoice() {
         <div className="flex justify-center py-4">
           <MicButton
             state={live.state}
+            micMode={live.micMode}
             size="lg"
             onStart={live.startListening}
             onStop={live.stopListening}

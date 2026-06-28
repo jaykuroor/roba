@@ -421,7 +421,7 @@ async def live_bridge(
             return
 
         task_c2g = asyncio.create_task(
-            _client_to_gemini(websocket, session),
+            _client_to_gemini(websocket, session, voice_processor),
             name="voice_live_c2g",
         )
         task_g2c = asyncio.create_task(
@@ -454,13 +454,17 @@ async def live_bridge(
             pass
 
 
-async def _client_to_gemini(websocket: Any, session: Any) -> None:
+async def _client_to_gemini(
+    websocket: Any, session: Any, voice_processor: Any
+) -> None:
     """Read frames from the browser WS and relay to the Vertex AI Live session.
 
     Binary frames → PCM16 audio (send_realtime_input).
     JSON control frames:
-      end_of_turn  → audio_stream_end signal to the session.
-      text_input   → send_client_content text turn.
+      end_of_turn   → audio_stream_end signal to the session.
+      text_input    → send_client_content text turn.
+      confirm_plan  → execute voice_processor.confirm and return tool_result.
+      cancel_plan   → execute voice_processor.cancel and return tool_result.
     """
     from google.genai import types as _gtypes
 
@@ -494,6 +498,29 @@ async def _client_to_gemini(websocket: Any, session: Any) -> None:
                             turns={"parts": [{"text": text}]},
                             turn_complete=True,
                         )
+                elif msg_type in ("confirm_plan", "cancel_plan"):
+                    # The client Confirm/Cancel buttons send these frames; execute
+                    # the plan action and relay the result back to the browser so
+                    # the plan card can clear and the transcript can update.
+                    plan_id = str(msg.get("plan_id") or "")
+                    if plan_id:
+                        try:
+                            if msg_type == "confirm_plan":
+                                result = await asyncio.to_thread(
+                                    voice_processor.confirm, plan_id
+                                )
+                                tool = "confirm_plan"
+                            else:
+                                result = await asyncio.to_thread(
+                                    voice_processor.cancel, plan_id
+                                )
+                                tool = "cancel_plan"
+                            await _safe_send_json(
+                                websocket,
+                                {"type": "tool_result", "tool": tool, "result": result},
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("voice %s failed: %s", msg_type, exc)
     except asyncio.CancelledError:
         pass
 
@@ -624,7 +651,12 @@ async def _handle_chunk(
         # the client can stop showing "speaking" and re-arm.
         if getattr(sc, "generation_complete", False):
             await _flush_transcript(websocket, "roba", buffers)
-        if getattr(sc, "interrupted", False) or getattr(sc, "turn_complete", False):
+        if getattr(sc, "interrupted", False):
+            # Barge-in: tell the browser to stop playback and resume listening.
+            await _flush_transcript(websocket, "user", buffers)
+            await _flush_transcript(websocket, "roba", buffers)
+            await _safe_send_json(websocket, {"type": "interrupted"})
+        if getattr(sc, "turn_complete", False):
             await _flush_transcript(websocket, "user", buffers)
             await _flush_transcript(websocket, "roba", buffers)
             await _safe_send_json(websocket, {"type": "turn_complete"})

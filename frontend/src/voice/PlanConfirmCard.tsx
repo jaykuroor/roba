@@ -2,16 +2,18 @@
  * PlanConfirmCard — surfaces the pending Roba plan (or a clarification
  * question) before the user commits.
  *
+ * Designed for quick, eyes-up decision-making in a noisy kitchen/front-of-house
+ * environment — large text, big tap targets, clear hierarchy.
+ *
  * Shows:
- *  • A human-readable summary of what will happen ("Roba will boost demand
- *    forecast for dinner service by 30%").
- *  • Target agents that will be triggered.
- *  • Confirm / Cancel buttons.
- *  • If `clarification` is present, renders options instead of confirm/cancel
- *    and calls onClarify(answer) so the voice planner can re-plan.
+ *  • A clear header ("Roba's Plan" or "Roba Needs to Know")
+ *  • A large hero summary of what will happen
+ *  • Target agents that will be triggered (readable chips)
+ *  • A "What happens" breakdown of each route
+ *  • Large Confirm / Cancel buttons (or clarification option buttons)
  */
 
-import { Check, X, ChevronRight } from "lucide-react";
+import { Check, X, ChevronRight, ClipboardList, HelpCircle } from "lucide-react";
 import type { PlanResult, Clarification } from "./RobaLiveClient";
 
 interface PlanConfirmCardProps {
@@ -22,9 +24,9 @@ interface PlanConfirmCardProps {
   onClarify?: (planId: string, answer: string) => void;
 }
 
-function AgentPill({ name }: { name: string }) {
+function AgentChip({ name }: { name: string }) {
   return (
-    <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-text/70">
+    <span className="inline-flex items-center rounded-full bg-accent/15 px-3 py-1 text-sm font-medium text-accent">
       {name}
     </span>
   );
@@ -38,12 +40,16 @@ export function PlanConfirmCard({
   onClarify,
 }: PlanConfirmCardProps) {
   const planId = plan.plan_id ?? "";
+
   // Collect unique target agents from routes.
   const agentSet = new Set<string>();
   for (const r of plan.routes ?? []) {
     for (const a of r.target_agents ?? []) agentSet.add(a);
   }
   const agents = Array.from(agentSet);
+
+  // The human-readable summary is the primary hero text; fall back to summary.
+  const heroText = plan.human_readable || plan.summary;
 
   // Clarification options can be either strings or {value, label} objects.
   function labelOf(opt: { value: string; label: string } | string): string {
@@ -54,84 +60,99 @@ export function PlanConfirmCard({
   }
 
   return (
-    <div className="rounded-xl border border-muted/60 bg-surface p-4 shadow-sm">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-wide text-text/40">
-          {clarification ? "Roba needs to know" : "Roba's plan"}
+    <div className="rounded-2xl border-2 border-accent/30 bg-surface shadow-md overflow-hidden">
+      {/* Coloured header band */}
+      <div className="flex items-center gap-3 bg-accent/10 px-5 py-3">
+        {clarification ? (
+          <HelpCircle size={22} className="shrink-0 text-accent" />
+        ) : (
+          <ClipboardList size={22} className="shrink-0 text-accent" />
+        )}
+        <span className="flex-1 text-sm font-bold uppercase tracking-wide text-accent">
+          {clarification ? "Roba Needs to Know" : "Roba's Plan"}
         </span>
         <button
           onClick={() => onCancel(planId)}
-          className="rounded p-0.5 text-text/30 hover:bg-muted/50 hover:text-text/60"
-          aria-label="Cancel plan"
+          className="rounded-full p-1 text-accent/50 hover:bg-accent/20 hover:text-accent transition-colors"
+          aria-label="Dismiss"
         >
-          <X size={14} />
+          <X size={16} />
         </button>
       </div>
 
-      {/* Summary */}
-      {plan.human_readable && (
-        <p className="mt-2 text-sm text-text leading-snug">{plan.human_readable}</p>
-      )}
+      <div className="px-5 py-4 space-y-4">
+        {/* Hero summary — large readable text */}
+        {heroText && (
+          <p className="text-lg font-semibold text-text leading-snug">{heroText}</p>
+        )}
 
-      {/* Target agents */}
-      {agents.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1">
-          {agents.map((a) => (
-            <AgentPill key={a} name={a} />
-          ))}
-        </div>
-      )}
-
-      {/* Route breakdown */}
-      {(plan.routes ?? []).length > 0 && !clarification && (
-        <ul className="mt-2 space-y-1">
-          {(plan.routes ?? []).map((r, i) => (
-            <li key={i} className="flex items-start gap-1.5 text-xs text-text/60">
-              <ChevronRight size={12} className="mt-0.5 shrink-0 text-text/30" />
-              <span>{r.summary}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {/* Clarification options */}
-      {clarification && (
-        <div className="mt-3 space-y-2">
-          <p className="text-sm font-medium text-text">{clarification.question}</p>
-          <div className="flex flex-col gap-1.5">
-            {(clarification.options ?? []).map((opt, i) => (
-              <button
-                key={i}
-                onClick={() => onClarify?.(planId, valueOf(opt))}
-                className="rounded-lg border border-muted bg-primary/60 px-3 py-1.5 text-left text-sm text-text hover:border-accent/50 hover:bg-muted/50 transition-colors"
-              >
-                {labelOf(opt)}
-              </button>
+        {/* Target agents */}
+        {agents.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {agents.map((a) => (
+              <AgentChip key={a} name={a} />
             ))}
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Actions */}
-      {!clarification && (
-        <div className="mt-4 flex gap-2">
-          <button
-            onClick={() => onConfirm(planId)}
-            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent/90 transition-colors"
-          >
-            <Check size={14} />
-            Confirm
-          </button>
-          <button
-            onClick={() => onCancel(planId)}
-            className="flex items-center gap-1.5 rounded-lg border border-muted bg-surface px-3 py-2 text-sm text-text/70 hover:bg-muted/50 transition-colors"
-          >
-            <X size={14} />
-            Cancel
-          </button>
-        </div>
-      )}
+        {/* Route breakdown — "What happens" list */}
+        {(plan.routes ?? []).length > 0 && !clarification && (
+          <div className="space-y-1.5">
+            <p className="text-xs font-semibold uppercase tracking-wide text-text/40">
+              What happens
+            </p>
+            <ul className="space-y-1.5">
+              {(plan.routes ?? []).map((r, i) => (
+                <li key={i} className="flex items-start gap-2 text-sm text-text/70">
+                  <ChevronRight size={14} className="mt-0.5 shrink-0 text-accent/60" />
+                  <span>{r.summary}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Clarification options */}
+        {clarification && (
+          <div className="space-y-3">
+            <p className="text-base font-semibold text-text leading-snug">
+              {clarification.question}
+            </p>
+            <div className="flex flex-col gap-2">
+              {(clarification.options ?? []).map((opt, i) => (
+                <button
+                  key={i}
+                  onClick={() => onClarify?.(planId, valueOf(opt))}
+                  className="w-full rounded-xl border-2 border-muted bg-surface px-4 py-3 text-left text-base font-medium text-text hover:border-accent/50 hover:bg-accent/5 active:scale-[0.98] transition-all"
+                >
+                  {labelOf(opt)}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Confirm / Cancel actions */}
+        {!clarification && (
+          <div className="flex gap-3 pt-1">
+            <button
+              onClick={() => onConfirm(planId)}
+              disabled={!planId}
+              className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-accent px-4 py-3.5 text-base font-semibold text-white shadow hover:bg-accent/90 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Check size={18} />
+              Confirm
+            </button>
+            <button
+              onClick={() => onCancel(planId)}
+              className="flex items-center gap-2 rounded-xl border-2 border-muted bg-surface px-4 py-3.5 text-base font-medium text-text/70 hover:bg-muted/50 active:scale-[0.98] transition-all"
+            >
+              <X size={18} />
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

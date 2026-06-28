@@ -6,7 +6,13 @@
  *
  * Timeouts:
  *   - Connection timeout: if "connecting" lasts > 8s → "unavailable"
- *   - Thinking timeout: if "thinking" lasts > 20s → reset to "ready" + error
+ *   - Thinking timeout: if "thinking" lasts > 30s → reset to "ready" + error
+ *
+ * Mic modes (persisted in localStorage as "roba.voice.micMode"):
+ *   - "ptt"          Push-to-talk (default). Hold/tap the button per utterance;
+ *                    sends end_of_turn when released. Enters "thinking" on stop.
+ *   - "conversation" Active conversation. Mic stays open; Gemini's auto-VAD
+ *                    detects turn ends. Tap once to start, tap again to end.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -18,9 +24,11 @@ export type VoiceState =
   | "connecting"   // WS open, waiting for "connected" / "unavailable"
   | "ready"        // connected & ready to talk
   | "listening"    // mic is live, user speaking
-  | "thinking"     // awaiting Roba response
+  | "thinking"     // awaiting Roba response (PTT only)
   | "speaking"     // Roba audio playing back
   | "unavailable"; // no Vertex AI project configured / import failure
+
+export type MicMode = "ptt" | "conversation";
 
 export interface TranscriptLine {
   id: string;
@@ -44,9 +52,12 @@ export interface VoiceLiveHook {
   // Tool results
   lastStatus: Record<string, unknown> | null;
   clearStatus: () => void;
-  // Mode
+  // Confirm/auto mode (whether Roba asks for approval before acting)
   mode: string;
   setMode: (m: string) => void;
+  // Mic interaction mode
+  micMode: MicMode;
+  setMicMode: (m: MicMode) => void;
 }
 
 const CONNECT_TIMEOUT_MS = 8_000;   // "connecting" → "unavailable"
@@ -54,13 +65,30 @@ const CONNECT_TIMEOUT_MS = 8_000;   // "connecting" → "unavailable"
 // the first roba transcript, a tool_result, or an error.
 const THINKING_TIMEOUT_MS = 30_000; // "thinking" → "ready" + error msg
 
+const MIC_MODE_KEY = "roba.voice.micMode";
+
 let _lineId = 0;
 function nextId() {
   return String(++_lineId);
 }
 
+function readMicMode(): MicMode {
+  try {
+    const stored = localStorage.getItem(MIC_MODE_KEY);
+    if (stored === "ptt" || stored === "conversation") return stored;
+  } catch {
+    // localStorage unavailable
+  }
+  return "ptt";
+}
+
+function writeMicMode(m: MicMode) {
+  try { localStorage.setItem(MIC_MODE_KEY, m); } catch { /* ignore */ }
+}
+
 export function useVoiceLive(role: string): VoiceLiveHook {
   const [mode, setMode] = useState<string>("confirm");
+  const [micMode, _setMicMode] = useState<MicMode>(readMicMode);
   const [state, setState] = useState<VoiceState>("idle");
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const [pendingPlan, setPendingPlan] = useState<PlanResult | null>(null);
@@ -71,6 +99,10 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const clientRef = useRef<RobaLiveClient | null>(null);
   const connectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const thinkingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const micModeRef = useRef<MicMode>(micMode);
+
+  // Keep the ref in sync so callbacks close over the latest micMode value.
+  micModeRef.current = micMode;
 
   function clearConnectTimer() {
     if (connectTimerRef.current) {
@@ -99,7 +131,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
 
   // Connect (or reconnect) when role changes.
   useEffect(() => {
-    const client = new RobaLiveClient(role, mode);
+    const client = new RobaLiveClient(role, mode, micModeRef.current);
     clientRef.current = client;
     setState("connecting");
     setLastError(null);
@@ -169,6 +201,12 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           // Done generating; stay "speaking" until audio drains (playback_done).
           clearThinkingTimer();
           break;
+        case "interrupted":
+          // Barge-in: user spoke while Roba was talking. In conversation mode
+          // the mic stays open; in PTT the user is pressing the button.
+          clearThinkingTimer();
+          setState("listening");
+          break;
         case "playback_done":
           setState((cur) =>
             cur === "speaking" || cur === "thinking" ? "ready" : cur,
@@ -199,7 +237,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
       clearThinkingTimer();
       client.disconnect();
     };
-    // Reconnect on role change only.
+    // Reconnect on role change only.  mode/micMode are pushed via setters on
+    // the live client instead of reconnecting.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [role]);
 
@@ -214,7 +253,13 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const stopListening = useCallback(() => {
     if (!clientRef.current) return;
     clientRef.current.stopListening();
-    setStateWithTimeout("thinking");
+    if (micModeRef.current === "ptt") {
+      // Push-to-talk: enter "thinking" and wait for Roba's response.
+      setStateWithTimeout("thinking");
+    } else {
+      // Conversation ended by the user — just return to ready.
+      setState("ready");
+    }
   }, [setStateWithTimeout]);
 
   const sendText = useCallback(
@@ -238,6 +283,12 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     setClarification(null);
   }, []);
 
+  const setMicMode = useCallback((m: MicMode) => {
+    writeMicMode(m);
+    _setMicMode(m);
+    clientRef.current?.setMicMode(m);
+  }, []);
+
   const clearTranscript = useCallback(() => setTranscript([]), []);
   const clearStatus = useCallback(() => setLastStatus(null), []);
 
@@ -257,5 +308,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     clearStatus,
     mode,
     setMode,
+    micMode,
+    setMicMode,
   };
 }

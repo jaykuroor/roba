@@ -4,6 +4,7 @@ import { useVoiceLive } from "./useVoiceLive";
 import { MicButton } from "./MicButton";
 import { PlanConfirmCard } from "./PlanConfirmCard";
 import { ModeToggle } from "./ModeToggle";
+import { MicModeToggle } from "./MicModeToggle";
 import { apiGet, apiPost } from "../api";
 
 // ---------------------------------------------------------------------------
@@ -225,10 +226,16 @@ export function CookVoice() {
 
   return (
     <div className="flex flex-col gap-5">
-      {/* Mode toggle */}
-      <div className="flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Mode</span>
-        <ModeToggle mode={live.mode} onChange={live.setMode} disabled={live.state === "listening"} />
+      {/* Mode toggles */}
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Plan mode</span>
+          <ModeToggle mode={live.mode} onChange={live.setMode} disabled={live.state === "listening"} />
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wide text-text/40">Mic mode</span>
+          <MicModeToggle micMode={live.micMode} onChange={live.setMicMode} disabled={live.state === "listening"} />
+        </div>
       </div>
 
       {/* Error strip */}
@@ -398,6 +405,7 @@ export function CookVoice() {
         <div className="flex flex-col items-center gap-3">
           <MicButton
             state={live.state}
+            micMode={live.micMode}
             size="md"
             onStart={live.startListening}
             onStop={live.stopListening}
