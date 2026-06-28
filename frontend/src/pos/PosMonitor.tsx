@@ -51,6 +51,17 @@ function simTimeToClock(simTime: number): string {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
+const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+function simTimeToLabel(simTime: number, windowKey: PosWindowKey): string {
+  if (windowKey === "week") {
+    // Each bucket is one day; label by day-of-week (sim day 0 = Monday).
+    const dayIndex = Math.floor(simTime / 86400) % 7;
+    return DAY_NAMES[dayIndex] ?? `D${dayIndex}`;
+  }
+  return simTimeToClock(simTime);
+}
+
 function WindowSelect({
   value,
   onChange,
@@ -120,7 +131,7 @@ export function PosMonitor() {
     stats && stats.lines > 0 ? stats.voidedLines / stats.lines : 0;
 
   const chartData = (stats?.buckets ?? []).map((b) => ({
-    label: simTimeToClock(b.t),
+    label: simTimeToLabel(b.t, windowKey),
     orders: b.orders,
   }));
   const channelData = Object.entries(stats?.channelSplit ?? {})

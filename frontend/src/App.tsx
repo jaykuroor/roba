@@ -10,6 +10,16 @@ import PanelsPage from "./routes/PanelsPage";
 // console code (see docs/06).
 const MenuPage = lazy(() => import("./menu/MenuPage"));
 
+// Voice page: staff-facing, uses its own WS (Gemini Live) — NOT the operator
+// WS firehose. Mounted outside OperatorLayout to keep it lightweight.
+const VoicePage = lazy(() => import("./voice/VoicePage"));
+
+const Spinner = (
+  <div className="flex min-h-screen items-center justify-center bg-primary text-text/50">
+    Loading…
+  </div>
+);
+
 export default function App() {
   return (
     <Routes>
@@ -23,14 +33,17 @@ export default function App() {
       <Route
         path="/menu"
         element={
-          <Suspense
-            fallback={
-              <div className="flex min-h-screen items-center justify-center bg-primary text-text/50">
-                Loading menu…
-              </div>
-            }
-          >
+          <Suspense fallback={Spinner}>
             <MenuPage />
+          </Suspense>
+        }
+      />
+      {/* Voice interface — staff-facing, outside OperatorLayout (no WS firehose). */}
+      <Route
+        path="/voice"
+        element={
+          <Suspense fallback={Spinner}>
+            <VoicePage />
           </Suspense>
         }
       />

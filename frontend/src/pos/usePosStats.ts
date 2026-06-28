@@ -81,7 +81,7 @@ export function usePosStats(
   useEffect(() => {
     let cancelled = false;
     const load = () => {
-      apiGet<RawStats>(`/api/pos/stats?since=${sinceFor(windowKey)}`)
+      apiGet<RawStats>(`/api/pos/stats?since=${sinceFor(windowKey)}&window=${windowKey}`)
         .then((r) => {
           if (cancelled) return;
           setStats({

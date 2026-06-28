@@ -14,6 +14,7 @@ const NAV = [
   { to: "/", label: "Console", end: true },
   { to: "/control", label: "Control", end: false },
   { to: "/panels", label: "Panels", end: false },
+  { to: "/voice", label: "Roba Desk", end: false },
   { to: "/menu", label: "Menu site", end: false },
 ];
 
