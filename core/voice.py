@@ -20,15 +20,20 @@ agents consume the routed signals and apply their own deterministic changes.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from .clock import DAY_CLOSE_OFFSET, DAY_OPEN_OFFSET, SECONDS_PER_DAY
-from .config import EVENT_MULT, VOICE_EMIT_LEGACY_USER_FACT
+from .config import EVENT_MULT, VOICE_DEFAULT_MODE, VOICE_EMIT_LEGACY_USER_FACT
 from .llm import CANNED_NOTE
 from .module_capabilities import capability_prompt_context
 from .models import (
+    ApprovalRequest,
+    Forecast,
+    Batch,
+    BatchDefinition,
     Ingredient,
     InventoryLevel,
     MenuItem,
@@ -38,8 +43,26 @@ from .models import (
     Station,
     Supplier,
     UserFact,
+    VoicePlan,
+    WasteEvent,
 )
 from .signals import SignalType
+
+logger = logging.getLogger(__name__)
+
+# Map from target_modules string → agent name used in the orchestrator.
+_MODULE_TO_AGENT: Dict[str, str] = {
+    "track_a.forecaster": "forecaster",
+    "track_a.staff": "staff",
+    "track_a.review": "review",
+    "track_a.competitor": "competitor",
+    "track_b.ledger": "ledger",
+    "track_b.optimizer": "optimizer",
+    "track_b.market_spectator": "market_spectator",
+}
+
+# Roles that can use cook-specific intents.
+COOK_ROLES = {"cook", "kitchen"}
 
 # §11 extraction schema (passed to the LLM as JSON mode).
 EXTRACTION_SCHEMA: Dict[str, Any] = {
@@ -82,13 +105,86 @@ _UNIT_WORDS = {
 }
 
 
-class VoiceProcessor:
-    """STT text → LLM/regex extraction → typed routes + audit (§11)."""
+def _redact_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of payload suitable for plan storage (strip large blobs)."""
+    redacted = {}
+    for k, v in payload.items():
+        if isinstance(v, str) and len(v) > 200:
+            redacted[k] = v[:200] + "…"
+        else:
+            redacted[k] = v
+    return redacted
 
-    def __init__(self, llm: Any, bus: Any, db_session_factory: Callable[[], Any]):
+
+def _route_human_summary(spec: Dict[str, Any], extracted: Dict[str, Any]) -> str:
+    """Generate a 1-line human-readable summary for a route spec."""
+    sig = spec.get("signal_type")
+    sig_str = sig.value if hasattr(sig, "value") else str(sig)
+    entity = extracted.get("entity_ref") or ""
+    value = extracted.get("value")
+    return f"{sig_str}: {entity} {value}".strip()
+
+
+def _plan_human_readable(extracted: Dict[str, Any], routes: List[Dict[str, Any]]) -> str:
+    """Build a friendly summary of what the plan will do."""
+    intent = extracted.get("intent") or "other"
+    entity = extracted.get("entity_ref") or ""
+    window = extracted.get("effective_window")
+    window_str = ""
+    if isinstance(window, dict):
+        start = window.get("start")
+        end = window.get("end")
+        if start is not None and end is not None:
+            window_str = f" (window {start:.0f}–{end:.0f})"
+    agents = sorted({a for r in routes for a in (r.get("target_agents") or [])})
+    agents_str = f" → agents: {', '.join(agents)}" if agents else ""
+    if intent == "add_event":
+        return f"Record demand event '{entity}'{window_str}{agents_str}."
+    if intent == "set_operational_constraint":
+        return f"Set production constraint for '{entity}'{window_str}{agents_str}."
+    if intent == "set_leave":
+        return f"Mark '{entity}' as on leave{window_str}{agents_str}."
+    if intent == "add_review":
+        return f"Log customer feedback about '{entity}'{agents_str}."
+    if intent == "set_competitor":
+        return f"Log competitor note about '{entity}'{agents_str}."
+    if intent == "record_receipt":
+        return f"Record inventory receipt of '{entity}'{agents_str}."
+    if intent == "set_supplier_price":
+        return f"Update supplier pricing for '{entity}'{agents_str}."
+    if routes:
+        types_str = ", ".join({r.get("signal_type", "") for r in routes})
+        return f"Emit {types_str}{agents_str}."
+    return f"Intent '{intent}' for '{entity}'{agents_str}."
+
+
+class VoiceProcessor:
+    """STT text → LLM/regex extraction → typed routes + audit (§11).
+
+    Stream B adds plan/confirm mode: ``plan`` computes what will happen and
+    persists a ``VoicePlan`` row; ``confirm`` applies it.  ``process`` remains
+    the original single-shot path (used by the legacy /api/voice/transcript).
+    """
+
+    def __init__(
+        self,
+        llm: Any,
+        bus: Any,
+        db_session_factory: Callable[[], Any],
+        approvals: Any = None,
+        calls: Any = None,
+    ):
         self.llm = llm
         self.bus = bus
         self.db_session_factory = db_session_factory
+        self.approvals = approvals
+        self.calls = calls
+
+    def attach_approvals(self, approvals: Any) -> None:
+        self.approvals = approvals
+
+    def attach_calls(self, calls: Any) -> None:
+        self.calls = calls
 
     # -- public API ---------------------------------------------------------
 
@@ -117,6 +213,618 @@ class VoiceProcessor:
             "resulting_writes": resulting_writes,
             "signal_id": signal_id,
         }
+
+    # -- Stream B: plan/confirm API ------------------------------------------
+
+    def plan(
+        self,
+        raw_text: str,
+        role: str = "manager",
+        mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compute a plan for the spoken input without emitting any signals.
+
+        Returns a ``VoicePlan`` dict.  When ``mode="auto"`` emits immediately
+        and returns the applied plan.
+
+        Cook-specific intents (mark_batch_cooked, report_waste) are handled
+        here if ``role`` is in ``COOK_ROLES``.
+        """
+        if mode is None:
+            mode = VOICE_DEFAULT_MODE
+
+        # Check for cook-specific intents first.
+        if role in COOK_ROLES:
+            cook_result = self._try_cook_intent(raw_text)
+            if cook_result is not None:
+                return self._save_and_maybe_apply(cook_result, raw_text, role, mode)
+
+        extracted = self._extract(raw_text)
+        specs = self._route_specs(extracted, raw_text)
+
+        # Manager: check for call-request intent.
+        call_plan = self._try_call_intent(extracted, raw_text, role)
+        if call_plan is not None:
+            return self._save_and_maybe_apply(call_plan, raw_text, role, mode)
+
+        # Build the plan dict.
+        route_summaries = []
+        for spec in specs:
+            modules = spec.get("target_modules") or []
+            agents = [_MODULE_TO_AGENT[m] for m in modules if m in _MODULE_TO_AGENT]
+            route_summaries.append({
+                "signal_type": spec["signal_type"].value
+                if hasattr(spec["signal_type"], "value") else str(spec["signal_type"]),
+                "target_modules": modules,
+                "target_agents": agents,
+                "payload_preview": _redact_payload(spec.get("payload") or {}),
+                "summary": _route_human_summary(spec, extracted),
+            })
+
+        human_readable = _plan_human_readable(extracted, route_summaries)
+        plan_dict: Dict[str, Any] = {
+            "role": role,
+            "mode": mode,
+            "summary": human_readable,
+            "human_readable": human_readable,
+            "routes": route_summaries,
+            "requires_approval": False,
+            "clarification": None,
+        }
+        return self._save_and_maybe_apply(plan_dict, raw_text, role, mode)
+
+    def confirm(self, plan_id: str) -> Dict[str, Any]:
+        """Apply a pending plan: emit its signals and mark it applied."""
+        session = self.db_session_factory()
+        try:
+            row = session.get(VoicePlan, plan_id)
+            if row is None:
+                return {"error": f"Plan {plan_id} not found", "status": "not_found"}
+            if row.status != "pending":
+                return {"plan_id": plan_id, "status": row.status}
+            plan = row.plan or {}
+        finally:
+            session.close()
+
+        signal_ids: List[str] = []
+        for route in plan.get("routes") or []:
+            sig_type_str = route.get("signal_type")
+            if not sig_type_str:
+                continue
+            # Resolve the signal type.
+            try:
+                sig_type = SignalType(sig_type_str)
+            except ValueError:
+                continue
+            payload = route.get("payload_preview") or route.get("payload") or {}
+            target_agents = route.get("target_agents") or None
+            try:
+                signal = self.bus.emit(
+                    sig_type,
+                    payload,
+                    source="voice_plan",
+                    target_agents=target_agents,
+                )
+                if signal is not None:
+                    signal_ids.append(signal.signal_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("voice plan confirm: failed to emit %s", sig_type_str)
+
+        # Handle non-signal actions (e.g. batch cooked, call request).
+        for action in plan.get("direct_actions") or []:
+            try:
+                self._apply_direct_action(action)
+            except Exception:  # noqa: BLE001
+                logger.exception("voice plan confirm: failed direct action %s", action)
+
+        now = float(self.bus.sim_time)
+        session = self.db_session_factory()
+        try:
+            row = session.get(VoicePlan, plan_id)
+            if row is not None:
+                row.status = "applied"
+                row.applied_at = now
+                session.commit()
+        finally:
+            session.close()
+
+        self._write_user_fact(
+            plan.get("raw_text", ""),
+            {"intent": "confirmed_plan", "plan_id": plan_id},
+            [f"signal:{s}" for s in signal_ids] or ["applied"],
+        )
+        return {"plan_id": plan_id, "status": "applied", "signal_ids": signal_ids}
+
+    def cancel(self, plan_id: str) -> Dict[str, Any]:
+        """Cancel a pending plan."""
+        session = self.db_session_factory()
+        try:
+            row = session.get(VoicePlan, plan_id)
+            if row is None:
+                return {"error": f"Plan {plan_id} not found"}
+            row.status = "cancelled"
+            session.commit()
+        finally:
+            session.close()
+        return {"plan_id": plan_id, "status": "cancelled"}
+
+    def clarify(self, plan_id: str, answer: str) -> Dict[str, Any]:
+        """Re-plan with the clarification answer appended to the original text."""
+        session = self.db_session_factory()
+        try:
+            row = session.get(VoicePlan, plan_id)
+            if row is None:
+                return {"error": f"Plan {plan_id} not found"}
+            original_text = row.raw_text or ""
+            role = row.role or "manager"
+            mode = row.mode or VOICE_DEFAULT_MODE
+            row.status = "superseded"
+            session.commit()
+        finally:
+            session.close()
+        combined = f"{original_text} [clarification: {answer}]"
+        return self.plan(combined, role=role, mode=mode)
+
+    # -- cook-specific intent detection (Stream B) ---------------------------
+
+    def _try_cook_intent(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        """Check if the text is a cook intent (batch cooked / waste report).
+
+        Returns a partial plan dict with ``direct_actions`` if recognised,
+        or None if it's not a cook intent.
+        """
+        low = raw_text.lower()
+
+        # Batch cooked: "I cooked the margherita batch, made 18"
+        cooked_phrases = (
+            "i cooked", "we cooked", "batch done", "cooked the batch",
+            "finished cooking", "finished batch", "batch is done",
+            "batch cooked", "made the batch",
+        )
+        if any(ph in low for ph in cooked_phrases):
+            batch = self._resolve_next_batch_from_text(low)
+            qty = self._extract_qty_from_text(low)
+            if batch is not None:
+                return {
+                    "role": "cook",
+                    "summary": f"Mark batch #{batch['id']} ({batch['item_name']}) as cooked"
+                               + (f", actual qty {qty}" if qty else ""),
+                    "human_readable": (
+                        f"Roba will record batch #{batch['id']} ({batch['item_name']}) "
+                        f"as cooked"
+                        + (f" with actual quantity {qty}" if qty else "")
+                        + "."
+                    ),
+                    "routes": [],
+                    "direct_actions": [{
+                        "type": "batch_cooked",
+                        "batch_id": batch["id"],
+                        "menu_item_id": batch["menu_item_id"],
+                        "actual_made_qty": qty or batch.get("planned_qty") or 0,
+                        "planned_qty": batch.get("planned_qty"),
+                    }],
+                    "requires_approval": False,
+                    "clarification": None,
+                }
+            # Can't resolve → return a clarification
+            return {
+                "role": "cook",
+                "summary": "Mark a batch as cooked",
+                "human_readable": "Which batch did you cook? Please say the dish name.",
+                "routes": [],
+                "direct_actions": [],
+                "requires_approval": False,
+                "clarification": {
+                    "question": "Which dish batch did you cook?",
+                    "options": self._upcoming_batch_names(),
+                },
+            }
+
+        # Waste report: "threw away 6 tiramisus"
+        waste_phrases = (
+            "threw away", "thrown away", "wasted", "had to throw",
+            "discarded", "waste", "in the bin", "in the trash",
+        )
+        if any(ph in low for ph in waste_phrases):
+            qty = self._extract_qty_from_text(low)
+            item_name = self._extract_dish_from_text(low)
+            if qty is not None and item_name:
+                return {
+                    "role": "cook",
+                    "summary": f"Report waste: {qty} {item_name}",
+                    "human_readable": (
+                        f"Roba will record waste of {qty} × {item_name}. "
+                        "Was this from the batch you just cooked (overproduction) "
+                        "or did an ingredient spoil / prep error?"
+                    ),
+                    "routes": [],
+                    "direct_actions": [],
+                    "requires_approval": False,
+                    "clarification": {
+                        "question": "Why was the food wasted?",
+                        "options": [
+                            {"value": "overproduction", "label": "From a batch (overproduction)"},
+                            {"value": "spoilage", "label": "Ingredient spoiled"},
+                            {"value": "prep_error", "label": "Prep error / dropped"},
+                        ],
+                        "pending_waste": {
+                            "item_name": item_name,
+                            "qty": qty,
+                        },
+                    },
+                }
+            # Partial info → ask
+            return {
+                "role": "cook",
+                "summary": "Report food waste",
+                "human_readable": "How much was wasted and what dish?",
+                "routes": [],
+                "direct_actions": [],
+                "requires_approval": False,
+                "clarification": {
+                    "question": "What was thrown away and how much?",
+                    "options": [],
+                },
+            }
+
+        # "I threw away 6 tiramisus because they spoiled" — embedded cause
+        for cause_phrase, waste_type in (
+            ("overproduction", "overproduction"),
+            ("from the batch", "overproduction"),
+            ("too many", "overproduction"),
+            ("spoil", "spoilage"),
+            ("expir", "spoilage"),
+            ("drop", "prep_error"),
+            ("prep error", "prep_error"),
+        ):
+            if cause_phrase in low and any(ph in low for ph in waste_phrases):
+                qty = self._extract_qty_from_text(low)
+                item_name = self._extract_dish_from_text(low)
+                if qty and item_name:
+                    menu_item_id = self._resolve_menu_item_id(item_name)
+                    return {
+                        "role": "cook",
+                        "summary": f"Report {waste_type} waste: {qty} {item_name}",
+                        "human_readable": (
+                            f"Roba will record {waste_type} waste of "
+                            f"{qty} × {item_name} and update the demand model."
+                        ),
+                        "routes": [],
+                        "direct_actions": [{
+                            "type": "waste_event",
+                            "menu_item_id": menu_item_id,
+                            "qty": qty,
+                            "waste_type": waste_type,
+                            "reason": raw_text,
+                        }],
+                        "requires_approval": False,
+                        "clarification": None,
+                    }
+
+        return None
+
+    def _try_call_intent(
+        self, extracted: Dict[str, Any], raw_text: str, role: str
+    ) -> Optional[Dict[str, Any]]:
+        """If the manager asks to 'call' a competitor/supplier, create an approval."""
+        if role not in ("manager",):
+            return None
+        low = raw_text.lower()
+        call_phrases = ("call ", "phone ", "ring ", "contact ")
+        if not any(ph in low for ph in call_phrases):
+            return None
+        # Check for competitor/supplier keywords.
+        counterparty_type = None
+        counterparty_id = None
+        if any(w in low for w in ("competitor", "rival", "restaurant", "pizza", "mario")):
+            counterparty_type = "competitor"
+            counterparty_id = self._resolve_counterparty_id("competitor", raw_text)
+        elif any(w in low for w in ("supplier", "vendor", "farm", "distributor")):
+            counterparty_type = "supplier"
+            counterparty_id = self._resolve_counterparty_id("supplier", raw_text)
+        if counterparty_type is None:
+            return None
+
+        return {
+            "role": role,
+            "summary": f"Request {counterparty_type} call",
+            "human_readable": (
+                f"Roba will create an approval request for an outbound "
+                f"{counterparty_type} call. You will confirm it in the approvals inbox."
+            ),
+            "routes": [],
+            "direct_actions": [{
+                "type": "call_request",
+                "counterparty_type": counterparty_type,
+                "counterparty_id": counterparty_id,
+                "purpose": raw_text,
+            }],
+            "requires_approval": True,
+            "clarification": None,
+        }
+
+    def _apply_direct_action(self, action: Dict[str, Any]) -> None:
+        """Execute a non-signal action from a confirmed plan."""
+        kind = action.get("type")
+        if kind == "batch_cooked":
+            self._record_batch_cooked(
+                batch_id=int(action["batch_id"]),
+                menu_item_id=int(action["menu_item_id"]),
+                actual_made_qty=float(action["actual_made_qty"]),
+                planned_qty=action.get("planned_qty"),
+            )
+        elif kind == "waste_event":
+            self._record_waste_event(
+                menu_item_id=action.get("menu_item_id"),
+                qty=float(action.get("qty") or 0.0),
+                waste_type=str(action.get("waste_type") or "overproduction"),
+                reason=str(action.get("reason") or ""),
+            )
+        elif kind == "call_request":
+            if self.calls is not None:
+                try:
+                    self.calls.request(
+                        agent="manager",
+                        counterparty_type=str(action.get("counterparty_type") or "competitor"),
+                        counterparty_id=int(action.get("counterparty_id") or 0),
+                        purpose=str(action.get("purpose") or ""),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("voice plan: call request failed")
+
+    def _record_batch_cooked(
+        self,
+        batch_id: int,
+        menu_item_id: int,
+        actual_made_qty: float,
+        planned_qty: Optional[float] = None,
+    ) -> None:
+        """Advance a batch to 'cooked'/ready state and emit BATCH_PROGRESS."""
+        from .signals import SignalType  # avoid circular
+        now = float(self.bus.sim_time)
+        session = self.db_session_factory()
+        try:
+            batch = session.get(Batch, batch_id)
+            if batch is None:
+                return
+            old_planned = float(batch.planned_qty or 0.0)
+            batch.actual_made_qty = actual_made_qty
+            batch.status = "ready"
+            batch.cooked_at = now
+            session.commit()
+        finally:
+            session.close()
+
+        # Emit BATCH_PROGRESS so the forecaster and ledger can react.
+        self.bus.emit(
+            SignalType.BATCH_PROGRESS,
+            {
+                "batch_id": batch_id,
+                "menu_item_id": menu_item_id,
+                "actual_made_qty": actual_made_qty,
+                "planned_qty": planned_qty or old_planned,
+                "status": "cooked",
+                "source": "cook",
+            },
+            source="voice_cook",
+            target_agents=["forecaster", "ledger"],
+        )
+
+    def _record_waste_event(
+        self,
+        menu_item_id: Optional[int],
+        qty: float,
+        waste_type: str,
+        reason: str = "",
+    ) -> None:
+        """Write a WasteEvent and emit WASTE_EVENT."""
+        from .signals import SignalType  # avoid circular
+        now = float(self.bus.sim_time)
+        session = self.db_session_factory()
+        try:
+            we = WasteEvent(
+                waste_type=waste_type,
+                ingredient_id=None,
+                menu_item_id=menu_item_id,
+                lot_id=None,
+                qty=qty,
+                unit="each",
+                cost=None,
+                reason=reason,
+                sim_time=now,
+                source="cook",
+            )
+            session.add(we)
+            session.commit()
+            session.refresh(we)
+            we_id = we.id
+        finally:
+            session.close()
+
+        self.bus.emit(
+            SignalType.WASTE_EVENT,
+            {
+                "waste_event_id": we_id,
+                "waste_type": waste_type,
+                "menu_item_id": menu_item_id,
+                "ingredient_id": None,
+                "qty": qty,
+                "unit": "each",
+                "cost": None,
+                "reason": reason,
+                "source": "cook",
+            },
+            source="voice_cook",
+            target_agents=["forecaster", "ledger"],
+        )
+
+    # -- plan persistence helpers -------------------------------------------
+
+    def _save_and_maybe_apply(
+        self,
+        plan_dict: Dict[str, Any],
+        raw_text: str,
+        role: str,
+        mode: str,
+    ) -> Dict[str, Any]:
+        """Persist the plan and apply immediately if mode='auto'."""
+        plan_id = str(uuid.uuid4())
+        now = float(self.bus.sim_time)
+        plan_dict["plan_id"] = plan_id
+        plan_dict.setdefault("raw_text", raw_text)
+
+        status = "pending"
+        if mode == "auto" and not plan_dict.get("requires_approval") and not plan_dict.get("clarification"):
+            status = "applied"
+
+        session = self.db_session_factory()
+        try:
+            row = VoicePlan(
+                plan_id=plan_id,
+                role=role,
+                mode=mode,
+                raw_text=raw_text,
+                plan=plan_dict,
+                status=status,
+                created_at=now,
+                applied_at=now if status == "applied" else None,
+            )
+            session.add(row)
+            session.commit()
+        finally:
+            session.close()
+
+        plan_dict["status"] = status
+        plan_dict["plan_id"] = plan_id
+
+        if status == "applied":
+            # Apply immediately (auto mode).
+            result = self.confirm(plan_id)
+            plan_dict["signal_ids"] = result.get("signal_ids", [])
+
+        return plan_dict
+
+    # -- cook helper methods ------------------------------------------------
+
+    def _resolve_next_batch_from_text(self, low: str) -> Optional[Dict[str, Any]]:
+        """Find the most likely 'next approved/decided' batch from the text."""
+        session = self.db_session_factory()
+        try:
+            # Look for a dish name in the text.
+            items = session.query(MenuItem).filter(MenuItem.active == 1).all()
+            matched_item = None
+            for item in sorted(items, key=lambda i: len(i.name or ""), reverse=True):
+                if (item.name or "").lower() in low:
+                    matched_item = item
+                    break
+            if matched_item:
+                batch = (
+                    session.query(Batch)
+                    .filter(
+                        Batch.menu_item_id == matched_item.id,
+                        Batch.status.in_(("decided", "approved")),
+                        Batch.decision == "cook",
+                    )
+                    .order_by(Batch.decided_at.desc())
+                    .first()
+                )
+            else:
+                batch = (
+                    session.query(Batch)
+                    .filter(
+                        Batch.status.in_(("decided", "approved")),
+                        Batch.decision == "cook",
+                    )
+                    .order_by(Batch.decided_at.desc())
+                    .first()
+                )
+            if batch is None:
+                return None
+            item_name = ""
+            if batch.menu_item_id:
+                mi = session.get(MenuItem, batch.menu_item_id)
+                item_name = mi.name if mi else str(batch.menu_item_id)
+            return {
+                "id": int(batch.id),
+                "menu_item_id": int(batch.menu_item_id or 0),
+                "item_name": item_name,
+                "planned_qty": float(batch.planned_qty or 0.0),
+            }
+        finally:
+            session.close()
+
+    def _upcoming_batch_names(self) -> List[str]:
+        """Return names of the next few pending batches for a clarification list."""
+        session = self.db_session_factory()
+        try:
+            batches = (
+                session.query(Batch)
+                .filter(Batch.status.in_(("decided", "approved")), Batch.decision == "cook")
+                .order_by(Batch.decided_at.desc())
+                .limit(5)
+                .all()
+            )
+            names = []
+            for b in batches:
+                mi = session.get(MenuItem, b.menu_item_id) if b.menu_item_id else None
+                names.append(mi.name if mi else f"Batch #{b.id}")
+            return names
+        finally:
+            session.close()
+
+    def _extract_qty_from_text(self, low: str) -> Optional[float]:
+        """Extract a simple number from the text."""
+        m = re.search(r"(\d+(?:\.\d+)?)", low)
+        return float(m.group(1)) if m else None
+
+    def _extract_dish_from_text(self, low: str) -> Optional[str]:
+        """Try to find a dish name in the text by matching active menu items."""
+        session = self.db_session_factory()
+        try:
+            items = session.query(MenuItem).filter(MenuItem.active == 1).all()
+            for item in sorted(items, key=lambda i: len(i.name or ""), reverse=True):
+                if (item.name or "").lower() in low:
+                    return item.name
+            return None
+        finally:
+            session.close()
+
+    def _resolve_menu_item_id(self, ref: Optional[str]) -> Optional[int]:
+        if not ref:
+            return None
+        session = self.db_session_factory()
+        try:
+            row = session.query(MenuItem).filter(MenuItem.name.ilike(str(ref))).first()
+            if row is None:
+                row = session.query(MenuItem).filter(MenuItem.name.ilike(f"{ref}%")).first()
+            return int(row.id) if row is not None else None
+        finally:
+            session.close()
+
+    def _resolve_counterparty_id(self, ctype: str, text: str) -> int:
+        """Resolve a competitor or supplier id from text (best-effort, 0 if unknown)."""
+        from .models import Competitor
+        low = text.lower()
+        session = self.db_session_factory()
+        try:
+            if ctype == "competitor":
+                rows = session.query(Competitor).all()
+                for row in sorted(rows, key=lambda r: len(r.name or ""), reverse=True):
+                    if (row.name or "").lower() in low:
+                        return int(row.id)
+                # Return first competitor as fallback.
+                first = session.query(Competitor).first()
+                return int(first.id) if first else 0
+            elif ctype == "supplier":
+                rows = session.query(Supplier).all()
+                for row in sorted(rows, key=lambda r: len(r.name or ""), reverse=True):
+                    if (row.name or "").lower() in low:
+                        return int(row.id)
+                first = session.query(Supplier).first()
+                return int(first.id) if first else 0
+        finally:
+            session.close()
+        return 0
 
     # -- (1) extraction -----------------------------------------------------
 
@@ -246,6 +954,51 @@ class VoiceProcessor:
                 .order_by(InventoryLevel.ingredient_id.asc())
                 .all()
             ][:40]
+
+            # --- batch board (last 6 sim-hours, capped at 15 rows) ---
+            from . import kitchen as _kitchen
+            raw_board = _kitchen.batch_board(session, now=float(self.bus.sim_time), window_sim_s=6*3600, limit=15)
+            # Slim down batches for the prompt (omit sold_qty/wasted_qty/decided_at)
+            slim_batches = [
+                {k: b[k] for k in ("id","dish","decision","status","state","planned_qty","actual_made_qty","cook_by")}
+                for b in raw_board["batches"]
+            ]
+            batch_board_ctx = {"clock": raw_board["clock"], "counts": raw_board["counts"], "recent_batches": slim_batches}
+
+            # --- pending approvals ---
+            approval_rows = (
+                session.query(ApprovalRequest)
+                .filter(ApprovalRequest.status == "pending")
+                .order_by(ApprovalRequest.created_at.desc())
+                .limit(15)
+                .all()
+            )
+            pending_approvals = [
+                {"id": ar.id, "type": ar.type, "title": ar.title, "ref_id": ar.ref_id, "urgency": ar.urgency}
+                for ar in approval_rows
+            ]
+
+            # --- latest forecast per active item ---
+            forecasts_raw = (
+                session.query(Forecast)
+                .order_by(Forecast.generated_at.desc())
+                .limit(40)
+                .all()
+            )
+            seen_items: set = set()
+            forecast_ctx = []
+            for f in forecasts_raw:
+                if f.menu_item_id not in seen_items and len(forecast_ctx) < 20:
+                    seen_items.add(f.menu_item_id)
+                    # resolve name from menu_rows already fetched
+                    dish_name = next((r.get("name") for r in menu_rows if r.get("id") == f.menu_item_id), f"Item #{f.menu_item_id}")
+                    forecast_ctx.append({
+                        "menu_item_id": f.menu_item_id,
+                        "dish": dish_name,
+                        "daypart": f.daypart,
+                        "forecast_qty": f.forecast_qty,
+                        "confidence": f.confidence,
+                    })
         finally:
             session.close()
 
@@ -265,19 +1018,87 @@ class VoiceProcessor:
 
         payload = {
             "sim_time": float(self.bus.sim_time),
+            "clock": raw_board["clock"],
             "menu": menu_rows[:80],
             "staff": staff_rows,
             "inventory": inventory_rows,
             "active_constraints": active_constraints,
+            "batch_board": batch_board_ctx,
+            "pending_approvals": pending_approvals,
+            "forecasts": forecast_ctx,
             "module_capabilities": capability_prompt_context(),
             "guidance": {
                 "specific_modifier_rule": "Ingredient/modifier words like bacon or mozzarella narrow the impact before category words like burger or pizza.",
                 "category_rule": "Category words like dessert, desserts, pizza, pasta, or beverages cascade to every active menu item in that category.",
                 "equipment_rule": "Equipment failures only affect items whose station, category, item name, or description indicates that equipment.",
                 "hard_zero_rule": "Broken equipment, out-of-stock required ingredients, no-more, over, done, finished, and 86 instructions are hard production_unavailable constraints.",
+                "status_vocabulary": (
+                    "Batch state vocabulary (use EXACTLY these terms — do not invent others): "
+                    "state=skipped: decision is 'skip', do not cook; "
+                    "state=awaiting_approval: cook batch not yet cleared (status=decided); "
+                    "state=ready_to_cook: cleared and should be cooked now (status=approved); "
+                    "state=cooked: already prepared (status=ready, cooked_at set). "
+                    "The word 'prepping' and 'served' are NOT used in this system."
+                ),
             },
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def kitchen_status(self, *, dish: str | None = None, topic: str = "all") -> dict:
+        """Live DB read for the get_kitchen_status tool.
+
+        Returns a JSON-serialisable dict with a 'summary' key suitable for
+        reading back to the staff member.
+        """
+        from . import kitchen as _kitchen
+        session = self.db_session_factory()
+        try:
+            now = float(self.bus.sim_time)
+            if dish:
+                result = _kitchen.dish_status(session, dish, now=now)
+                mi = result.get("menu_item") or {}
+                ans = result.get("answer", {})
+                name = mi.get("name", dish)
+                mid = mi.get("id", "?")
+                if not result["resolved"]:
+                    summary = f"Could not find a dish matching '{dish}' in the menu."
+                elif ans.get("prepared"):
+                    made = ans.get("made_qty")
+                    made_str = f"{made:.0f} made" if made is not None else "already made"
+                    batches = result.get("batches", [])
+                    planned = next((b["planned_qty"] for b in batches if b["state"]=="cooked"), None)
+                    planned_str = f" (planned {planned:.0f})" if planned else ""
+                    summary = f"Dish #{mid} ({name}): cooked — {made_str}{planned_str}."
+                elif ans.get("should_cook"):
+                    summary = f"Dish #{mid} ({name}): approved and should be cooked now."
+                elif ans.get("awaiting_approval"):
+                    summary = f"Dish #{mid} ({name}): batch is awaiting manager approval before cooking."
+                else:
+                    batches = result.get("batches", [])
+                    if any(b["decision"] == "skip" for b in batches):
+                        summary = f"Dish #{mid} ({name}): batch was decided to be skipped."
+                    else:
+                        summary = f"Dish #{mid} ({name}): no batch found in the current window."
+                result["summary"] = summary
+                return result
+            else:
+                board = _kitchen.batch_board(session, now=now, window_sim_s=6*3600, limit=40)
+                c = board["counts"]
+                parts = []
+                if c["cooked"]: parts.append(f"{c['cooked']} cooked")
+                if c["approved"]: parts.append(f"{c['approved']} ready to cook")
+                if c["pending"]: parts.append(f"{c['pending']} awaiting approval")
+                if c["skipped"]: parts.append(f"{c['skipped']} skipped")
+                if topic in ("approvals", "all"):
+                    approvals = session.query(ApprovalRequest).filter(ApprovalRequest.status == "pending").order_by(ApprovalRequest.created_at.desc()).limit(15).all()
+                    board["pending_approvals"] = [
+                        {"id": ar.id, "type": ar.type, "title": ar.title, "urgency": ar.urgency}
+                        for ar in approvals
+                    ]
+                board["summary"] = ", ".join(parts) + "." if parts else "No batches in the current window."
+                return board
+        finally:
+            session.close()
 
     def _enrich_operational_constraint(
         self,

@@ -247,6 +247,9 @@ def _bootstrap() -> None:
     approvals.set_ws_broadcast(sink)
     calls.set_ws_broadcast(sink)
     calls.attach_approvals(approvals)
+    # Wire calls and approvals into the voice processor for manager intents.
+    voice.attach_approvals(approvals)
+    voice.attach_calls(calls)
 
     # §14.4 agent-group routing: every signal type fans out to
     # ``orchestrator.on_signal`` (which dispatches to each registered agent
@@ -282,6 +285,7 @@ def _bootstrap() -> None:
             orchestrator=orchestrator,
             formatter=formatter,
             calls=calls,
+            approvals=approvals,
             llm=llm,
             ws_broadcast=sink,
         )
@@ -998,15 +1002,19 @@ def read_orders(
 @app.get("/api/pos/stats")
 def read_pos_stats(
     since: float = Query(0.0),
+    window: str = Query("day"),
     db_session: Any = Depends(db.get_db),
 ) -> Dict[str, Any]:
     """Aggregated POS statistics over ``(since, now]`` for the monitor's window
-    selector (Today / last hour / 30m / 15m).
+    selector (Today / last hour / 6h / This week).
 
     Computed server-side so totals are accurate for any window regardless of the
     client's bounded live buffer. ``since`` is clamped to ``>= 0`` so the seeded
-    negative-``sim_time`` history is never included. Also returns ~24 adaptive
-    time buckets across the window for the orders-over-time chart.
+    negative-``sim_time`` history is never included.
+
+    Returns fixed, clock-aligned time buckets for the orders-over-time chart;
+    bucket boundaries are multiples of the window's canonical bucket width so
+    they never shift as ``now`` advances.
     """
     since = max(float(since), 0.0)
     now = float(ctx.clock.sim_time)
@@ -1049,17 +1057,36 @@ def read_pos_stats(
         .all()
     ]
 
-    # ~24 adaptive buckets (min 60 sim-s wide) for the orders-over-time chart.
-    span = max(now - since, 1.0)
-    width = max(60.0, span / 24.0)
-    bucket_count = int(math.ceil(span / width))
-    counts = [0] * (bucket_count + 1)
-    for (sim_time,) in db_session.query(models.Order.sim_time).filter(order_filter).all():
-        idx = int((float(sim_time) - since) // width)
-        if 0 <= idx < len(counts):
-            counts[idx] += 1
+    # Fixed, clock-aligned time buckets for the orders-over-time chart.
+    # Bucket width is a constant per window so boundaries never shift as
+    # ``now`` advances (fixing the drifting X-axis bug).
+    _BUCKET_WIDTHS: Dict[str, float] = {
+        "1h": 300.0,       # 5-minute buckets
+        "6h": 1800.0,      # 30-minute buckets
+        "day": 3600.0,     # 1-hour buckets
+        "week": 86400.0,   # 1-day buckets
+    }
+    bucket_width = _BUCKET_WIDTHS.get(window, 3600.0)
+    # Anchor to the rounded boundary that contains ``since``.
+    bucket_start = math.floor(since / bucket_width) * bucket_width
+    # Build a fixed ordered list of bucket start times up to (and including)
+    # the bucket that contains ``now``.
+    bucket_starts: list[float] = []
+    t = bucket_start
+    while t <= now:
+        bucket_starts.append(t)
+        t += bucket_width
+    # Count orders into each bucket.  Any t < since is excluded by order_filter.
+    bucket_index: Dict[int, int] = {i: 0 for i in range(len(bucket_starts))}
+    if bucket_starts:
+        for (sim_time,) in db_session.query(models.Order.sim_time).filter(order_filter).all():
+            raw_t = float(sim_time)
+            idx = int((raw_t - bucket_start) / bucket_width)
+            if 0 <= idx < len(bucket_starts):
+                bucket_index[idx] = bucket_index.get(idx, 0) + 1
     buckets = [
-        {"t": since + i * width, "orders": count} for i, count in enumerate(counts)
+        {"t": bucket_starts[i], "orders": bucket_index.get(i, 0)}
+        for i in range(len(bucket_starts))
     ]
 
     return {
@@ -1487,6 +1514,197 @@ def voice_transcript(body: VoiceBody) -> Dict[str, Any]:
     return ctx.voice.process(body.text)
 
 
+# ---------------------------------------------------------------------------
+# Voice plan/confirm API (Stream B)
+# ---------------------------------------------------------------------------
+
+
+class VoicePlanBody(BaseModel):
+    text: str
+    role: str = "manager"
+    mode: Optional[str] = None  # None → use config default
+
+
+class VoiceClarifyBody(BaseModel):
+    plan_id: str
+    answer: str
+
+
+class VoiceSettingsBody(BaseModel):
+    default_mode: str = "confirm"
+
+
+@app.post("/api/voice/plan")
+def voice_plan(body: VoicePlanBody) -> Dict[str, Any]:
+    """Compute a plan for the spoken input (plan/confirm flow, Stream B)."""
+    _sync_bus_to_clock()
+    return ctx.voice.plan(body.text, role=body.role, mode=body.mode)
+
+
+@app.post("/api/voice/plan/{plan_id}/confirm")
+def voice_plan_confirm(plan_id: str) -> Dict[str, Any]:
+    """Apply a pending voice plan."""
+    _sync_bus_to_clock()
+    return ctx.voice.confirm(plan_id)
+
+
+@app.post("/api/voice/plan/{plan_id}/cancel")
+def voice_plan_cancel(plan_id: str) -> Dict[str, Any]:
+    """Cancel a pending voice plan."""
+    return ctx.voice.cancel(plan_id)
+
+
+@app.post("/api/voice/clarify")
+def voice_clarify(body: VoiceClarifyBody) -> Dict[str, Any]:
+    """Re-plan with a clarification answer."""
+    _sync_bus_to_clock()
+    return ctx.voice.clarify(body.plan_id, body.answer)
+
+
+@app.get("/api/settings/voice")
+def get_voice_settings() -> Dict[str, Any]:
+    return {"default_mode": config.VOICE_DEFAULT_MODE}
+
+
+@app.post("/api/settings/voice")
+def set_voice_settings(body: VoiceSettingsBody) -> Dict[str, Any]:
+    import core.config as _cfg
+    _cfg.VOICE_DEFAULT_MODE = body.default_mode
+    return {"default_mode": _cfg.VOICE_DEFAULT_MODE}
+
+
+# ---------------------------------------------------------------------------
+# Kitchen / Cook endpoints (Stream B3)
+# ---------------------------------------------------------------------------
+
+
+class BatchCookedBody(BaseModel):
+    actual_made_qty: float
+
+
+class KitchenWasteBody(BaseModel):
+    menu_item_id: Optional[int] = None
+    ingredient_id: Optional[int] = None
+    qty: float
+    waste_type: str = "overproduction"
+    from_batch_id: Optional[int] = None
+    reason: str = ""
+
+
+@app.get("/api/kitchen/board")
+def kitchen_board(
+    window_hours: Optional[float] = Query(None),
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    """Return the full batch board: counts + all batches with state derived.
+
+    Used by the cook's rolling batch board and the voice agent context.
+    """
+    from . import kitchen as _kitchen
+    now = float(ctx.clock.sim_time)
+    window_sim_s = window_hours * 3600 if window_hours is not None else None
+    return _kitchen.batch_board(db_session, now=now, window_sim_s=window_sim_s, limit=40)
+
+
+@app.get("/api/kitchen/batches")
+def kitchen_batches(
+    status: Optional[str] = Query(None),
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    """Return cook-facing batch queue: decided/approved 'cook' batches."""
+    query = db_session.query(models.Batch).filter(models.Batch.decision == "cook")
+    if status:
+        query = query.filter(models.Batch.status == status)
+    else:
+        query = query.filter(models.Batch.status.in_(("decided", "approved")))
+    batches = query.order_by(models.Batch.decided_at.desc()).limit(20).all()
+    result = []
+    for b in batches:
+        d = _row_to_dict(b)
+        # Resolve menu item name.
+        mi = db_session.get(models.MenuItem, b.menu_item_id) if b.menu_item_id else None
+        d["menu_item_name"] = mi.name if mi else None
+        result.append(d)
+    return result
+
+
+@app.post("/api/kitchen/batches/{batch_id}/cooked")
+def kitchen_batch_cooked(batch_id: int, body: BatchCookedBody) -> Dict[str, Any]:
+    """Cook marks a batch as cooked with the actual quantity made."""
+    session = db.new_session()
+    try:
+        batch = session.get(models.Batch, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+        now = float(ctx.clock.sim_time)
+        planned = float(batch.planned_qty or 0.0)
+        batch.actual_made_qty = body.actual_made_qty
+        batch.status = "ready"
+        batch.cooked_at = now
+        session.commit()
+    finally:
+        session.close()
+
+    ctx.bus.emit(
+        "BATCH_PROGRESS",
+        {
+            "batch_id": batch_id,
+            "menu_item_id": int(batch.menu_item_id or 0),
+            "actual_made_qty": body.actual_made_qty,
+            "planned_qty": planned,
+            "status": "cooked",
+            "source": "cook",
+        },
+        source="kitchen_api",
+        target_agents=["forecaster", "ledger"],
+    )
+    return {"batch_id": batch_id, "status": "ready", "actual_made_qty": body.actual_made_qty}
+
+
+@app.post("/api/kitchen/waste")
+def kitchen_waste(body: KitchenWasteBody) -> Dict[str, Any]:
+    """Cook reports a waste event."""
+    now = float(ctx.clock.sim_time)
+    session = db.new_session()
+    try:
+        we = models.WasteEvent(
+            waste_type=body.waste_type,
+            ingredient_id=body.ingredient_id,
+            menu_item_id=body.menu_item_id,
+            lot_id=None,
+            qty=body.qty,
+            unit="each",
+            cost=None,
+            reason=body.reason,
+            sim_time=now,
+            source="cook",
+        )
+        session.add(we)
+        session.commit()
+        session.refresh(we)
+        we_id = we.id
+    finally:
+        session.close()
+
+    ctx.bus.emit(
+        "WASTE_EVENT",
+        {
+            "waste_event_id": we_id,
+            "waste_type": body.waste_type,
+            "menu_item_id": body.menu_item_id,
+            "ingredient_id": body.ingredient_id,
+            "qty": body.qty,
+            "unit": "each",
+            "cost": None,
+            "reason": body.reason,
+            "source": "cook",
+        },
+        source="kitchen_api",
+        target_agents=["forecaster", "ledger"],
+    )
+    return {"waste_event_id": we_id, "status": "recorded"}
+
+
 @app.post("/api/calls/{call_id}/turn")
 def call_turn(call_id: int, body: CallTurnBody) -> Dict[str, Any]:
     session = db.new_session()
@@ -1525,6 +1743,48 @@ def market_negotiate(body: NegotiateBody) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="Market Spectator not active")
     market.negotiate(body.supplier_id, body.ingredient_id)
     return {"supplier_id": body.supplier_id, "ingredient_id": body.ingredient_id, "requested": True}
+
+
+# ===========================================================================
+# Track B: Inventory Optimizer LLM (Stream E)
+# ===========================================================================
+
+
+@app.get("/api/track-b/optimizer/insights")
+def read_optimizer_insights(
+    limit: int = Query(50),
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    """Return recent InventoryOptimizerMemory insights."""
+    rows = (
+        db_session.query(models.InventoryOptimizerMemory)
+        .order_by(models.InventoryOptimizerMemory.last_seen_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [_row_to_dict(r) for r in rows]
+
+
+@app.post("/api/track-b/optimizer/auto-mode")
+def set_optimizer_auto_mode(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Toggle the optimizer's LLM auto-mode at runtime."""
+    import core.config as _cfg
+    enabled = bool(body.get("enabled", True))
+    _cfg.OPTIMIZER_LLM_AUTO_MODE = enabled
+    optimizer = (ctx.tracks.get("track_b") or {}).get("optimizer")
+    return {"optimizer_llm_auto_mode": enabled, "optimizer_active": optimizer is not None}
+
+
+@app.post("/api/track-b/optimizer/run-llm")
+def run_optimizer_llm(
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    """Trigger an immediate LLM optimization pass."""
+    optimizer = (ctx.tracks.get("track_b") or {}).get("optimizer")
+    if optimizer is None:
+        raise HTTPException(status_code=503, detail="Optimizer not active")
+    optimizer.llm_optimize()
+    return {"status": "ok"}
 
 
 # ===========================================================================
@@ -1633,3 +1893,27 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         ctx.hub.disconnect(websocket)
     except Exception:  # noqa: BLE001 — any socket error ends this connection.
         ctx.hub.disconnect(websocket)
+
+
+@app.websocket("/ws/voice/live")
+async def voice_live_endpoint(
+    websocket: WebSocket,
+    role: str = Query("manager"),
+    mode: str = Query("confirm"),
+) -> None:
+    """Gemini Live API bridge (Stream B5).
+
+    Browser connects, sends 16kHz PCM16 binary frames + JSON control frames;
+    receives 24kHz PCM16 audio frames + JSON transcript/plan events back.
+    """
+    await websocket.accept()
+    try:
+        from .voice_live import live_bridge
+        await live_bridge(websocket, ctx.voice, role=role, mode=mode)
+    except Exception:  # noqa: BLE001
+        logger.exception("voice live endpoint error")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass

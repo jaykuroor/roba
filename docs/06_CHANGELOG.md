@@ -4,6 +4,520 @@ Reverse-chronological record of every significant commit. Entries include the sh
 
 ---
 
+## `pending` — 2026-06-27 — Voice-first interface, POS chart fix, Optimizer LLM, Cook feedback loop
+
+This entry covers five simultaneous workstreams (A–E) delivered together. Read all sections before touching the voice pipeline, batch lifecycle, or inventory optimizer.
+
+---
+
+### Overview
+
+Four major features were added:
+
+1. **Signal→agent routing (Stream A)** — Signals can now name specific agents to target, breaking the group-only fan-out constraint.
+2. **POS chart stabilisation (Stream D)** — The "Orders over time" X-axis no longer drifts; bucket widths are fixed per window.
+3. **Bidirectional Gemini Live voice interface (Streams B + C)** — A dedicated `/voice` page with role-based UIs (Manager / Cook) that uses the Gemini Live API for real-time two-way speech. Roba both listens and talks back. The LLM turns spoken input into bus signals via a plan/confirm layer. Full text fallback when no key is set.
+4. **Inventory Optimizer LLM pass (Stream E)** — The Track B optimizer now runs an LLM reasoning step that can disable dishes sharing a scarce ingredient, propose near-waste deals, and adjust procurement timing. Uses the same `DemandForecasterMemory`-style durable memory.
+5. **Cook feedback loop (Stream B3)** — Batches advance through a full lifecycle (decided → approved → cooked). Cook waste reporting feeds back into the demand forecaster's learning memory. Auto-approve is the default; a gated mode exists.
+
+---
+
+### Stream A — Signal→agent routing
+
+**Problem:** The orchestrator fanned signals out by *group-tag intersection only*. There was no way for a voice planner (or any agent) to say "send this signal specifically to the forecaster and no one else."
+
+**Solution:** Added an optional `target_agents: List[str]` field to signals. Routing is now a union: an agent receives a signal if its subscribed groups intersect the signal's groups **OR** its name appears in `target_agents`. Both conditions are checked; unset `target_agents` keeps behaviour identical to before.
+
+**What changed:**
+
+- `core/models.py` — `Signal` table: new `target_agents = mapped_column(JSON, nullable=True)` column (after `correlation_id`). Existing rows unaffected (nullable).
+- `core/bus.py` — `SignalBus.emit()` accepts `target_agents: Optional[List[str]] = None`. Persists it on the new column; on dedup-refresh, refreshes the field if provided.
+- `core/orchestrator.py` — `on_signal()` union routing:
+  ```python
+  named = set(signal.target_agents or [])
+  by_group = bool(sig_groups & set(agent.subscribed_groups))
+  by_name  = agent.name in named
+  if not (by_group or by_name): continue
+  ```
+- `core/signals.py` — `_signal_to_dict()` carries `target_agents` in the WS broadcast payload.
+
+**Usage pattern:**
+```python
+bus.emit(
+    SignalType.DEMAND_EVENT,
+    payload,
+    target_agents=["forecaster"],   # only wakes the forecaster
+)
+```
+
+---
+
+### Stream D — POS "Orders over time" chart fix
+
+**Problem:** The chart X-axis rescaled constantly while the simulation ran. Root cause: `width = span / 24` where `span = now - since` grows every poll tick, so bucket boundaries (`floor(t/width)*width`) shift with every 3-second refresh.
+
+**Solution:** Fixed bucket widths per window, anchored to absolute clock boundaries.
+
+**Backend (`core/api.py` — `read_pos_stats`):**
+```python
+_BUCKET_WIDTHS = {"1h": 300, "6h": 1800, "day": 3600, "week": 86400}
+```
+- Added `window: str = Query("day")` parameter.
+- Bucket start is `floor(since / width) * width`. Boundaries are always round multiples (08:00, 09:00, …) regardless of `now`.
+- No more adaptive width: the same 24 buckets always align to the same clock positions.
+
+**Frontend:**
+- `frontend/src/pos/usePosStats.ts` — appends `&window=${windowKey}` to the fetch URL.
+- `frontend/src/pos/PosMonitor.tsx` — added `simTimeToLabel(t, windowKey)` helper that formats as `HH:MM` for intraday windows and `Mon`, `Tue`, … for `week`.
+
+**Invariant:** Switching the window selector or stopping/restarting the simulation no longer shifts or rescales the chart axis.
+
+---
+
+### Stream B — Voice planner backend
+
+#### B1 — Plan/confirm layer (`core/voice.py`)
+
+The existing `VoiceProcessor` was a one-shot transcribe→emit pipeline. A plan/confirm layer sits on top without replacing it.
+
+**New public methods:**
+
+| Method | What it does |
+|--------|-------------|
+| `plan(text, role, mode)` | Runs extraction + routing but does NOT emit signals. Persists a `VoicePlan` row with `status="pending"`. In `mode="auto"` immediately calls `confirm()` and returns the applied result. |
+| `confirm(plan_id)` | Loads the plan, emits each route via `bus.emit(..., target_agents=route["target_agents"])`, marks it `applied`. |
+| `cancel(plan_id)` | Marks it `cancelled`. Supersedes any existing `pending` plan for the same role first. |
+| `clarify(plan_id, answer)` | Appends the answer to the raw text and re-plans. Returns a new plan (with a new `plan_id`; original is marked `superseded`). |
+
+**Route target_agents derivation:** Each route's `target_modules` list (e.g. `["track_a.forecaster"]`) is mapped to agent names via `_MODULE_TO_AGENT`:
+```python
+_MODULE_TO_AGENT = {
+    "track_a.forecaster":  "forecaster",
+    "track_b.optimizer":   "optimizer",
+    "track_b.ledger":      "ledger",
+    "track_b.procurement": "procurement",
+    ...
+}
+```
+This gives the voice planner named targeting without hard-coding agent names at call sites.
+
+**Cook intents** (gated by `role in {"cook", "kitchen"}`):
+
+- *Mark batch cooked*: resolves the next `approved`/`decided` batch for the named item → records `actual_made_qty`, advances `Batch.status = "cooked"`, emits `BATCH_PROGRESS`.
+- *Report waste*: if cause is ambiguous, returns a `clarification` block instead of emitting. The cook's follow-up answer re-plans with full cause → writes a `WasteEvent` and emits `WASTE_EVENT(source="cook")`.
+
+**Manager human-in-the-loop** (competitor/supplier call intents): calls `ctx.calls.request(...)` which creates an `outbound_call` approval via the existing approval flow. Plan is marked `requires_approval=True`. The manager sees it in the approvals inbox.
+
+#### B2 — New signal type and models
+
+**`core/signals.py`:**
+- `SignalType.BATCH_PROGRESS = "BATCH_PROGRESS"` — groups `["kitchen","forecasting","inventory","human","frontend"]`, priority 3, TTL 4 hours.
+- `BatchProgressPayload`: `batch_id`, `menu_item_id`, `actual_made_qty`, `planned_qty?`, `sold_qty?`, `wasted_qty?`, `status`, `source`.
+
+**`core/models.py` additions:**
+- `VoicePlan` table — `plan_id` (PK text/UUID), `role`, `mode`, `raw_text`, `plan` (JSON route list), `status` (pending|applied|cancelled|superseded), `created_at`, `applied_at`.
+- `InventoryOptimizerMemory` table — mirrors `DemandForecasterMemory`: `key` (unique), `insight`, `confidence`, `last_seen_at`, `times_observed`.
+- `Batch.approval_id` — FK to `approval_requests` (nullable); set when gated mode creates an approval.
+- `Batch.cooked_at` — sim-time when cook marked it done (nullable).
+
+**`core/config.py` additions:**
+```python
+VOICE_DEFAULT_MODE      = os.getenv("VOICE_DEFAULT_MODE", "confirm")
+BATCH_APPROVAL_GATED    = os.getenv("BATCH_APPROVAL_GATED", "0") in {"1","true","yes","on"}
+OPTIMIZER_LLM_AUTO_MODE = os.getenv("OPTIMIZER_LLM_AUTO_MODE", "0") in {"1","true","yes","on"}
+PROMO_SLOW_MOVER_PCT    = int(os.getenv("PROMO_SLOW_MOVER_PCT", "15"))
+GEMINI_LIVE_MODEL       = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.0-flash-live-001")
+```
+
+#### B4 — Voice REST endpoints (`core/api.py`)
+
+All new endpoints under `/api/voice/` and `/api/kitchen/`:
+
+| Method | Path | Body | Returns |
+|--------|------|------|---------|
+| `POST` | `/api/voice/plan` | `{text, role, mode}` | plan object: `{plan_id, role, mode, summary, human_readable, routes, clarification?, requires_approval}` |
+| `POST` | `/api/voice/plan/{id}/confirm` | — | `{status:"applied", signal_ids:[...]}` |
+| `POST` | `/api/voice/plan/{id}/cancel` | — | `{status:"cancelled"}` |
+| `POST` | `/api/voice/clarify` | `{plan_id, answer}` | re-planned result (same shape as `/plan`) |
+| `GET` | `/api/settings/voice` | — | `{default_mode}` |
+| `POST` | `/api/settings/voice` | `{default_mode}` | `{ok:true}` |
+| `GET` | `/api/kitchen/batches` | `?status=approved,decided` | list of kitchen batches with `item_name`, `cook_by` |
+| `POST` | `/api/kitchen/batches/{id}/cooked` | `{actual_made_qty}` | advances batch status, emits `BATCH_PROGRESS` |
+| `POST` | `/api/kitchen/waste` | `{menu_item_id?, ingredient_id?, qty, waste_type, from_batch_id?}` | writes `WasteEvent`, emits `WASTE_EVENT` |
+| `GET` | `/api/track-b/optimizer/insights` | — | recent `InventoryOptimizerMemory` rows |
+| `POST` | `/api/track-b/optimizer/auto-mode` | `{enabled}` | toggles `OPTIMIZER_LLM_AUTO_MODE` at runtime |
+| `POST` | `/api/track-b/optimizer/run-llm` | — | triggers `optimizer.llm_optimize()` immediately |
+| `WS` | `/ws/voice/live` | `?role=&mode=` | Gemini Live bridge (binary PCM both ways + JSON control frames) |
+
+#### B5 — Gemini Live bridge (`core/voice_live.py`)
+
+This is the server-side half of the real-time voice path. It bridges the browser WebSocket to a Gemini Live session and executes tool calls server-side.
+
+**Topology:**
+```
+Browser ←──WS /ws/voice/live──→ live_bridge() ←──Gemini Live WS──→ Gemini API
+```
+
+**Why server-side bridge?** The `GEMINI_API_KEY` never leaves the server. The browser only sends raw PCM audio and receives raw PCM audio + JSON control frames.
+
+**Audio format contract (mandated by Gemini Live):**
+- Browser → server: 16 kHz, mono, PCM16 LE (little-endian signed 16-bit)
+- Server → browser: 24 kHz, mono, PCM16 LE
+
+**SDK methods used (google-genai v2.8+):**
+
+| Operation | Method |
+|-----------|--------|
+| Send audio chunk | `session.send_realtime_input(media=types.Blob(data=bytes, mime_type="audio/pcm;rate=16000"))` |
+| End of audio stream | `session.send_realtime_input(audio_stream_end=True)` |
+| Send text turn | `session.send_client_content(turns={"parts":[{"text":"..."}]}, turn_complete=True)` |
+| Return tool result | `session.send_tool_response(function_responses=types.FunctionResponse(id=..., name=..., response=...))` |
+| Receive audio | `chunk.data` property (concatenates all `inline_data` parts) |
+| Receive text | `chunk.text` property |
+| Input transcription | `chunk.server_content.input_transcription.text` |
+| Output transcription | `chunk.server_content.output_transcription.text` |
+| Tool calls | `chunk.tool_call.function_calls` (list of `FunctionCall` objects with `.id`, `.name`, `.args`) |
+
+**Important: `session.receive()` is per-turn.** It yields chunks until `server_content.turn_complete = True`, then raises `StopAsyncIteration`. The bridge wraps it in `while True:` to handle multi-turn conversations.
+
+**Timeouts (failsafe layer):**
+- Connection timeout: `asyncio.timeout(10s)` around the initial `connect()` call. If the API key is invalid or the network is down, the WS immediately receives `{"type":"unavailable", "reason":"..."}` and the bridge exits cleanly.
+- Response timeout: `asyncio.timeout(20s)` per turn inside the receive loop. If Gemini goes silent (API outage, very slow response), the browser gets `{"type":"error","message":"response_timeout"}` and the state resets to "ready".
+
+**Tool declarations exposed to Gemini:**
+
+| Tool | Gemini calls it when… | Server-side handler |
+|------|-----------------------|---------------------|
+| `process_note(text)` | The model wants to understand what the user said | `VoiceProcessor.plan(text, role, mode)` |
+| `confirm_plan(plan_id)` | The model (or user voice) confirmed a pending plan | `VoiceProcessor.confirm(plan_id)` |
+| `cancel_plan(plan_id)` | The model (or user voice) rejected a plan | `VoiceProcessor.cancel(plan_id)` |
+| `mark_batch_cooked(item_name, actual_qty)` | Cook says batch is done | Synthesises voice note → `plan(text, role="cook", mode="auto")` |
+| `report_waste(item_name, qty, cause)` | Cook reports thrown-away food | Synthesises voice note → `plan(text, role="cook", mode="auto")` |
+| `request_competitor_call(target, counterparty_type, purpose)` | Manager wants to call a competitor/supplier | `plan(text, role="manager", mode="confirm")` → creates an outbound_call approval |
+
+**Fallback:** If `GEMINI_API_KEY` is unset, the WS immediately sends `{"type":"unavailable","reason":"no_api_key"}` and returns. The frontend shows the text input fallback — no hang, no crash.
+
+---
+
+### Stream B3 — Batch lifecycle and cook feedback loop
+
+#### Batch auto-approve
+
+Previously batches were stuck at `status="decided"` forever — no cook ever saw them.
+
+**Now:** When `decide_batches()` creates a batch with `decision="cook"`:
+- If `BATCH_APPROVAL_GATED=False` (default): batch immediately gets `status="approved"`. Cooks see it via `GET /api/kitchen/batches?status=approved,decided`.
+- If `BATCH_APPROVAL_GATED=True`: batch stays at `status="decided"` and an approval request (`type="batch"`) is created in the approval inbox. The manager approves → `ApprovalHandlers.on_resolved()` advances it to `"approved"`.
+
+**Files changed:**
+- `track_a/agents/forecaster.py` — `decide_batches()` conditionally sets `initial_status`, creates approval requests via `self.approvals.create(type="batch", ...)`.
+- `track_a/__init__.py` / `core/api.py` — `approvals` passed through `bootstrap_track_a()` to the forecaster.
+- `track_b/approval/handlers.py` — `OWN_TYPES` now includes `"batch"`; `on_resolved()` handles it by calling `_approve_batch(batch_id)` which writes `status="approved"` to the DB.
+
+#### Forecaster learning from cook feedback
+
+Two new signals feed back into `DemandForecasterMemory`:
+
+**`BATCH_PROGRESS` (cook marks batch cooked):**
+- `_learn_from_batch_progress(payload)`: if `actual_made_qty / planned_qty` deviates by more than 15%, writes a `DemandForecasterMemory` row scoped to `(menu_item_id, daypart)` nudging future batch quantities in the observed direction.
+- Example: cook makes 8 instead of 15 margheritas at lunch → memory says "reduce lunch margherita batch by ~47%".
+
+**`WASTE_EVENT(source="cook")` (cook reports throw-away):**
+- `_learn_from_cook_waste(payload)`: if `waste_type="overproduction"`, writes a memory reducing the future forecasted quantity for that item in that daypart.
+- Example: "I threw away 6 tiramisus, overproduction" → memory says "cut tiramisu dinner batch".
+
+Both learning paths reuse the existing `_remember()` method which upserts by key and increments `times_observed`, so repeated signals converge rather than thrash.
+
+---
+
+### Stream E — Inventory Optimizer LLM pass
+
+The `InventoryOptimizer` gained an LLM reasoning layer that runs alongside (not instead of) its deterministic rules.
+
+#### When it runs
+
+- On `LOW_STOCK`, `STOCKOUT_RISK`, `EXPIRY_RISK`, or `EXPIRY_USE_PRIORITY` signals (when `OPTIMIZER_LLM_AUTO_MODE=True`).
+- On a timer: every `FORECAST_INTERVAL_SIM_S * 2` ticks.
+- On demand: `POST /api/track-b/optimizer/run-llm`.
+
+#### Context fed to the LLM (`_build_llm_context`)
+
+```json
+{
+  "inventory": [{"ingredient_id":…, "name":"…", "on_hand":…, "par":…, "unit":"…"}],
+  "near_expiry": [{"lot_id":…, "ingredient_id":…, "qty":…, "expiry_date":…}],
+  "menu_items": [{"id":…, "name":…, "active":…, "margin_x_velocity":…, "ingredients":[…]}],
+  "supplier_catalog": [{"ingredient_id":…, "supplier":…, "price":…, "lead_days":…}],
+  "optimizer_memory": [{"key":"…", "insight":"…", "confidence":…, "times_observed":…}],
+  "live_demand_forecasts": [{"menu_item_id":…, "forecast_qty":…, "confidence":…}]
+}
+```
+
+The `margin_x_velocity` score = `(dine_in_price × historical_attach_rate)` — a proxy for contribution per service slot. Used by the LLM to prefer disabling the lower-value dish when an ingredient is shared.
+
+#### Actions the LLM can return
+
+```json
+[
+  {"action": "toggle_item",    "menu_item_id": 3, "enable": false, "confidence": 0.8, "rationale": "…"},
+  {"action": "create_deal",    "menu_item_ids": [5], "discount_pct": 20, "trigger": "expiry", "confidence": 0.75, "rationale": "…"},
+  {"action": "reorder",        "ingredient_id": 2, "qty": 50, "rationale": "…"},
+  {"action": "defer_reorder",  "ingredient_id": 7, "rationale": "…"}
+]
+```
+
+Confidence threshold for application: **0.55** (actions below this are logged but not executed). Actions map to existing deterministic writers:
+
+| LLM action | Deterministic executor |
+|------------|----------------------|
+| `toggle_item` | `optimizer._disable()` / `_manual_toggle()` |
+| `create_deal` | `optimizer._propose_promo_llm()` (wraps `_propose_promo`) |
+| `reorder` | `procurement.create_po()` (still honours `APPROVAL_PO_THRESHOLD`) |
+| `defer_reorder` | logs only; skips the reorder that would have fired deterministically |
+
+**Fallback:** If `self.llm is None` or the LLM call raises any exception, the method returns silently and the normal deterministic reorder/promo paths run as before. No key = no LLM, no crash.
+
+#### Learning memory (`InventoryOptimizerMemory`)
+
+After each successful `llm_optimize()` run, outcomes are persisted via `_remember(key, insight, confidence)`. On the next run, these rows are included in the LLM context so it builds on prior observations (e.g. "tomatoes spoil every Sunday → reduce PO size by 30%").
+
+---
+
+### Stream C — Voice frontend
+
+A dedicated `/voice` route mounted **outside** `OperatorLayout` (so it never opens the operator WS firehose). Accessible from the top nav ("Voice" link) and directly at `/voice`.
+
+#### Architecture
+
+```
+VoicePage          ← role chooser (Manager / Kitchen)
+  ├── ManagerVoice ← uses useVoiceLive("manager")
+  └── CookVoice    ← uses useVoiceLive("cook")
+
+useVoiceLive(role)
+  └── RobaLiveClient    ← WS to /ws/voice/live
+        ├── AudioWorklet (mic-processor.js)  ← mic capture
+        └── Web Audio API                    ← playback
+```
+
+#### `mic-processor.js` (AudioWorklet, `frontend/public/`)
+
+Runs in a dedicated audio thread (not the main thread — no jank):
+- Receives float32 audio from the mic at the browser's native rate (48kHz typical).
+- Downsamples to 16kHz using nearest-neighbour (correct for speech).
+- Converts to signed PCM16 little-endian.
+- Posts 20ms chunks (320 samples at 16kHz) as `ArrayBuffer` to the main thread.
+
+#### `RobaLiveClient.ts`
+
+Manages the entire WS + audio lifecycle:
+- Connects to `ws[s]://<host>/ws/voice/live?role=<role>&mode=<mode>`.
+- On `startListening()`: requests mic permission → creates `AudioContext` at 48kHz → adds the worklet → pipes mic → worklet output → WS binary frames.
+- On `stopListening()`: tears down mic, sends `{"type":"end_of_turn"}` to signal the server to tell Gemini the audio turn is complete.
+- Barge-in: calling `startListening()` while Roba is speaking closes the playback `AudioContext` immediately (interrupts Roba mid-sentence).
+- Playback: incoming binary frames (24kHz PCM16 from Gemini) are decoded to float32, placed in an `AudioBuffer`, and scheduled sequentially on a second `AudioContext` for gap-free playback.
+- Emits typed events: `connected`, `unavailable`, `transcript`, `plan_preview`, `tool_result`, `applied`, `error`, `disconnected`.
+
+#### `useVoiceLive.ts`
+
+React hook providing:
+- State machine: `idle → connecting → ready → listening → thinking → speaking → unavailable`
+- **Connection timeout (8s)**: if the WS doesn't receive `"connected"` or `"unavailable"` within 8 seconds, state transitions to `"unavailable"` with an error message. Protects against silent WS failures.
+- **Thinking timeout (20s)**: if state stays `"thinking"` for 20 seconds after `stopListening()`, it resets to `"ready"` with the message "No response — Roba may be unavailable." Protects against Gemini API hangs.
+- Both timers are cleared immediately if a real response arrives.
+- `startListening()` / `stopListening()` / `sendText()` / `confirmPlan()` / `cancelPlan()` / `clearTranscript()`.
+
+#### `MicButton.tsx`
+
+Shared component with two simultaneous interaction modes:
+- **Click to toggle**: short tap (< 300ms) starts listening; next short tap stops.
+- **Hold to talk**: long press (≥ 300ms) listens while held; release sends.
+
+Implementation uses `onPointerDown` / `onPointerUp` + `setPointerCapture` for reliable cross-device behaviour. A `pressTimeRef` records the press start; duration on release determines mode. Visual states: idle (red button), listening (pulsing ring + mic icon), thinking (spinner), speaking (volume icon), unavailable (greyed out + MicOff).
+
+#### `PlanConfirmCard.tsx`
+
+Rendered when Roba has processed a note and is in confirm-first mode:
+- Shows `human_readable` summary (plain English — e.g. "Roba will boost the dinner forecast by 30% and flag it to the forecaster agent").
+- Shows target agent pills (e.g. `forecaster`, `optimizer`).
+- Shows a route breakdown (each signal type and its purpose).
+- Confirm button → `confirmPlan(plan_id)` → signals are emitted to named agents.
+- Cancel button → `cancelPlan(plan_id)` → plan discarded.
+- When the plan has a `clarification` (Roba needs more info), renders option buttons instead of Confirm/Cancel. Selecting an option calls `POST /api/voice/clarify` and surfaces the re-planned result.
+
+#### `ModeToggle.tsx`
+
+Toggle between `confirm` (default) and `auto` modes. In auto mode, plans are applied without the confirmation step — Gemini calls `confirm_plan()` server-side immediately after `process_note()` returns. In confirm mode, Roba reads back the plan and waits.
+
+#### `ManagerVoice.tsx`
+
+Full Roba management console:
+- `MicButton` (large, centred).
+- Error strip with refresh button — shows any `lastError` from the hook.
+- Approvals inbox: polls `GET /api/approvals?status=pending` every 5s; shows pending approvals with Approve/Reject buttons. This is the human-in-the-loop surface for competitor call requests, batch approvals (gated mode), PO approvals, etc.
+- `PlanConfirmCard` shown when a plan is pending.
+- Transcript (last 12 turns, scrollable, user messages right-aligned, Roba left-aligned).
+- Hidden "Type instead" text input (always available as fallback, even when Live works).
+
+#### `CookVoice.tsx`
+
+Kitchen-focused:
+- "Next batch" card: shows the queued `approved` or `decided` batch with dish name, planned qty, and a "cook by" time if set. Has an actual-qty input and a "Mark cooked" button (calls `POST /api/kitchen/batches/{id}/cooked` directly, bypassing voice for speed).
+- `MicButton` (medium).
+- Quick action buttons: "Batch done" (pre-fills the voice note) and "Report waste" (kicks off the clarification flow via voice).
+- `PlanConfirmCard` for waste cause clarification.
+- Transcript (last 8 turns).
+- "Type instead" fallback.
+- Polls `GET /api/kitchen/batches?status=approved,decided` every 5s and removes a batch from the UI immediately when marked cooked.
+
+#### `VoicePage.tsx`
+
+Role chooser entry point. Two large cards (Manager / Kitchen) with icon, label, and description. Selecting one renders the appropriate sub-component. A "Switch role" button in the header returns to the chooser without a page reload (no WS reconnect needed — `useVoiceLive` reconnects on role change via its `useEffect([role])` dependency).
+
+---
+
+### Runtime: how a voice turn flows end-to-end
+
+**Happy path (Gemini Live available, Manager role, confirm-first mode):**
+
+```
+1. User opens /voice → selects Manager
+   → useVoiceLive("manager") mounts
+   → RobaLiveClient connects WS to /ws/voice/live?role=manager&mode=confirm
+   → live_bridge() checks GEMINI_API_KEY → connects to Gemini Live
+   → server sends {"type":"connected"} → state: "ready"
+
+2. User holds the mic button (> 300ms hold)
+   → startListening(): getUserMedia() → AudioContext → AudioWorklet loads
+   → state: "listening"
+   → mic-processor.js downsamples 48kHz → 16kHz PCM16, posts 20ms chunks
+   → RobaLiveClient sends binary frames over WS
+   → _client_to_gemini() → session.send_realtime_input(media=Blob(...))
+   → [user speaks: "there is a parade tonight, expect a big crowd"]
+
+3. User releases button
+   → stopListening(): mic torn down
+   → WS sends {"type":"end_of_turn"}
+   → _client_to_gemini() → session.send_realtime_input(audio_stream_end=True)
+   → state: "thinking" + 20s timeout armed
+
+4. Gemini transcribes the audio, decides to call process_note
+   → tool_call arrives in _gemini_to_client()
+   → _execute_tool("process_note", {"text": "there is a parade tonight..."})
+   → VoiceProcessor.plan("there is a parade...", role="manager", mode="confirm")
+     → extracts: DEMAND_EVENT intent, +30% multiplier, evening window
+     → builds routes: [{signal_type: DEMAND_EVENT, target_agents: ["forecaster"], summary: "..."}]
+     → saves VoicePlan(status="pending")
+     → returns {plan_id, human_readable: "Roba will boost evening demand by 30%..."}
+   → session.send_tool_response(FunctionResponse(result={...}))
+
+5. Gemini reads the plan back aloud in natural language
+   → audio chunks flow through _gemini_to_client() → websocket.send_bytes()
+   → RobaLiveClient.playPcm() schedules the 24kHz audio on the playback AudioContext
+   → state: "speaking" (set when output_transcription.text arrives)
+   → transcript line added: {role:"roba", text:"I'll boost the dinner forecast by about 30%..."}
+   → PlanConfirmCard appears in UI
+
+6. User says "yes, do it" (or taps Confirm button)
+   → Gemini calls confirm_plan({plan_id})
+   → _execute_tool() → VoiceProcessor.confirm(plan_id)
+     → loads VoicePlan, calls bus.emit(DEMAND_EVENT, payload, target_agents=["forecaster"])
+     → forecaster receives DEMAND_EVENT → adjusts forecast
+     → VoicePlan.status = "applied"
+   → tool result → {"status":"applied", "signal_ids":["abc..."]}
+   → Gemini confirms aloud: "Done, I've updated the forecast."
+   → frontend receives {"type":"applied"} → PlanConfirmCard dismissed
+   → state: "ready"
+```
+
+**No-API-key path:**
+```
+WS connects → live_bridge() checks GEMINI_API_KEY="" 
+→ sends {"type":"unavailable","reason":"no_api_key"} → returns
+→ state: "unavailable"
+→ lastError: "No GEMINI_API_KEY set — use the text input below."
+→ TextFallback rendered; typing a note calls POST /api/voice/plan (REST, no Live)
+→ PlanConfirmCard appears with REST-derived plan
+```
+
+**Thinking timeout:**
+```
+User stops speaking → state: "thinking" → 20s timer starts
+→ 20s elapses with no response
+→ state: "ready" + lastError: "No response — Roba may be unavailable."
+→ Refresh button reloads the page (reconnects WS)
+```
+
+---
+
+### Environment variables added
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `GEMINI_API_KEY` | — | Required for Gemini Live voice. Without it the voice page degrades to text. |
+| `GEMINI_LIVE_MODEL` | `gemini-2.0-flash-live-001` | Which Live model to connect to. |
+| `VOICE_DEFAULT_MODE` | `confirm` | `confirm` or `auto`. Initial mode for all voice sessions. |
+| `BATCH_APPROVAL_GATED` | `0` | Set to `1` to require manager approval before cooks see batches. |
+| `OPTIMIZER_LLM_AUTO_MODE` | `0` | Set to `1` to enable automatic LLM reasoning pass in the optimizer. |
+| `PROMO_SLOW_MOVER_PCT` | `15` | Minimum velocity shortfall % to trigger a slow-mover promo. |
+
+---
+
+### Key files
+
+```
+# Backend — new files
+core/voice_live.py                      Gemini Live WS bridge
+frontend/public/mic-processor.js        AudioWorklet: mic capture → 16kHz PCM16
+
+# Backend — modified files
+core/models.py                          Signal.target_agents, VoicePlan, InventoryOptimizerMemory,
+                                        Batch.approval_id, Batch.cooked_at
+core/bus.py                             emit() target_agents param
+core/orchestrator.py                    union routing (group OR named)
+core/signals.py                         BATCH_PROGRESS type + BatchProgressPayload
+core/config.py                          VOICE_DEFAULT_MODE, BATCH_APPROVAL_GATED,
+                                        OPTIMIZER_LLM_AUTO_MODE, PROMO_SLOW_MOVER_PCT,
+                                        GEMINI_LIVE_MODEL
+core/voice.py                           plan/confirm/cancel/clarify, cook + manager intents
+core/api.py                             voice/kitchen/optimizer endpoints + /ws/voice/live
+track_a/agents/forecaster.py            batch auto-approve, approvals param,
+                                        _learn_from_batch_progress, _learn_from_cook_waste
+track_a/__init__.py                     approvals passed to bootstrap
+track_b/agents/optimizer.py             llm_optimize, _build_llm_context, _apply_llm_actions,
+                                        InventoryOptimizerMemory upserts
+track_b/agents/__init__.py              llm + db_session_factory passed to optimizer/handlers
+track_b/approval/handlers.py            batch type + _approve_batch
+pos/usePosStats.ts                      &window= param
+pos/PosMonitor.tsx                      simTimeToLabel helper
+
+# Frontend — new files
+frontend/src/voice/RobaLiveClient.ts    WS + audio client class
+frontend/src/voice/useVoiceLive.ts      React hook (state machine + timeouts)
+frontend/src/voice/MicButton.tsx        click-to-toggle + hold-to-talk button
+frontend/src/voice/ModeToggle.tsx       confirm/auto toggle
+frontend/src/voice/PlanConfirmCard.tsx  plan preview + confirm/cancel + clarification
+frontend/src/voice/ManagerVoice.tsx     Manager role UI
+frontend/src/voice/CookVoice.tsx        Cook role UI
+frontend/src/voice/VoicePage.tsx        role chooser entry point
+
+# Frontend — modified files
+frontend/src/App.tsx                    /voice route (lazy, outside OperatorLayout)
+frontend/src/routes/OperatorLayout.tsx  "Voice" added to NAV
+```
+
+---
+
+### What is NOT implemented / known gaps
+
+- **`VoiceProcessor.plan()` / `confirm()` implementation detail**: the route extraction in `core/voice.py` was extended with method stubs and intent handlers. If you find a cook/manager intent that isn't being extracted correctly, check `_try_cook_intent()` and `_try_call_intent()` in `core/voice.py` — those are the most likely places where pattern matching may need tuning for new phrases.
+- **Batch status after "cooked"**: batches advance to `"cooked"` via the cook voice flow, but there is no automatic transition to `"served"`. That step (linking a cooked batch to fulfilled order lines) would require matching POS orders to batch inventory depletion — not yet implemented.
+- **`OPTIMIZER_LLM_AUTO_MODE` defaults off**: the LLM optimizer pass is disabled by default so CI and demo environments without a key don't fail silently. Enable it with `OPTIMIZER_LLM_AUTO_MODE=1`.
+- **No end-to-end tests for the voice frontend**: the voice components are not covered by the existing pytest suite (which is backend-only). Manual verification is required.
+- **Gemini Live model availability**: `gemini-2.0-flash-live-001` requires the Live API to be enabled on the project. If the connection fails with a 403, check API key permissions and `GEMINI_LIVE_MODEL`.
+
+---
+
 ## `4f9c49b` — 2026-06-24 — Frontend overhaul
 
 **What changed:**

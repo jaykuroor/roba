@@ -47,7 +47,7 @@ class FakeAvailabilityLLM:
 def seeded(bus, session_factory, monkeypatch):
     """An in-memory DB loaded with the Bella's Kitchen preset + a voice
     processor whose LLM has no API keys (so it uses the regex fallback)."""
-    for var in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+    for var in ("GOOGLE_CLOUD_PROJECT",):
         monkeypatch.delenv(var, raising=False)
     llm = LLMProvider()
     llm._sleep = lambda *_a, **_k: None
@@ -257,7 +257,7 @@ def test_pizza_oven_constraint_targets_only_pizza_oven_items(seeded):
 
 
 def test_no_more_bacon_burgers_targets_bacon_items_only(bus, session_factory, monkeypatch):
-    for var in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+    for var in ("GOOGLE_CLOUD_PROJECT",):
         monkeypatch.delenv(var, raising=False)
     llm = LLMProvider()
     llm._sleep = lambda *_a, **_k: None
