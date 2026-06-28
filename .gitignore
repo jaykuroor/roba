@@ -1,4 +1,5 @@
 .env
+roba.json
 .venv/
 __pycache__/
 .cursor/
@@ -6,3 +7,4 @@ __pycache__/
 *.db-shm
 *.db-wal
 *.log
+graphify-out/

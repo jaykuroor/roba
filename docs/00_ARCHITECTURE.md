@@ -87,10 +87,10 @@ Every cross-track signal (marked → in §15) MUST have, in the **consuming** tr
 | LLM | **Gemini 3.1 Flash-Lite via google-genai (primary) -> Groq -> OpenRouter -> canned** | free tiers; see §13 |
 | Weather | external HTTP (impl picks; suggest **Open-Meteo**, no key) | usage decided in §9/§18.5 |
 | Scheduling | **in-process async loop bound to the sim clock** | no external scheduler |
-| Python deps | fastapi, uvicorn, sqlalchemy, pydantic, httpx, google-genai, python-dotenv | |
+| Python deps | fastapi, uvicorn, sqlalchemy, pydantic, httpx, google-genai, google-auth, python-dotenv | |
 | **Containerization** | **Docker + Docker Compose** | `docker compose up` runs backend+frontend on any machine — see §26 |
 
-Env vars: `GEMINI_API_KEY`, `GEMINI_MODEL` (default `gemini-3.1-flash-lite`), `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `WEATHER_API_BASE` (optional), `DEMO_MODE`.
+Env vars: `GOOGLE_CLOUD_PROJECT` (required for LLM + voice), `GOOGLE_CLOUD_LOCATION` (default `us-central1`), `GOOGLE_APPLICATION_CREDENTIALS` (default `roba.json`), `GEMINI_MODEL` (default `gemini-3.1-flash-lite`), `GEMINI_LIVE_MODEL` (default `gemini-live-2.5-flash`), `WEATHER_API_BASE` (optional), `DEMO_MODE`. Authentication is via a service-account JSON (`roba.json` in repo root — gitignored, never committed) or Application Default Credentials.
 
 ---
 
@@ -682,13 +682,20 @@ server: { host: true, port: 5173, proxy: {
 All frontend calls use **relative paths** (`/api/...`, `/ws`) — never hardcode host/port.
 
 ### 26.5 Run
+
+**Prerequisites — Vertex AI setup**
+1. In [Google Cloud Console](https://console.cloud.google.com/), enable the **Vertex AI API** for your project.
+2. Create a service account, grant it the `roles/aiplatform.user` (**Vertex AI User**) role, and download a JSON key as **`roba.json`** into the repo root (gitignored — never committed).
+3. Copy and fill `.env.example → .env`: set `GOOGLE_CLOUD_PROJECT` to your project ID and `GOOGLE_CLOUD_LOCATION` to your region.
+
 ```
-cp .env.example .env          # fill GEMINI_API_KEY (+ GROQ/OPENROUTER optional)
+cp .env.example .env          # fill GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION
+# place your service-account key at roba.json in the repo root
 docker compose up --build     # or: make up
 # open http://localhost:5173
 docker compose down           # make down   (down -v also wipes the DB)
 ```
-For non-Docker dev: `uvicorn core.api:app --reload` + `npm run dev` in `/frontend` (the proxy falls back to `localhost:8000`). The two paths are interchangeable; demos use Docker.
+For non-Docker dev: `uvicorn core.api:app --reload` + `npm run dev` in `/frontend` (the proxy falls back to `localhost:8000`). Set `GOOGLE_APPLICATION_CREDENTIALS=roba.json` (or the path configured in `.env`). The two paths are interchangeable; demos use Docker.
 
 ### 26.6 Makefile targets
 `base` = `docker compose build base` (builds/refreshes the pip-install image, cached unless `requirements.txt` changes); `up`/`reset`/`demo-a`/`demo-b`/`demo` all depend on `base` so it's always current before the app images build `FROM` it. `up` = `docker compose up --build`; `down` = `docker compose down`; `reset` = `down -v` then `up` (re-seeds); `seed` = POST default preset; `demo-a|demo-b|demo` = set `DEMO_MODE` and `up`; `test` = pytest (backend) + vitest (frontend).

@@ -4,8 +4,8 @@ Run from the repo root:
 
     python scripts/llm_smoke.py
 
-With GEMINI_API_KEY set, this performs live Gemini calls through google-genai.
-Without keys, it verifies that each major app use-site reaches the canned
+With GOOGLE_CLOUD_PROJECT set, this performs live Vertex AI calls through google-genai.
+Without a project, it verifies that each major app use-site reaches the canned
 fallback cleanly.
 """
 
@@ -108,7 +108,7 @@ def run_case(
     )
     canned = isinstance(result, dict) and result.get("note") == CANNED_NOTE
     ok = bool(result) and not canned
-    if not os.getenv("GEMINI_API_KEY"):
+    if not os.getenv("GOOGLE_CLOUD_PROJECT"):
         ok = canned or isinstance(result, str)
     return {"case": name, "ok": ok, "canned": canned, "result": result}
 
@@ -207,7 +207,7 @@ def main() -> int:
     ]
     report = {
         "gemini_model": config.GEMINI_MODEL,
-        "gemini_key_present": bool(os.getenv("GEMINI_API_KEY")),
+        "gcp_project_present": bool(os.getenv("GOOGLE_CLOUD_PROJECT")),
         "request_count": llm.request_count,
         "cases": cases,
     }

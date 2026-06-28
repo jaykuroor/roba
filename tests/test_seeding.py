@@ -23,7 +23,7 @@ from core.seeding import Seeder, Validator
 
 @pytest.fixture
 def llm(monkeypatch):
-    for var in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+    for var in ("GOOGLE_CLOUD_PROJECT",):
         monkeypatch.delenv(var, raising=False)
     provider = LLMProvider()
     provider._sleep = lambda *_a, **_k: None

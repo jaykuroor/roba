@@ -7,8 +7,17 @@ services:
     build: { context: ., dockerfile: Dockerfile.backend }
     ports: ["8000:8000"]
     env_file: [.env]
-    environment: { DB_PATH: /app/dbdata/demo.db, DEMO_MODE: "${DEMO_MODE:-combined}" }
-    volumes: ["dbdata:/app/dbdata"]            # SQLite persists here
+    environment:
+      DB_PATH: /app/dbdata/demo.db
+      DEMO_MODE: "${DEMO_MODE:-combined}"
+      # Point the SDK at the mounted service-account key.  Falls back to ADC
+      # (e.g. Workload Identity) when the file is absent in GCP-hosted deployments.
+      GOOGLE_APPLICATION_CREDENTIALS: /app/roba.json
+    volumes:
+      - "dbdata:/app/dbdata"
+      # Mount the service-account JSON read-only.  Create roba.json in the repo
+      # root before running `docker compose up` (gitignored — never committed).
+      - "./roba.json:/app/roba.json:ro"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2).read()"]
       interval: 5s

@@ -1,12 +1,14 @@
-"""Structured LLM provider layer (§13).
+"""Structured LLM provider layer (§13) — Vertex AI backend.
 
 ``LLMProvider.complete`` walks the configured provider chain
-(``gemini -> groq -> openrouter -> canned`` by default). Gemini uses the official
-``google-genai`` SDK; Groq/OpenRouter use OpenAI-compatible chat completions.
+(``gemini -> canned`` by default). Gemini runs on **Vertex AI** via the
+``google-genai`` SDK (``genai.Client(vertexai=True, ...)``) authenticated
+by a service-account JSON (``roba.json``) or Application Default Credentials.
+Auth and project resolution are handled by ``core.vertex``.
 
 Hosted provider attempts use exponential backoff up to ``config.LLM_RETRIES``
 retries (base ``config.LLM_BACKOFF_BASE_S``). A 429 / 5xx / timeout is retried;
-if keys are missing or all attempts fail, the call-site receives its canned
+if the project is missing or all attempts fail, the call-site receives its canned
 fallback instead of an exception.
 
 When ``json_schema`` is given the raw text is parsed and validated with a
@@ -17,7 +19,7 @@ canned response). Otherwise the raw string is returned.
 Results are memoised in an in-process dict keyed by
 ``sha256(json.dumps(messages, sort_keys=True) + str(json_schema))``; calls with
 ``use_site="generation"`` always run fresh (never cached). Every call-site has a
-canned fallback so the demo never crashes when no API keys are configured.
+canned fallback so the demo never crashes when Vertex AI is not configured.
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
@@ -115,7 +116,7 @@ class LLMProvider:
         self.fallback = [
             provider
             for provider in requested_fallback
-            if provider in {"gemini", "groq", "openrouter", "canned"}
+            if provider in {"gemini", "canned"}
         ]
         if "canned" not in self.fallback:
             self.fallback.append("canned")
@@ -370,20 +371,22 @@ class LLMProvider:
         timeout_s: Optional[float] = None,
         fallback: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Run a schema-bound LLM call and return data plus provider metadata."""
+        """Run a schema-bound LLM call and return data plus provider metadata.
+
+        ``fallback`` and ``timeout_s`` are applied per-call without mutating the
+        shared instance, so concurrent requests on the app-wide singleton are safe.
+        """
         started = time.perf_counter()
-        prior_fallback = list(self.fallback)
-        prior_timeout = self.timeout_s
+
+        # Resolve per-call overrides without touching shared state.
+        effective_fallback: List[str] = self.fallback
         if fallback is not None:
-            self.fallback = [
-                provider
-                for provider in fallback
-                if provider in {"gemini", "groq", "openrouter", "canned"}
+            effective_fallback = [
+                p for p in fallback if p in {"gemini", "canned"}
             ] or ["canned"]
-            if "canned" not in self.fallback:
-                self.fallback.append("canned")
-        if timeout_s is not None:
-            self.timeout_s = float(timeout_s)
+            if "canned" not in effective_fallback:
+                effective_fallback.append("canned")
+        effective_timeout = float(timeout_s) if timeout_s is not None else self.timeout_s
 
         messages = [
             {
@@ -393,12 +396,20 @@ class LLMProvider:
             {"role": "user", "content": json.dumps(context, sort_keys=True, default=str)},
         ]
         error = None
+        data: Union[str, dict]
         try:
-            raw = self.complete(
-                messages,
-                json_schema=response_model.model_json_schema(),
-                use_site=use_site,
-            )
+            # Temporarily override for this call only — done inline to avoid race.
+            orig_fallback, orig_timeout = self.fallback, self.timeout_s
+            self.fallback, self.timeout_s = effective_fallback, effective_timeout
+            try:
+                raw = self.complete(
+                    messages,
+                    json_schema=response_model.model_json_schema(),
+                    use_site=use_site,
+                )
+            finally:
+                self.fallback, self.timeout_s = orig_fallback, orig_timeout
+
             if isinstance(raw, dict) and raw.get("note") != CANNED_NOTE:
                 data = response_model.model_validate(raw).model_dump(mode="json")
             elif isinstance(raw, dict):
@@ -415,9 +426,6 @@ class LLMProvider:
                 "status": "failed",
                 "error": error,
             }
-        finally:
-            self.fallback = prior_fallback
-            self.timeout_s = prior_timeout
 
         latency_ms = (time.perf_counter() - started) * 1000.0
         meta = dict(self._last_call_meta)
@@ -480,10 +488,6 @@ class LLMProvider:
     ) -> str:
         if provider == "gemini":
             return self._gemini(messages, json_schema, max_tokens, want_json, temperature, top_p)
-        if provider in {"groq", "openrouter"}:
-            return self._openai_compatible(
-                provider, messages, json_schema, max_tokens, want_json, temperature, top_p
-            )
         raise _SkipProvider()
 
     # -- concrete providers -------------------------------------------------
@@ -497,7 +501,7 @@ class LLMProvider:
         temperature: Optional[float],
         top_p: Optional[float],
     ) -> str:
-        """Gemini via the official Google GenAI SDK."""
+        """Gemini on Vertex AI via the google-genai SDK (vertexai=True)."""
         system_parts: List[str] = []
         content_specs: List[Dict[str, str]] = []
         for msg in messages:
@@ -533,10 +537,13 @@ class LLMProvider:
     def _get_gemini_client(self) -> Any:
         if self._gemini_client is None:
             try:
-                from google import genai
+                from . import vertex
+                self._gemini_client = vertex.build_genai_client()
             except ImportError as exc:
                 raise _SkipProvider() from exc
-            self._gemini_client = genai.Client(api_key=self._key("gemini"))
+            except RuntimeError as exc:
+                logger.debug("Vertex AI unavailable: %s", exc)
+                raise _SkipProvider() from exc
         return self._gemini_client
 
     @staticmethod
@@ -598,61 +605,6 @@ class LLMProvider:
             config=gen_config,
         )
 
-    def _openai_compatible(
-        self,
-        provider: str,
-        messages: List[dict],
-        json_schema: Optional[dict],
-        max_tokens: int,
-        want_json: bool,
-        temperature: Optional[float],
-        top_p: Optional[float],
-    ) -> str:
-        try:
-            import httpx
-        except ImportError as exc:
-            raise _SkipProvider() from exc
-        model = os.getenv(
-            "GROQ_MODEL" if provider == "groq" else "OPENROUTER_MODEL",
-            "llama-3.1-8b-instant" if provider == "groq" else "openai/gpt-4o-mini",
-        )
-        url = (
-            "https://api.groq.com/openai/v1/chat/completions"
-            if provider == "groq"
-            else "https://openrouter.ai/api/v1/chat/completions"
-        )
-        headers = {"Authorization": f"Bearer {self._key(provider)}"}
-        if provider == "openrouter":
-            headers["HTTP-Referer"] = "http://localhost"
-            headers["X-Title"] = "ROBA"
-        body: Dict[str, Any] = {
-            "model": model,
-            "messages": self._augment_for_json(messages) if want_json else messages,
-            "max_tokens": max_tokens,
-        }
-        if temperature is not None:
-            body["temperature"] = temperature
-        if top_p is not None:
-            body["top_p"] = top_p
-        if want_json:
-            body["response_format"] = {"type": "json_object"}
-        self.request_count += 1
-        try:
-            response = httpx.post(url, headers=headers, json=body, timeout=self.timeout_s)
-        except httpx.TimeoutException as exc:
-            raise _RetryableError("timeout") from exc
-        except httpx.HTTPError as exc:
-            raise _SkipProvider() from exc
-        if response.status_code == 429 or response.status_code >= 500:
-            raise _RetryableError(f"status {response.status_code}")
-        if response.status_code >= 400:
-            raise _SkipProvider()
-        data = response.json()
-        try:
-            return str(data["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError) as exc:
-            raise _SkipProvider() from exc
-
     @staticmethod
     def _gemini_response_text(response: Any) -> str:
         text = getattr(response, "text", None)
@@ -709,21 +661,20 @@ class LLMProvider:
             }
         ]
 
-    # -- keys ---------------------------------------------------------------
+    # -- provider availability -----------------------------------------------
 
     @staticmethod
-    def _env_var(provider: str) -> str:
-        return {
-            "gemini": "GEMINI_API_KEY",
-            "groq": "GROQ_API_KEY",
-            "openrouter": "OPENROUTER_API_KEY",
-        }.get(provider, "")
+    def _has_key(provider: str) -> bool:
+        """Return True when the named provider can be attempted.
 
-    def _key(self, provider: str) -> str:
-        return os.getenv(self._env_var(provider), "") or ""
-
-    def _has_key(self, provider: str) -> bool:
-        return bool(self._key(provider).strip())
+        For the Vertex AI backend ``provider="gemini"`` maps to
+        ``vertex.vertex_available()`` — which checks that a GCP project is
+        resolvable (via env var or service-account JSON) rather than an API key.
+        """
+        if provider == "gemini":
+            from . import vertex
+            return vertex.vertex_available()
+        return False
 
     def _log_call(
         self,

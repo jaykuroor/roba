@@ -1,4 +1,4 @@
-"""Tests for the Gemini-only LLM provider layer."""
+"""Tests for the Vertex AI LLM provider layer."""
 
 import pytest
 from pydantic import BaseModel
@@ -30,7 +30,7 @@ class StructuredIntent(BaseModel):
 
 
 def _gemini_llm(monkeypatch, responses):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     calls = {"n": 0, "configs": [], "models": [], "contents": []}
     queue = list(responses)
 
@@ -49,8 +49,8 @@ def _gemini_llm(monkeypatch, responses):
     return llm, calls
 
 
-def test_canned_fallback_without_gemini_key(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+def test_canned_fallback_without_gcp_project(monkeypatch):
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
 
     llm = LLMProvider()
     llm._sleep = lambda *_a, **_k: None
@@ -205,24 +205,21 @@ def test_json_mode_validation_failure_falls_back(monkeypatch):
     assert calls["n"] == 2
 
 
-def test_hosted_provider_chain_falls_back_to_canned(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setenv("GROQ_API_KEY", "test-groq")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter")
-    attempted = []
+def test_no_gcp_project_falls_back_to_canned(monkeypatch):
+    """Vertex-only chain: missing project skips gemini and returns canned."""
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    # Also ensure roba.json doesn't accidentally provide a project in tests.
+    monkeypatch.setattr(
+        "core.vertex.service_account_path", lambda: None
+    )
 
-    def fake_openai_compatible(self, provider, *_args, **_kwargs):
-        attempted.append(provider)
-        raise RuntimeError("offline")
-
-    monkeypatch.setattr(LLMProvider, "_openai_compatible", fake_openai_compatible)
-
-    llm = LLMProvider(fallback=["groq", "openrouter"])
+    llm = LLMProvider(fallback=["gemini", "canned"])
+    llm._sleep = lambda *_a, **_k: None
     result = llm.complete([{"role": "user", "content": "x"}], use_site="review")
 
-    assert llm.fallback == ["groq", "openrouter", "canned"]
-    assert attempted == ["groq", "openrouter"]
+    assert llm.fallback == ["gemini", "canned"]
     assert result.get("note") == CANNED_NOTE
+    assert llm.request_count == 0
 
 
 def test_complete_structured_logs_success_and_cache(monkeypatch, session_factory):
@@ -265,7 +262,7 @@ def test_complete_structured_logs_success_and_cache(monkeypatch, session_factory
 
 
 def test_complete_structured_canned_fallback_logs(monkeypatch, session_factory):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     llm = LLMProvider(fallback=["gemini", "canned"], db_session_factory=session_factory)
 
     result = llm.complete_structured(

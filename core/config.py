@@ -10,7 +10,14 @@ import os
 from dotenv import dotenv_values
 
 for _key, _value in dotenv_values(".env").items():
-    if _key in {"GEMINI_API_KEY", "GEMINI_MODEL", "LLM_FORECAST_AUTO_MODE"} and _key not in os.environ and _value:
+    if _key in {
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GEMINI_MODEL",
+        "GEMINI_LIVE_MODEL",
+        "LLM_FORECAST_AUTO_MODE",
+    } and _key not in os.environ and _value:
         os.environ[_key] = _value
 
 # clock
@@ -80,15 +87,36 @@ COMPETITOR_CALL_TARGETS = 2
 COMPETITOR_AGGREGATOR_POLL_SIM_S = 1800
 COMPETITOR_MENU_REFRESH_SIM_S = 7200
 
-# llm
+# llm — Vertex AI only; Groq/OpenRouter removed
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-LLM_FALLBACK = ["gemini", "groq", "openrouter", "canned"]
+LLM_FALLBACK = ["gemini", "canned"]
 LLM_RETRIES = 3
 LLM_BACKOFF_BASE_S = 1.5
 LLM_INTER_CALL_SLEEP_S = 2
 VOICE_EMIT_LEGACY_USER_FACT = os.getenv(
     "VOICE_EMIT_LEGACY_USER_FACT", "true"
 ).strip().lower() not in {"0", "false", "no", "off"}
+
+# Voice planner (Stream B)
+VOICE_DEFAULT_MODE = os.getenv("VOICE_DEFAULT_MODE", "confirm")  # "confirm" | "auto"
+
+# Kitchen batch lifecycle (Stream B3)
+BATCH_APPROVAL_GATED = os.getenv("BATCH_APPROVAL_GATED", "0").lower() in {
+    "1", "true", "yes", "on"
+}
+
+# Inventory optimizer LLM (Stream E)
+OPTIMIZER_LLM_AUTO_MODE = os.getenv("OPTIMIZER_LLM_AUTO_MODE", "0").lower() in {
+    "1", "true", "yes", "on"
+}
+PROMO_SLOW_MOVER_PCT = int(os.getenv("PROMO_SLOW_MOVER_PCT", "15"))
+
+# Vertex AI Live API (Stream B5)
+GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio")
+
+# Vertex AI auth / project
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "roba.json")
 
 # weather
 WEATHER_FETCH_SIM_S = 10800                # every 3 sim-h
