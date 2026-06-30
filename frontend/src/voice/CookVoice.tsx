@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Loader2, ChefHat, Trash2, Send, RefreshCw, ChevronUp, ChevronDown } from "lucide-react";
+import { Loader2, ChefHat, Trash2, Send, RefreshCw, ChevronUp, ChevronDown, Check, X } from "lucide-react";
 import { useVoiceLive } from "./useVoiceLive";
 import { MicButton } from "./MicButton";
 import { PlanConfirmCard } from "./PlanConfirmCard";
@@ -451,6 +451,21 @@ export function CookVoice() {
           onCancel={live.cancelPlan}
           onClarify={handleClarify}
         />
+      )}
+
+      {/* Auto-mode done card — brief confirmation of what was just applied */}
+      {live.lastApplied && (
+        <div className="flex items-center gap-3 rounded-xl border border-green-500/30 bg-green-500/5 px-4 py-3 text-sm text-text">
+          <Check size={16} className="shrink-0 text-green-500" />
+          <span className="flex-1">{live.lastApplied.summary}</span>
+          <button
+            onClick={live.clearLastApplied}
+            className="shrink-0 text-text/30 hover:text-text/60"
+            aria-label="Dismiss"
+          >
+            <X size={14} />
+          </button>
+        </div>
       )}
 
       {/* Transcript */}

@@ -14,7 +14,7 @@ export type LiveClientEvent =
   | { type: "transcript"; role: "user" | "roba"; text: string; turn_id: string; final: boolean }
   | { type: "plan_preview"; plan: PlanResult }
   | { type: "tool_result"; tool: string; result: unknown }
-  | { type: "applied"; plan_id: string; signal_ids: string[] }
+  | { type: "applied"; plan_id: string; signal_ids: string[]; summary?: string; tool?: string }
   | { type: "speaking" }       // first audio byte of a turn started playing
   | { type: "turn_complete" }  // server signalled the turn is done generating
   | { type: "playback_done" }  // turn done AND all audio finished playing
@@ -338,6 +338,21 @@ export class RobaLiveClient {
         turn_id: String(msg.turn_id ?? `fallback-${Date.now()}`),
         final: Boolean(msg.final),
       });
+    } else if (t === "plan_preview") {
+      // Backend staged a write action in confirm mode — show the card.
+      const plan = msg.plan as PlanResult | undefined;
+      if (plan) {
+        this.emit({ type: "plan_preview", plan });
+      }
+    } else if (t === "applied") {
+      // Backend applied an action (auto mode or after spoken confirm).
+      this.emit({
+        type: "applied",
+        plan_id: String(msg.plan_id ?? ""),
+        signal_ids: (msg.signal_ids as string[]) ?? [],
+        summary: String(msg.summary ?? ""),
+        tool: String(msg.tool ?? ""),
+      });
     } else if (t === "tool_result") {
       const tool = String(msg.tool ?? "");
       const result = msg.result as Record<string, unknown> | undefined;
@@ -351,6 +366,8 @@ export class RobaLiveClient {
           type: "applied",
           plan_id: String(result.plan_id ?? ""),
           signal_ids: (result.signal_ids as string[]) ?? [],
+          summary: String(result.human_readable ?? result.summary ?? "Done."),
+          tool: "confirm_plan",
         });
       }
     } else if (t === "turn_complete") {

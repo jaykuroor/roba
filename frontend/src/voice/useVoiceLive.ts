@@ -61,6 +61,9 @@ export interface VoiceLiveHook {
   // Tool results
   lastStatus: Record<string, unknown> | null;
   clearStatus: () => void;
+  // Last applied action (auto-mode done card)
+  lastApplied: { summary: string; tool: string } | null;
+  clearLastApplied: () => void;
   // Confirm/auto mode (whether Roba asks for approval before acting)
   mode: string;
   setMode: (m: string) => void;
@@ -156,6 +159,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
   const [clarification, setClarification] = useState<Clarification | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastStatus, setLastStatus] = useState<Record<string, unknown> | null>(null);
+  const [lastApplied, setLastApplied] = useState<{ summary: string; tool: string } | null>(null);
 
   const clientRef = useRef<RobaLiveClient | null>(null);
   const connectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -248,6 +252,11 @@ export function useVoiceLive(role: string): VoiceLiveHook {
           clearThinkingTimer();
           setPendingPlan(null);
           setClarification(null);
+          if (ev.summary) {
+            setLastApplied({ summary: ev.summary, tool: ev.tool ?? "" });
+            // Auto-dismiss after 4 seconds
+            setTimeout(() => setLastApplied(null), 4000);
+          }
           setState("ready");
           break;
         case "tool_result":
@@ -306,7 +315,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     // enables it), so switching mic mode requires a new session. MicModeToggle
     // is disabled while state === "listening", so this never reconnects mid-turn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [role, micMode, voiceModel]);
+  }, [role, micMode, voiceModel, mode]);
 
   const startListening = useCallback(async () => {
     if (!clientRef.current) return;
@@ -364,6 +373,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
 
   const clearTranscript = useCallback(() => setTranscript([]), []);
   const clearStatus = useCallback(() => setLastStatus(null), []);
+  const clearLastApplied = useCallback(() => setLastApplied(null), []);
 
   return {
     state,
@@ -379,6 +389,8 @@ export function useVoiceLive(role: string): VoiceLiveHook {
     clearTranscript,
     lastStatus,
     clearStatus,
+    lastApplied,
+    clearLastApplied,
     mode,
     setMode,
     micMode,
