@@ -147,22 +147,68 @@ class StaffAgent(BaseAgent):
                     .first()
                 )
                 resolved_staff_id = link.staff_id if link is not None else None
-            row = Attendance(
-                staff_id=resolved_staff_id,
-                date_sim_day=day,
-                status=status,
-                daypart=daypart,
-                reason=reason,
-                sim_time=now,
+
+            # UPSERT: update the existing row for (staff_id, day, daypart) rather
+            # than appending a new one each call, so the table does not grow forever.
+            existing = (
+                session.query(Attendance)
+                .filter(
+                    Attendance.staff_id == resolved_staff_id,
+                    Attendance.date_sim_day == day,
+                    Attendance.daypart == daypart,
+                )
+                .first()
             )
-            session.add(row)
-            session.flush()
-            attendance_id = row.id
+            if existing is not None:
+                existing.status = status
+                existing.reason = reason
+                existing.sim_time = now
+                session.flush()
+                attendance_id = existing.id
+            else:
+                row = Attendance(
+                    staff_id=resolved_staff_id,
+                    date_sim_day=day,
+                    status=status,
+                    daypart=daypart,
+                    reason=reason,
+                    sim_time=now,
+                )
+                session.add(row)
+                session.flush()
+                attendance_id = row.id
             session.commit()
             result = {"attendance_id": attendance_id, "staff_id": resolved_staff_id, "status": status}
         finally:
             session.close()
+
+        # Cascade step 1: emit STAFF_COVERAGE signals via the existing recompute path.
         self.recompute()
+
+        # Cascade step 2: run the deterministic resolver so station_unstaffed
+        # blocks are written/cleared on MenuItem immediately.
+        try:
+            session2 = self.db_session_factory()
+            try:
+                links = session2.query(StaffStation).filter(StaffStation.staff_id == resolved_staff_id).all()
+                station_ids = [lnk.station_id for lnk in links]
+            finally:
+                session2.close()
+            if station_ids:
+                from core.availability import recompute_availability
+                recompute_availability(
+                    self.db_session_factory,
+                    self.bus,
+                    self.ws_broadcast,
+                    changed_station_ids=station_ids,
+                    agent_name="staff_attendance",
+                )
+        except Exception as _exc:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "availability cascade on attendance change failed: %s", _exc
+            )
+
         return result
 
     def _apply_staff_availability(self, payload: Dict[str, Any]) -> None:

@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
@@ -1218,6 +1218,14 @@ class TrackAStaffBody(BaseModel):
     daypart: Optional[str] = None
     status: str = "sick"
     reason: str = "called in sick"
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: str) -> str:
+        allowed = {"present", "leave", "sick"}
+        if v not in allowed:
+            raise ValueError(f"status must be one of {allowed}")
+        return v
 
 
 class TrackAForecastAutoBody(BaseModel):
