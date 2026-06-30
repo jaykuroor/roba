@@ -83,14 +83,56 @@ function StationRow({ station, onSave }: { station: Station; onSave: (name: stri
   );
 }
 
+interface AttendanceRow {
+  id: number;
+  staff_id: number | null;
+  date_sim_day: number;
+  status: string;
+  daypart: string | null;
+  sim_time: number;
+}
+
+interface StaffStationLink {
+  id: number;
+  staff_id: number;
+  station_id: number;
+}
+
+function currentStaffStatus(
+  staffId: number,
+  attendance: AttendanceRow[],
+): "present" | "leave" | "sick" {
+  const rows = attendance
+    .filter((r) => r.staff_id === staffId)
+    .sort((a, b) => b.sim_time - a.sim_time);
+  return (rows[0]?.status as "present" | "leave" | "sick") ?? "present";
+}
+
 function StaffPanel() {
   const [staff, setStaff] = useState<StaffRow[]>([]);
   const [edits, setEdits] = useState<Record<number, Partial<StaffRow>>>({});
   const [busyId, setBusyId] = useState<number | null>(null);
-  const [sickBusy, setSickBusy] = useState<number | null>(null);
+  const [statusBusy, setStatusBusy] = useState<number | null>(null);
+  const [attendance, setAttendance] = useState<AttendanceRow[]>([]);
+  const [staffStations, setStaffStations] = useState<StaffStationLink[]>([]);
+  const [stations, setStations] = useState<Station[]>([]);
+
+  async function refreshTrackA() {
+    try {
+      const snap = await apiGet<{
+        attendance: AttendanceRow[];
+        staff_stations: StaffStationLink[];
+        stations: Station[];
+      }>("/api/track-a/snapshot");
+      setAttendance(snap.attendance ?? []);
+      setStaffStations(snap.staff_stations ?? []);
+      setStations(snap.stations ?? []);
+    } catch { /* ignore */ }
+  }
 
   useEffect(() => {
     apiGet<StaffRow[]>("/api/staff").then(setStaff).catch(() => undefined);
+    void refreshTrackA();
   }, []);
 
   function patchRow(id: number, patch: Partial<StaffRow>) {
@@ -108,20 +150,31 @@ function StaffPanel() {
     } catch { /* ignore */ } finally { setBusyId(null); }
   }
 
-  async function callInSick(s: StaffRow) {
-    setSickBusy(s.id);
+  async function setStatus(staffId: number, status: "present" | "leave" | "sick") {
+    setStatusBusy(staffId);
     try {
-      await apiPost("/api/track-a/staff/call-in-sick", { staff_id: s.id });
-    } catch { /* ignore */ } finally { setSickBusy(null); }
+      await apiPost("/api/track-a/staff/call-in-sick", { staff_id: staffId, status });
+      await refreshTrackA();
+    } catch { /* ignore */ } finally { setStatusBusy(null); }
   }
 
   async function recompute() {
     await apiPost("/api/track-a/staff/recompute").catch(() => undefined);
+    await refreshTrackA();
   }
 
   function val(s: StaffRow, key: keyof StaffRow) {
     return String((edits[s.id]?.[key] ?? s[key]) ?? "");
   }
+
+  // Derive station coverage from staff_stations + current attendance.
+  const stationCoverage = stations.map((station) => {
+    const links = staffStations.filter((l) => l.station_id === station.id);
+    const covered =
+      links.length === 0 ||
+      links.some((l) => currentStaffStatus(l.staff_id, attendance) === "present");
+    return { station, covered };
+  });
 
   return (
     <div>
@@ -136,7 +189,7 @@ function StaffPanel() {
         <table className="w-full text-left text-xs">
           <thead>
             <tr className="border-b border-muted bg-surface/60">
-              {["Name", "Role", "Skill", "Cost/hr", "Active", "Actions"].map((h) => (
+              {["Name", "Role", "Skill", "Cost/hr", "Active", "Status", "Actions"].map((h) => (
                 <th key={h} className="px-2 py-1.5 font-medium text-text/50">{h}</th>
               ))}
             </tr>
@@ -145,6 +198,8 @@ function StaffPanel() {
             {staff.map((s) => {
               const hasPatch = Object.keys(edits[s.id] ?? {}).length > 0;
               const merged = { ...s, ...(edits[s.id] ?? {}) };
+              const status = currentStaffStatus(s.id, attendance);
+              const isBusy = statusBusy === s.id;
               return (
                 <tr key={s.id} className="border-b border-muted/40 last:border-0 hover:bg-surface/20">
                   <td className="px-2 py-1">
@@ -170,6 +225,17 @@ function StaffPanel() {
                       onChange={(e) => patchRow(s.id, { active: e.target.checked ? 1 : 0 })}
                       className="accent-accent" />
                   </td>
+                  <td className="px-2 py-1">
+                    <span className={`inline-block rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                      status === "present"
+                        ? "bg-success/20 text-success"
+                        : status === "leave"
+                          ? "bg-warning/20 text-warning"
+                          : "bg-danger/20 text-danger"
+                    }`}>
+                      {status === "present" ? "Present" : status === "leave" ? "On Leave" : "Sick"}
+                    </span>
+                  </td>
                   <td className="flex items-center gap-1 px-2 py-1">
                     {hasPatch && (
                       <button type="button" onClick={() => void saveRow(s)} disabled={busyId === s.id}
@@ -177,21 +243,58 @@ function StaffPanel() {
                         {busyId === s.id ? "…" : "Save"}
                       </button>
                     )}
-                    <button type="button" onClick={() => void callInSick(s)} disabled={sickBusy === s.id}
-                      title="Call in sick"
-                      className="flex items-center gap-0.5 rounded bg-warning/20 px-1.5 py-0.5 text-[10px] text-warning hover:bg-warning/30 disabled:opacity-50">
-                      <UserX size={10} /> Sick
-                    </button>
+                    {status === "present" ? (
+                      <>
+                        <button type="button" onClick={() => void setStatus(s.id, "leave")} disabled={isBusy}
+                          title="Mark on leave"
+                          className="rounded bg-warning/20 px-1.5 py-0.5 text-[10px] text-warning hover:bg-warning/30 disabled:opacity-50">
+                          {isBusy ? "…" : "Leave"}
+                        </button>
+                        <button type="button" onClick={() => void setStatus(s.id, "sick")} disabled={isBusy}
+                          title="Call in sick"
+                          className="flex items-center gap-0.5 rounded bg-danger/20 px-1.5 py-0.5 text-[10px] text-danger hover:bg-danger/30 disabled:opacity-50">
+                          <UserX size={10} /> Sick
+                        </button>
+                      </>
+                    ) : (
+                      <button type="button" onClick={() => void setStatus(s.id, "present")} disabled={isBusy}
+                        title="Mark present"
+                        className="flex items-center gap-0.5 rounded bg-success/20 px-1.5 py-0.5 text-[10px] text-success hover:bg-success/30 disabled:opacity-50">
+                        {isBusy ? "…" : "Restore"}
+                      </button>
+                    )}
                   </td>
                 </tr>
               );
             })}
             {staff.length === 0 && (
-              <tr><td colSpan={6} className="py-4 text-center text-text/30">No staff. Load a seed.</td></tr>
+              <tr><td colSpan={7} className="py-4 text-center text-text/30">No staff. Load a seed.</td></tr>
             )}
           </tbody>
         </table>
       </div>
+
+      {stationCoverage.length > 0 && (
+        <div className="mt-4">
+          <SectionHeading>Station Coverage</SectionHeading>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {stationCoverage.map(({ station, covered }) => (
+              <div
+                key={station.id}
+                className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${
+                  covered
+                    ? "border-success/30 bg-success/10 text-success"
+                    : "border-danger/40 bg-danger/10 text-danger"
+                }`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${covered ? "bg-success" : "bg-danger"}`} />
+                {station.name}
+                {!covered && <span className="ml-1 font-semibold">UNSTAFFED — dishes disabled</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

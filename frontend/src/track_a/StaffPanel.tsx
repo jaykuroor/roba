@@ -1,8 +1,19 @@
-import { RefreshCw, UserMinus, UserCheck } from "lucide-react";
+import { RefreshCw, UserCheck, UserMinus, UserX } from "lucide-react";
 import { apiPost } from "../api";
 import { latestCoverageSignals, menuByStation } from "./helpers";
 import { EmptyState, Pill, TrackAShell } from "./ui";
 import { useTrackAData } from "./useTrackAData";
+import type { Attendance } from "./types";
+
+function currentStaffStatus(
+  staffId: number,
+  attendance: Attendance[],
+): "present" | "leave" | "sick" {
+  const rows = attendance
+    .filter((r) => r.staff_id === staffId)
+    .sort((a, b) => b.sim_time - a.sim_time);
+  return (rows[0]?.status as "present" | "leave" | "sick") ?? "present";
+}
 
 export function StaffPanel() {
   const { data, loading, error, refresh } = useTrackAData();
@@ -12,11 +23,16 @@ export function StaffPanel() {
     await refresh();
   }
 
-  async function setStation(stationId: number, status: "sick" | "present") {
+  async function setStaffStatus(staffId: number, status: "present" | "leave" | "sick") {
     await apiPost("/api/track-a/staff/call-in-sick", {
-      station_id: stationId,
+      staff_id: staffId,
       status,
-      reason: status === "sick" ? "demo call in sick" : "demo restored coverage",
+      reason:
+        status === "sick"
+          ? "demo call in sick"
+          : status === "leave"
+            ? "demo on leave"
+            : "demo restored coverage",
     });
     await refresh();
   }
@@ -31,7 +47,7 @@ export function StaffPanel() {
       eyebrow="Station capacity"
       title="Staff coverage"
       action={
-        <button type="button" onClick={recompute} className="inline-flex items-center gap-2 rounded-md border border-muted px-3 py-2 text-sm text-text/80 hover:bg-muted/50">
+        <button type="button" onClick={() => void recompute()} className="inline-flex items-center gap-2 rounded-md border border-muted px-3 py-2 text-sm text-text/80 hover:bg-muted/50">
           <RefreshCw size={16} />
           Recompute
         </button>
@@ -56,23 +72,61 @@ export function StaffPanel() {
                 </div>
                 <Pill tone={covered ? "good" : "bad"}>{covered ? "Covered" : "Uncovered"}</Pill>
               </div>
+              {!covered && (
+                <p className="mt-2 text-xs font-semibold text-danger">UNSTAFFED — dishes disabled</p>
+              )}
               <div className="mt-4 space-y-2">
-                {roster.map((member) => (
-                  <div key={member!.id} className="flex items-center justify-between rounded bg-surface/70 px-3 py-2 text-sm">
-                    <span>{member!.name}</span>
-                    <span className="text-text/50">{member!.role}</span>
-                  </div>
-                ))}
-              </div>
-              <div className="mt-4 grid grid-cols-2 gap-2">
-                <button type="button" onClick={() => setStation(station.id, "sick")} className="inline-flex items-center justify-center gap-2 rounded-md border border-danger/50 px-3 py-2 text-sm text-danger hover:bg-danger/10">
-                  <UserMinus size={16} />
-                  Sick
-                </button>
-                <button type="button" onClick={() => setStation(station.id, "present")} className="inline-flex items-center justify-center gap-2 rounded-md border border-success/50 px-3 py-2 text-sm text-success hover:bg-success/10">
-                  <UserCheck size={16} />
-                  Restore
-                </button>
+                {roster.map((member) => {
+                  const staffStatus = currentStaffStatus(member!.id, data.attendance);
+                  return (
+                    <div key={member!.id} className="flex items-center justify-between rounded bg-surface/70 px-3 py-2 text-sm">
+                      <div className="flex items-center gap-2">
+                        <span>{member!.name}</span>
+                        <span className="text-text/50">{member!.role}</span>
+                        <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                          staffStatus === "present"
+                            ? "bg-success/20 text-success"
+                            : staffStatus === "leave"
+                              ? "bg-warning/20 text-warning"
+                              : "bg-danger/20 text-danger"
+                        }`}>
+                          {staffStatus === "present" ? "Present" : staffStatus === "leave" ? "On Leave" : "Sick"}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {staffStatus === "present" ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => void setStaffStatus(member!.id, "leave")}
+                              className="inline-flex items-center gap-1 rounded border border-warning/50 px-2 py-0.5 text-xs text-warning hover:bg-warning/10"
+                            >
+                              <UserMinus size={10} /> Leave
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void setStaffStatus(member!.id, "sick")}
+                              className="inline-flex items-center gap-1 rounded border border-danger/50 px-2 py-0.5 text-xs text-danger hover:bg-danger/10"
+                            >
+                              <UserX size={10} /> Sick
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => void setStaffStatus(member!.id, "present")}
+                            className="inline-flex items-center gap-1 rounded border border-success/50 px-2 py-0.5 text-xs text-success hover:bg-success/10"
+                          >
+                            <UserCheck size={10} /> Restore
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+                {roster.length === 0 && (
+                  <p className="text-xs text-text/40">No staff assigned</p>
+                )}
               </div>
             </article>
           );
@@ -85,11 +139,17 @@ export function StaffPanel() {
           {data.attendance.length === 0 ? (
             <span className="text-sm text-text/50">No exceptions recorded.</span>
           ) : (
-            data.attendance.slice(0, 12).map((row) => (
-              <Pill key={row.id} tone={row.status === "present" ? "good" : "warn"}>
-                {row.staff_id ? `Staff ${row.staff_id}` : "Unknown"} · {row.status} · {row.daypart ?? "day"}
-              </Pill>
-            ))
+            data.attendance.slice(0, 12).map((row) => {
+              const member = data.staff.find((m) => m.id === row.staff_id);
+              return (
+                <Pill
+                  key={row.id}
+                  tone={row.status === "present" ? "good" : row.status === "sick" ? "bad" : "warn"}
+                >
+                  {member?.name ?? `Staff ${row.staff_id}`} · {row.status} · {row.daypart ?? "day"}
+                </Pill>
+              );
+            })
           )}
         </div>
       </div>
