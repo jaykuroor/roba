@@ -169,7 +169,7 @@ class InventoryOptimizer(BaseAgent):
 
         for menu_item_id, ingredient_id in list(self._toggle_cause.items()):
             if self._on_hand_above_reorder(ingredient_id):
-                self._reenable(menu_item_id)
+                self._reenable(menu_item_id, ingredient_id)
 
     def _on_hand_above_reorder(self, ingredient_id: int) -> bool:
         session = self.db_session_factory()
@@ -294,47 +294,19 @@ class InventoryOptimizer(BaseAgent):
     # -- menu toggle (§18.8) -------------------------------------------------
 
     def _maybe_toggle(self, ingredient_id: int, projected_runout: float) -> None:
-        session = self.db_session_factory()
+        # Delegate to the deterministic resolver, which disables ALL dishes using this
+        # ingredient at/below threshold, not just the lowest-value one.
         try:
-            level = (
-                session.query(InventoryLevel)
-                .filter(InventoryLevel.ingredient_id == ingredient_id)
-                .first()
+            from core.availability import recompute_availability
+            recompute_availability(
+                self.db_session_factory,
+                self.bus,
+                self.broadcast,
+                changed_ingredient_ids=[ingredient_id],
+                agent_name="optimizer",
             )
-            supplier_leads = [
-                float(s.lead_time_days or 1.0)
-                for s in session.query(Supplier)
-                .join(SupplierCatalog, SupplierCatalog.supplier_id == Supplier.id)
-                .filter(SupplierCatalog.ingredient_id == ingredient_id)
-                .all()
-            ]
-            resupply_eta_s = (min(supplier_leads) if supplier_leads else 2.0) * 86400.0
-
-            items = (
-                session.query(MenuItem)
-                .join(Recipe, Recipe.menu_item_id == MenuItem.id)
-                .join(RecipeLine, RecipeLine.recipe_id == Recipe.id)
-                .filter(RecipeLine.ingredient_id == ingredient_id, MenuItem.active == 1)
-                .all()
-            )
-            item_specs = [
-                {"id": mi.id, "dine_in_price": mi.dine_in_price or 0.0} for mi in items
-            ]
-        finally:
-            session.close()
-
-        if len(item_specs) < 2:
-            return  # nothing to conserve by disabling the only dish using it
-        if projected_runout - self.sim_time >= resupply_eta_s:
-            return  # resupply will land before it actually runs out
-
-        scored = [
-            (self._margin_x_velocity(spec["id"], spec["dine_in_price"], ingredient_id), spec["id"])
-            for spec in item_specs
-        ]
-        scored.sort(key=lambda t: t[0])
-        target_id = scored[0][1]
-        self._disable(target_id, ingredient_id)
+        except Exception as exc:
+            logger.warning("optimizer _maybe_toggle cascade failed: %s", exc)
 
     def _margin_x_velocity(self, menu_item_id: int, price: float, ingredient_id: int) -> float:
         session = self.db_session_factory()
@@ -406,46 +378,24 @@ class InventoryOptimizer(BaseAgent):
             {"menu_item_id": menu_item_id, "ingredient_id": ingredient_id},
         )
 
-    def _reenable(self, menu_item_id: int) -> None:
-        now = self.sim_time
-        session = self.db_session_factory()
-        try:
-            item = session.get(MenuItem, menu_item_id)
-            if item is None or item.active == 1:
-                self._toggle_cause.pop(menu_item_id, None)
-                return
-            item.active = 1
-            (
-                session.query(MenuToggle)
-                .filter(MenuToggle.menu_item_id == menu_item_id, MenuToggle.active == 1)
-                .update({MenuToggle.active: 0})
-            )
-            session.add(
-                MenuToggle(
-                    menu_item_id=menu_item_id,
-                    action="enable",
-                    reason="resupplied above reorder point",
-                    triggered_by=self.name,
-                    sim_time=now,
-                    active=1,
+    def _reenable(self, menu_item_id: int, ingredient_id: Optional[int] = None) -> None:
+        # Delegate to the deterministic resolver; it auto-re-enables dishes when
+        # on_hand > threshold and no other block remains.
+        if ingredient_id is None:
+            ingredient_id = self._toggle_cause.get(menu_item_id)
+        if ingredient_id is not None:
+            try:
+                from core.availability import recompute_availability
+                recompute_availability(
+                    self.db_session_factory,
+                    self.bus,
+                    self.broadcast,
+                    changed_ingredient_ids=[ingredient_id],
+                    agent_name="optimizer",
                 )
-            )
-            session.commit()
-        finally:
-            session.close()
-
+            except Exception as exc:
+                logger.warning("optimizer _reenable cascade failed: %s", exc)
         self._toggle_cause.pop(menu_item_id, None)
-        self.emit(
-            SignalType.MENU_TOGGLE,
-            {"menu_item_id": menu_item_id, "action": "enable", "reason": "resupplied above reorder point"},
-            dedup_key=f"toggle:{menu_item_id}",
-        )
-        self.broadcast("menu_toggled", {"menu_item_id": menu_item_id, "action": "enable"})
-        self.log_event(
-            "menu_toggle",
-            f"Re-enabled menu item {menu_item_id}: stock recovered above reorder point.",
-            {"menu_item_id": menu_item_id},
-        )
 
     def _manual_toggle(self, menu_item_id: int, action: str, reason: str) -> None:
         now = self.sim_time

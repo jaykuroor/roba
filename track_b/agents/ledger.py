@@ -157,6 +157,18 @@ class InventoryLedger(BaseAgent):
             if used <= 0:
                 continue
             self._deplete_fifo(spec["ingredient_id"], used, reason, ref_id, now)
+            try:
+                from core.availability import recompute_availability
+                recompute_availability(
+                    self.db_session_factory,
+                    self.bus,
+                    self.broadcast,
+                    changed_ingredient_ids=[spec["ingredient_id"]],
+                    agent_name="ledger_sale",
+                )
+            except Exception as _exc:
+                import logging
+                logging.getLogger(__name__).warning("availability cascade failed: %s", _exc)
 
     def _yield_factor(self, ingredient_id: int) -> float:
         session = self.db_session_factory()
@@ -935,6 +947,19 @@ class InventoryLedger(BaseAgent):
         finally:
             session.close()
         self.broadcast("inventory_updated", {"ingredient_id": ingredient_id, "on_hand": qty})
+        # Cascade: auto-disable dishes whose ingredients are now at/below threshold.
+        try:
+            from core.availability import recompute_availability
+            recompute_availability(
+                self.db_session_factory,
+                self.bus,
+                self.broadcast,
+                changed_ingredient_ids=[ingredient_id],
+                agent_name="ledger_count",
+            )
+        except Exception as _exc:
+            import logging
+            logging.getLogger(__name__).warning("availability cascade failed: %s", _exc)
         self.log_event(
             "reconciliation",
             f"Voice count for ingredient {ingredient_id}: on-hand now {qty:.1f} (drift recorded).",

@@ -38,6 +38,17 @@ RC_MANUAL = "manual"
 _SYSTEM_REASON_CODES = {RC_OUT_OF_STOCK, RC_STATION_UNSTAFFED}
 
 
+def _oos_threshold(level) -> float:
+    """Return the quantity at or below which we treat this ingredient as 'out of stock'."""
+    safety = float(level.safety_stock or 0.0)
+    if safety > 0:
+        return safety
+    reorder = float(level.reorder_point or 0.0)
+    if reorder > 0:
+        return reorder
+    return 0.0  # fallback: only truly zero
+
+
 def recompute_availability(
     db_session_factory: Callable[[], Any],
     bus: Any,
@@ -103,7 +114,7 @@ def recompute_availability(
                 .filter(InventoryLevel.ingredient_id == ing_id)
                 .first()
             )
-            if level is not None and float(level.on_hand_cached or 0.0) <= 0:
+            if level is not None and float(level.on_hand_cached or 0.0) <= _oos_threshold(level):
                 oos_ingredient_ids.add(ing_id)
 
         # Map ingredient_id → set of menu_item_ids that require it.
