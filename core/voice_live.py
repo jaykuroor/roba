@@ -417,51 +417,88 @@ _TOOLS: list[dict[str, Any]] = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 _FEW_SHOTS = """
-## Examples (utterance → tool call → spoken reply)
+## Examples
+
+[AUTO MODE — act immediately, no permission needed]
 
 User: "How many tomatoes do we have?"
 → get_inventory(item_name="tomato")
-→ "We have 4,200 grams of tomatoes."
+→ "4,200 grams."
 
-User: "All tomatoes in the inventory have spoiled."
+User: "All tomatoes spoiled."
 → record_spoilage(ingredient_name="tomato", all_stock=true)
-→ "Done. I've zeroed the tomato stock and recorded the spoilage. Margherita Pizza and Bruschetta have been automatically disabled since they require tomatoes."
+→ "Done — tomatoes zeroed. Margherita and Bruschetta auto-disabled."
 
-User: "Disable Margherita Pizza."
+User: "Disable Margherita."
 → disable_menu_item(item_name="Margherita Pizza")
-→ [in confirm mode] "I'll disable Margherita Pizza. Confirm?"
-→ [after confirm] "Margherita Pizza has been disabled."
+→ "Margherita disabled."
 
-User: "The head chef is leaving, he's sick."
-→ get_staff() [to resolve who the head chef is]
+User: "Head chef is leaving sick."
 → set_staff_attendance(staff_name_or_role="head chef", status="sick")
-→ "Marco (head chef) has been marked as sick. The Pasta station is now unstaffed — Spaghetti Carbonara and Tagliatelle have been automatically disabled."
+→ "Marco marked sick. Pasta station unstaffed — Carbonara and Tagliatelle disabled."
+
+[CONFIRM MODE — call the tool, speak human_readable verbatim, wait]
+
+User: "Disable Margherita."
+→ disable_menu_item(item_name="Margherita Pizza")
+→ tool returns {requires_approval: true, human_readable: "Disable Margherita Pizza?"}
+→ "Disable Margherita Pizza?"   ← speak ONLY this, nothing more
+
+User: "Head chef is leaving sick."
+→ set_staff_attendance(staff_name_or_role="head chef", status="sick")
+→ tool returns {requires_approval: true, human_readable: "Mark Marco as sick?"}
+→ "Mark Marco as sick?"
 
 User: "What's selling most in the last 3 hours?"
 → get_pos_stats(window="3h")
-→ "The top seller in the last 3 hours is Margherita Pizza with 24 orders, followed by Tiramisu with 18."
+→ "Margherita Pizza — 24 orders. Tiramisu second with 18."
 
-User: "What are the tomato prices from all our suppliers?"
+User: "Tomato prices from all suppliers?"
 → get_supplier_prices(ingredient_name="tomato")
-→ "FreshFarms charges €2.50/kg for tomatoes; MedSupply charges €2.20/kg but has limited availability."
-
-User: "What dish is the most hated right now?"
-→ get_reviews(sort="most_hated")
-→ "Based on recent reviews, Tiramisu has the lowest ratings, with customers citing it as too sweet."
+→ "FreshFarms €2.50/kg, MedSupply €2.20/kg."
 """
 
-_SYSTEM_INSTRUCTIONS: Dict[str, str] = {
-    "manager": (
-        "You are Roba, the AI operations desk for this restaurant. "
-        "You are a TWO-WAY interface: you answer questions AND record operational updates.\n\n"
-        "CORE RULES:\n"
-        "1. ALWAYS call a tool before answering any factual question. Never guess or answer from memory.\n"
-        "2. TRUTHFULNESS: State ONLY what the tool result confirms. If a tool returns an error, say so — "
-        "never claim an action succeeded without a successful tool result.\n"
-        "3. CONCISENESS: Answer the specific question asked. Never recite entire inventory lists, "
-        "whole forecasts, or long reports when a specific answer was requested.\n"
-        "4. MISSING ARGS: If a tool returns {'need': ...}, ask the user for that specific piece of info.\n"
-        "5. READS NEVER CONFIRM: Read tools apply instantly. Write tools follow confirm/auto mode.\n\n"
+_BASE_RULES = """\
+CORE RULES:
+1. ALWAYS call a tool before answering any factual question. Never guess.
+2. TRUTHFULNESS: State ONLY what the tool result confirms. If a tool returns an error, say so — never claim an action succeeded without a successful tool result.
+3. CONCISENESS: Answer the specific question asked. Never recite entire lists when a specific answer was requested.
+4. MISSING ARGS: If a tool returns {"need": ...}, ask the user for that one piece of info only.
+"""
+
+_AUTO_MODE_RULE = """\
+MODE = AUTO: Call write tools immediately without asking permission. After the tool returns, \
+briefly state what was done. Never say "I'll do X" before doing it — just do it and confirm.
+"""
+
+_CONFIRM_MODE_RULE = """\
+MODE = CONFIRM: Call the write tool. If it returns requires_approval=true, \
+speak ONLY the human_readable field verbatim as your reply — nothing else, no preamble, \
+no "manager", no "approval", no formalities. It's already a short question. \
+Wait for the human to say yes/no, then call confirm_plan or cancel_plan accordingly.
+"""
+
+def _make_prompt(role: str, mode: str) -> str:
+    mode_rule = _AUTO_MODE_RULE if mode == "auto" else _CONFIRM_MODE_RULE
+    if role == "cook":
+        return (
+            "You are Roba, the AI kitchen desk. Concise kitchen-friendly replies — one or two sentences.\n\n"
+            + _BASE_RULES
+            + mode_rule + "\n"
+            "TOOL GUIDE:\n"
+            "• Batch status → get_batches(status='approved,decided')\n"
+            "• Did we cook X → get_batches(dish=..., status='ready')\n"
+            "• Mark cooked → confirm_batch_cooked(dish_or_batch=..., actual_qty=...)\n"
+            "• Waste (dish) → record_waste(item_name=..., qty=..., cause=...)\n"
+            "• Ingredient spoiled → record_spoilage(ingredient_name=..., all_stock=...)\n"
+            "• Inventory check → get_inventory(item_name=...)\n\n"
+            "BATCH STATES: approved=cook now; decided=needs approval; ready=already cooked; skipped=skip.\n\n"
+            + _FEW_SHOTS
+        )
+    return (
+        "You are Roba, the AI operations desk for this restaurant — you answer questions AND record updates.\n\n"
+        + _BASE_RULES
+        + mode_rule + "\n"
         "TOOL GUIDE:\n"
         "• Inventory quantity → get_inventory(item_name=...)\n"
         "• Inventory expiry → get_inventory(sort='expiring_soonest')\n"
@@ -478,28 +515,11 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "• Staff sick/leave → set_staff_attendance(staff_name_or_role=..., status=...)\n"
         "• Adjust stock → adjust_inventory(ingredient_name=..., set_to=... or delta=...)\n"
         "• Trigger agents → run_forecast / run_inventory_optimizer / run_competitor_scan / process_reviews\n"
-        "• Outbound call → request_outbound_call (always requires approval)\n\n"
+        "• Outbound call → request_outbound_call (always staged for approval)\n\n"
         "BATCH STATUS VOCABULARY: 'decided'=awaiting approval; 'approved'=ready to cook; "
         "'ready'=cooked; 'skipped'=decided to skip.\n\n"
         + _FEW_SHOTS
-    ),
-    "cook": (
-        "You are Roba, the AI kitchen desk. Concise kitchen-friendly replies (1-2 sentences max).\n\n"
-        "CORE RULES:\n"
-        "1. ALWAYS call a tool first. Never guess.\n"
-        "2. TRUTHFULNESS: Say only what the tool confirms.\n"
-        "3. CONCISENESS: Kitchen staff are busy. One or two sentences.\n\n"
-        "TOOL GUIDE:\n"
-        "• Batch status → get_batches(status='approved,decided')\n"
-        "• Did we cook X → get_batches(dish=..., status='ready')\n"
-        "• Mark cooked → confirm_batch_cooked(dish_or_batch=..., actual_qty=...)\n"
-        "• Waste (dish) → record_waste(item_name=..., qty=..., cause=...)\n"
-        "• Ingredient spoiled → record_spoilage(ingredient_name=..., all_stock=...)\n"
-        "• Inventory check → get_inventory(item_name=...)\n\n"
-        "BATCH STATES: approved=cook now; decided=needs approval; ready=already cooked; skipped=skip.\n\n"
-        + _FEW_SHOTS
-    ),
-}
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -556,7 +576,7 @@ async def live_bridge(
     if model and model in _ALLOWED_LIVE_MODELS:
         live_model = model
 
-    system_instruction = _SYSTEM_INSTRUCTIONS.get(role, _SYSTEM_INSTRUCTIONS["manager"])
+    system_instruction = _make_prompt(role, mode)
 
     # Slim injected context: just key numbers so the model uses tools for details.
     try:

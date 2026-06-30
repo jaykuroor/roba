@@ -324,7 +324,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Disable {resolved_name} on the menu.",
+            human_readable=f"Disable {resolved_name}?",
         )
 
     def enable_menu_item(
@@ -382,7 +382,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Re-enable {resolved_name} on the menu.",
+            human_readable=f"Re-enable {resolved_name}?",
         )
 
     def adjust_inventory(
@@ -453,8 +453,12 @@ class VoiceActions:
                 "unit": ing_unit,
             }
 
-        op = f"Set {ing_name} to {set_to}" if set_to is not None else f"Add {delta} to {ing_name}"
-        return self._stage_or_apply(mode, _apply, human_readable=f"{op} in inventory.")
+        if set_to is not None:
+            op = f"Set {ing_name} to {set_to} {unit or ''}".strip() + "?"
+        else:
+            direction = "Add" if (delta or 0) > 0 else "Remove"
+            op = f"{direction} {abs(delta or 0)} {unit or ''} {ing_name}?".strip()
+        return self._stage_or_apply(mode, _apply, human_readable=op)
 
     def record_spoilage(
         self,
@@ -527,7 +531,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Mark {qty_str} {ing_name} as spoiled and update inventory.",
+            human_readable=f"Mark {qty_str} {ing_name} as spoiled?",
         )
 
     def confirm_batch_cooked(
@@ -572,7 +576,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Mark {item_name} batch as cooked ({effective_qty:.0f} made).",
+            human_readable=f"Mark {item_name} batch cooked — {effective_qty:.0f} made?",
         )
 
     def record_waste(
@@ -603,7 +607,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Record {qty} × {resolved_name} as waste ({cause}).",
+            human_readable=f"Record {qty} × {resolved_name} as {cause}?",
         )
 
     def set_staff_attendance(
@@ -683,7 +687,7 @@ class VoiceActions:
         return self._stage_or_apply(
             mode,
             _apply,
-            human_readable=f"Mark {names} as {status}.",
+            human_readable=f"Mark {names} as {status}?",
         )
 
     def run_forecast(self) -> Dict[str, Any]:
@@ -755,7 +759,7 @@ class VoiceActions:
                 "status": "approval_requested",
             }
         # Always staged regardless of mode.
-        return self._stage_or_apply("confirm", _apply, human_readable=f"Request call to {target} ({purpose}).")
+        return self._stage_or_apply("confirm", _apply, human_readable=f"Call {target} — {purpose}?")
 
     # -----------------------------------------------------------------------
     # Staging (confirm/auto mode)
