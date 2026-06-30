@@ -63,6 +63,9 @@ _ALLOWED_LIVE_MODELS = {
     "gemini-live-2.5-flash-native-audio",   # native voice, GA on Vertex
 }
 
+# Hardcoded fallback — used when GEMINI_LIVE_MODEL env var contains an invalid name.
+_FALLBACK_LIVE_MODEL = "gemini-live-2.5-flash-native-audio"
+
 _DISCONNECT_EXC_NAMES = {
     "WebSocketDisconnect",
     "ClientDisconnected",
@@ -540,8 +543,16 @@ async def live_bridge(
         await _safe_send_json(websocket, {"type": "unavailable", "reason": str(exc)})
         return
 
-    # Resolve the model.
-    live_model = GEMINI_LIVE_MODEL
+    # Resolve the model — validate against the allowlist so a misconfigured
+    # GEMINI_LIVE_MODEL env var doesn't silently produce a "model not found" error.
+    if GEMINI_LIVE_MODEL in _ALLOWED_LIVE_MODELS:
+        live_model = GEMINI_LIVE_MODEL
+    else:
+        logger.warning(
+            "GEMINI_LIVE_MODEL=%r is not in the allowed list; falling back to %r",
+            GEMINI_LIVE_MODEL, _FALLBACK_LIVE_MODEL,
+        )
+        live_model = _FALLBACK_LIVE_MODEL
     if model and model in _ALLOWED_LIVE_MODELS:
         live_model = model
 
