@@ -133,3 +133,6 @@ WEATHER_CHANNEL_SHIFT = {
 
 # database
 DB_PATH = os.getenv("DB_PATH", "demo.db")
+# Reasoning model (used by core/reasoner.py for complex trade-off decisions)
+GEMINI_REASONER_MODEL: str = os.getenv("GEMINI_REASONER_MODEL", "gemini-2.5-pro")
+
