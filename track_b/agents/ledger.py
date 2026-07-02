@@ -776,6 +776,14 @@ class InventoryLedger(BaseAgent):
         """
         self._apply_reported_receipt(payload)
 
+    def apply_count(self, payload: Dict[str, Any]) -> None:
+        """Record a voice-reported stock count (set-to) directly, bypassing the bus.
+
+        Delegates to ``_apply_reported_count`` which writes the reconciliation
+        ledger row and calls ``recompute_availability`` to cascade menu state.
+        """
+        self._apply_reported_count(payload)
+
     # -- receipts (called by Procurement) ----------------------------------
 
     def receive(self, po_id: int) -> None:

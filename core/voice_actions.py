@@ -572,18 +572,16 @@ class VoiceActions:
                     session2.close()
             else:
                 new_qty = float(set_to)
-                from .signals import SignalType
-                self.bus.emit(
-                    SignalType.INVENTORY_COUNT_REPORTED,
+                if self.ledger is None:
+                    return {"error": "Ledger not available"}
+                self.ledger.apply_count(
                     {
                         "ingredient_id": ing_id,
                         "ingredient_ref": ing_name,
                         "qty": new_qty,
                         "unit": ing_unit,
                         "raw_text": f"set {ing_name} to {new_qty} {ing_unit}",
-                    },
-                    source="voice",
-                    groups=["inventory"],
+                    }
                 )
             return {
                 "ok": True,
