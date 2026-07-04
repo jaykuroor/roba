@@ -306,6 +306,8 @@ export interface SupplierCatalogRow {
   pack_size: number;
   availability: "in_stock" | "limited" | "out";
   updated_at: number | null;
+  /** 1 if this is the MILP-chosen default supplier for this ingredient. */
+  is_default?: number;
 }
 
 /** suppliers row (GET/PATCH /api/suppliers). */
@@ -352,4 +354,31 @@ export interface SignalEnvelope {
 
 export interface InventorySignalPolicy {
   shortage_signals_enabled: boolean;
+}
+
+// -- Call overhaul (Phase 1) ---------------------------------------------------
+
+export interface ManagerChange {
+  id: number;
+  kind: "sourcing_default" | "call_price" | "onboarding" | "supplier_data";
+  status: "pending" | "applied" | "reverted" | "dismissed";
+  auto_applied: number;
+  summary: string;
+  details: Record<string, unknown> | null;
+  created_at: number | null;
+  resolved_at: number | null;
+}
+
+export interface SupplierParty {
+  id: number;
+  name: string;
+  phone: string | null;
+  delivery_charge?: number | null;
+}
+
+export interface CompetitorParty {
+  id: number;
+  name: string;
+  phone: string | null;
+  cuisine: string | null;
 }

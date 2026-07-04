@@ -14,6 +14,10 @@ const MenuPage = lazy(() => import("./menu/MenuPage"));
 // WS firehose. Mounted outside OperatorLayout to keep it lightweight.
 const VoicePage = lazy(() => import("./voice/VoicePage"));
 
+// Call page: dedicated live-voice call surface, auto-opened in a new tab when
+// a call is confirmed. Also supports direct-open with a party chooser.
+const CallPage = lazy(() => import("./call/CallPage"));
+
 const Spinner = (
   <div className="flex min-h-screen items-center justify-center bg-primary text-text/50">
     Loading…
@@ -44,6 +48,15 @@ export default function App() {
         element={
           <Suspense fallback={Spinner}>
             <VoicePage />
+          </Suspense>
+        }
+      />
+      {/* Call page — dedicated live-voice call surface, auto-opened in a new tab. */}
+      <Route
+        path="/call"
+        element={
+          <Suspense fallback={Spinner}>
+            <CallPage />
           </Suspense>
         }
       />

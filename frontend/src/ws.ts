@@ -157,3 +157,7 @@ wsClient.on("call_turn", (p) => {
   const turn = p as { role: "agent" | "counterparty"; text: string };
   actions.appendCallTurn({ role: turn.role, text: turn.text });
 });
+wsClient.on("manager_change", () => {
+  // Bump version so components refetch the changes list from the API.
+  actions.bumpManagerChangeVersion();
+});

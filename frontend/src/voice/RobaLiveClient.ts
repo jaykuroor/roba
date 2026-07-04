@@ -80,17 +80,26 @@ export class RobaLiveClient {
   private _model: string | undefined;
   private _lastUserTurnId = "";
   private _lastRobaTurnId = "";
+  /** Extra query params appended to the WS URL (e.g. call_id for call sessions). */
+  private _extraParams: Record<string, string>;
 
   // Auto-reconnect for unexpected browser-socket drops.
   private _closedByUser = false;
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _reconnectAttempt = 0;
 
-  constructor(role = "manager", mode = "confirm", micMode: "ptt" | "conversation" = "ptt", model?: string) {
+  constructor(
+    role = "manager",
+    mode = "confirm",
+    micMode: "ptt" | "conversation" = "ptt",
+    model?: string,
+    extraParams?: Record<string, string>,
+  ) {
     this.role = role;
     this.mode = mode;
     this._micMode = micMode;
     this._model = model;
+    this._extraParams = extraParams ?? {};
   }
 
   setModel(model: string | undefined) {
@@ -142,6 +151,9 @@ export class RobaLiveClient {
       mic_mode: this._micMode,
     });
     if (this._model) params.set("model", this._model);
+    for (const [k, v] of Object.entries(this._extraParams)) {
+      params.set(k, v);
+    }
     const url = `${proto}://${base}/ws/voice/live?${params.toString()}`;
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";

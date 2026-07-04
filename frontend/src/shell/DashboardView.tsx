@@ -4,6 +4,7 @@
  * container changes — no Track A / Track B wording or group dividers.
  */
 import { useState } from "react";
+import { useActiveCall } from "../store";
 import { CompetitorPanel } from "../track_a/CompetitorPanel";
 import { ForecastDashboard } from "../track_a/ForecastDashboard";
 import { ReviewPanel } from "../track_a/ReviewPanel";
@@ -62,18 +63,32 @@ function Panel({ id }: { id: string }) {
   }
 }
 
-function TabButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
+function TabButton({
+  label,
+  active,
+  onClick,
+  dot,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  dot?: boolean;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className={
+      className={[
+        "relative rounded-md px-3 py-1.5 text-sm font-medium",
         active
-          ? "rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white"
-          : "rounded-md px-3 py-1.5 text-sm font-medium text-text/60 hover:bg-muted/50 hover:text-text"
-      }
+          ? "bg-accent text-white"
+          : "text-text/60 hover:bg-muted/50 hover:text-text",
+      ].join(" ")}
     >
       {label}
+      {dot && (
+        <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-accent animate-pulse ring-2 ring-primary" />
+      )}
     </button>
   );
 }
@@ -85,6 +100,15 @@ interface DashboardViewProps {
 
 export function DashboardView({ readOnly: _readOnly }: DashboardViewProps) {
   const [activeId, setActiveId] = useState(TABS[0].id);
+  const activeCall = useActiveCall();
+
+  // Pulsing dot: supplier call → suppliers tab; competitor call → competitors tab.
+  const callDotTab =
+    activeCall?.counterparty_type === "supplier"
+      ? "suppliers"
+      : activeCall?.counterparty_type === "competitor"
+      ? "competitors"
+      : null;
 
   return (
     <main className="px-4 py-4">
@@ -97,6 +121,7 @@ export function DashboardView({ readOnly: _readOnly }: DashboardViewProps) {
               label={tab.label}
               active={activeId === tab.id}
               onClick={() => setActiveId(tab.id)}
+              dot={callDotTab === tab.id}
             />
           ))}
         </div>

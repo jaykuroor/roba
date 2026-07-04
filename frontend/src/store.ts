@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { ApprovalRequest, Call, CallTurn, SimState, Weather } from "./types";
+import type { ApprovalRequest, Call, CallTurn, ManagerChange, SimState, Weather } from "./types";
 
 // A tiny Zustand-style external store: a single mutable state object, a set of
 // listeners, and `useSyncExternalStore` selectors. Because it lives outside the
@@ -15,6 +15,11 @@ export interface StoreState {
   /** Live transcript of the active call, accumulated from call_turn events. */
   callTurns: CallTurn[];
   wsConnected: boolean;
+  /** Incremented each time a manager_change WS event arrives; components use
+   * this to trigger a refetch of the changes list. */
+  managerChangeVersion: number;
+  /** Latest manager changes loaded by components; set on refetch. */
+  managerChanges: ManagerChange[];
 }
 
 const initialState: StoreState = {
@@ -24,6 +29,8 @@ const initialState: StoreState = {
   activeCall: null,
   callTurns: [],
   wsConnected: false,
+  managerChangeVersion: 0,
+  managerChanges: [],
 };
 
 type Listener = () => void;
@@ -98,6 +105,14 @@ export const actions = {
   appendCallTurn(turn: CallTurn): void {
     setState({ callTurns: [...state.callTurns, turn] });
   },
+
+  bumpManagerChangeVersion(): void {
+    setState({ managerChangeVersion: state.managerChangeVersion + 1 });
+  },
+
+  setManagerChanges(changes: ManagerChange[]): void {
+    setState({ managerChanges: changes });
+  },
 };
 
 export const store = { getState, setState, subscribe };
@@ -134,4 +149,12 @@ export function useCallTurns(): CallTurn[] {
 
 export function useWsConnected(): boolean {
   return useSelector((s) => s.wsConnected);
+}
+
+export function useManagerChangeVersion(): number {
+  return useSelector((s) => s.managerChangeVersion);
+}
+
+export function useManagerChanges(): ManagerChange[] {
+  return useSelector((s) => s.managerChanges);
 }

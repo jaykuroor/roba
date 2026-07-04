@@ -174,7 +174,11 @@ function mergeTranscriptLine(
   ];
 }
 
-export function useVoiceLive(role: string): VoiceLiveHook {
+export function useVoiceLive(
+  role: string,
+  opts?: { extraParams?: Record<string, string> },
+): VoiceLiveHook {
+  const extraParamsRef = useRef<Record<string, string>>(opts?.extraParams ?? {});
   const [mode, setMode] = useState<string>("confirm");
   const [micMode, _setMicMode] = useState<MicMode>(readMicMode);
   const [voiceModel, _setVoiceModel] = useState<string | undefined>(readVoiceModel);
@@ -244,7 +248,7 @@ export function useVoiceLive(role: string): VoiceLiveHook {
 
   // Connect (or reconnect) when role, micMode, or voiceModel changes.
   useEffect(() => {
-    const client = new RobaLiveClient(role, mode, micModeRef.current, voiceModelRef.current);
+    const client = new RobaLiveClient(role, mode, micModeRef.current, voiceModelRef.current, extraParamsRef.current);
     clientRef.current = client;
     setState("connecting");
     setLastError(null);
