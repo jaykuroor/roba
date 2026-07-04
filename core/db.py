@@ -102,6 +102,7 @@ def _ensure_columns() -> None:
         ("suppliers",       "volume_discount",  "TEXT"),          # JSON stored as TEXT
         ("supplier_catalog","is_default",        "INTEGER DEFAULT 0"),
         ("supplier_catalog","discount",          "TEXT"),
+        ("competitors",     "phone",             "TEXT"),         # for direct-call chooser
     ]
     conn = engine.raw_connection()
     try:

@@ -4,7 +4,9 @@
  * container changes — no Track A / Track B wording or group dividers.
  */
 import { useState } from "react";
+import { Radio } from "lucide-react";
 import { useActiveCall } from "../store";
+import { SpectateOverlay } from "./SpectateOverlay";
 import { CompetitorPanel } from "../track_a/CompetitorPanel";
 import { ForecastDashboard } from "../track_a/ForecastDashboard";
 import { ReviewPanel } from "../track_a/ReviewPanel";
@@ -100,6 +102,7 @@ interface DashboardViewProps {
 
 export function DashboardView({ readOnly: _readOnly }: DashboardViewProps) {
   const [activeId, setActiveId] = useState(TABS[0].id);
+  const [spectating, setSpectating] = useState(false);
   const activeCall = useActiveCall();
 
   // Pulsing dot: supplier call → suppliers tab; competitor call → competitors tab.
@@ -113,6 +116,24 @@ export function DashboardView({ readOnly: _readOnly }: DashboardViewProps) {
   return (
     <main className="px-4 py-4">
       <div className="flex flex-col gap-3">
+        {/* Live-call banner — shown when a call is active */}
+        {activeCall && (
+          <div className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2">
+            <Radio size={13} className="text-accent animate-pulse shrink-0" />
+            <span className="flex-1 text-xs font-medium text-accent">
+              Live {activeCall.counterparty_type} call in progress
+              {activeCall.purpose ? ` — ${activeCall.purpose}` : ""}
+            </span>
+            <button
+              onClick={() => setSpectating(true)}
+              className="rounded bg-accent/20 px-2 py-0.5 text-xs font-medium text-accent hover:bg-accent/30"
+            >
+              Spectate
+            </button>
+          </div>
+        )}
+        {spectating && <SpectateOverlay onClose={() => setSpectating(false)} />}
+
         {/* Flat tab strip — no Track A / Track B labels */}
         <div className="flex flex-wrap items-center gap-1.5 rounded-lg bg-surface p-2">
           {TABS.map((tab) => (

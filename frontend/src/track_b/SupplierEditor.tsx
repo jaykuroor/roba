@@ -8,10 +8,11 @@
 // Consumes `signal_emitted(SUPPLIER_PRICE_UPDATE)` + `call_*` WS events.
 
 import { useEffect, useMemo, useState } from "react";
-import { ExternalLink, PhoneCall } from "lucide-react";
+import { ExternalLink, PhoneCall, Radio } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
 import { wsClient } from "../ws";
 import { useActiveCall } from "../store";
+import { SpectateOverlay } from "../shell/SpectateOverlay";
 import type {
   Ingredient,
   Negotiation,
@@ -26,6 +27,7 @@ export function SupplierEditor() {
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [negotiations, setNegotiations] = useState<Negotiation[]>([]);
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [spectating, setSpectating] = useState(false);
   const activeCall = useActiveCall();
 
   function reload() {
@@ -132,6 +134,23 @@ export function SupplierEditor() {
       data-panel="Suppliers"
       className="flex h-full flex-col gap-4 overflow-auto rounded-lg bg-surface/40 p-3"
     >
+      {/* ── Active-call spectate banner ────────────────────────────────── */}
+      {activeCall && (
+        <div className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2">
+          <Radio size={13} className="text-accent animate-pulse shrink-0" />
+          <span className="flex-1 text-xs font-medium text-accent">
+            Live {activeCall.counterparty_type} call in progress
+          </span>
+          <button
+            onClick={() => setSpectating(true)}
+            className="rounded bg-accent/20 px-2 py-0.5 text-xs font-medium text-accent hover:bg-accent/30"
+          >
+            Spectate
+          </button>
+        </div>
+      )}
+      {spectating && <SpectateOverlay onClose={() => setSpectating(false)} />}
+
       {/* ── Grouped supplier catalog ───────────────────────────────────── */}
       <div>
         <h2 className="mb-3 text-sm font-semibold text-text">Supplier catalog</h2>

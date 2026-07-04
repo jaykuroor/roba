@@ -616,6 +616,7 @@ class Competitor(Base):
     is_open = mapped_column(Integer)           # bool 0/1
     price_tier = mapped_column(String)
     updated_at = mapped_column(Float)
+    phone = mapped_column(String, nullable=True)  # for direct-call chooser
 
     def __repr__(self):
         return f"<Competitor id={self.id} name={self.name!r} rating={self.rating}>"

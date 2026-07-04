@@ -35,6 +35,7 @@ import { ModelToggle } from "./ModelToggle";
 import { apiGet, apiPost } from "../api";
 import { useActiveCall, useCallTurns, useManagerChangeVersion, actions } from "../store";
 import type { ApprovalRequest, ManagerChange } from "../types";
+import { SpectateOverlay } from "../shell/SpectateOverlay";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -165,6 +166,7 @@ function ApprovalItem({
 function ActiveCallCard() {
   const call = useActiveCall();
   const turns = useCallTurns();
+  const [spectating, setSpectating] = useState(false);
 
   if (!call) return null;
 
@@ -176,46 +178,61 @@ function ActiveCallCard() {
   }
 
   return (
-    <div className="rounded-xl border border-accent/30 bg-accent/5 p-3 space-y-2">
-      <div className="flex items-center gap-2">
-        <Radio size={14} className="text-accent animate-pulse shrink-0" />
-        <span className="text-xs font-semibold uppercase tracking-wide text-accent">
-          Live Call
-        </span>
-        <span className="ml-auto text-xs text-text/40">#{call.id}</span>
-      </div>
-
-      <div>
-        <p className="text-sm font-medium text-text capitalize">
-          {call.counterparty_type} #{call.counterparty_id}
-        </p>
-        {call.purpose && (
-          <p className="text-xs text-text/50 mt-0.5">{call.purpose}</p>
-        )}
-      </div>
-
-      {/* Recent turns preview */}
-      {turns.length > 0 && (
-        <div className="rounded-lg border border-muted/40 bg-surface/50 p-2 space-y-1 max-h-28 overflow-y-auto">
-          {turns.slice(-4).map((t, i) => (
-            <p key={i} className={`text-xs ${t.role === "agent" ? "text-accent/80" : "text-text/70"}`}>
-              <span className="font-medium mr-1">
-                {t.role === "agent" ? "Roba:" : "Counterparty:"}
-              </span>
-              {t.text}
-            </p>
-          ))}
+    <>
+      <div className="rounded-xl border border-accent/30 bg-accent/5 p-3 space-y-2">
+        <div className="flex items-center gap-2">
+          <Radio size={14} className="text-accent animate-pulse shrink-0" />
+          <span className="text-xs font-semibold uppercase tracking-wide text-accent">
+            Live Call
+          </span>
+          <span className="ml-auto text-xs text-text/40">#{call.id}</span>
         </div>
-      )}
 
-      <button
-        onClick={openCallTab}
-        className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent/10 py-1.5 text-xs font-medium text-accent hover:bg-accent/20"
-      >
-        <ExternalLink size={12} />
-        Open call tab
-      </button>
-    </div>
+        <div>
+          <p className="text-sm font-medium text-text capitalize">
+            {call.counterparty_type} #{call.counterparty_id}
+          </p>
+          {call.purpose && (
+            <p className="text-xs text-text/50 mt-0.5">{call.purpose}</p>
+          )}
+        </div>
+
+        {/* Recent turns preview */}
+        {turns.length > 0 && (
+          <div className="rounded-lg border border-muted/40 bg-surface/50 p-2 space-y-1 max-h-28 overflow-y-auto">
+            {turns.slice(-4).map((t, i) => (
+              <p key={i} className={`text-xs ${t.role === "agent" ? "text-accent/80" : "text-text/70"}`}>
+                <span className="font-medium mr-1">
+                  {t.role === "agent" ? "Roba:" : "Counterparty:"}
+                </span>
+                {t.text}
+              </p>
+            ))}
+          </div>
+        )}
+
+        <div className="flex gap-2">
+          <button
+            onClick={() => setSpectating(true)}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-accent/20 py-1.5 text-xs font-medium text-accent hover:bg-accent/30"
+          >
+            <Radio size={12} />
+            Spectate
+          </button>
+          <button
+            onClick={openCallTab}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-accent/10 py-1.5 text-xs font-medium text-accent hover:bg-accent/20"
+          >
+            <ExternalLink size={12} />
+            Open call tab
+          </button>
+        </div>
+      </div>
+
+      {spectating && (
+        <SpectateOverlay callId={call.id} onClose={() => setSpectating(false)} />
+      )}
+    </>
   );
 }
 

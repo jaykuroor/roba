@@ -1982,7 +1982,7 @@ def get_current_parties(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
             for s in suppliers
         ],
         "competitors": [
-            {"id": c.id, "name": c.name, "cuisine": c.cuisine,
+            {"id": c.id, "name": c.name, "cuisine": c.cuisine, "phone": c.phone,
              "distance_km": c.distance_km, "rating": c.rating, "is_open": c.is_open}
             for c in competitors
         ],
@@ -2172,6 +2172,103 @@ def run_sourcing_plan() -> Dict[str, Any]:
         return {"status": "ok"}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/track-b/sourcing/latest")
+def get_latest_sourcing_run(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Return the most recent SourcingRun row (for the Control defaults indicator)."""
+    run = (
+        db_session.query(models.SourcingRun)
+        .order_by(models.SourcingRun.id.desc())
+        .first()
+    )
+    if run is None:
+        return {}
+    return {
+        "id": run.id,
+        "created_at": run.created_at,
+        "horizon_days": run.horizon_days,
+        "total_cost": run.total_cost,
+        "prev_cost": run.prev_cost,
+        "savings": run.savings,
+        "assignments": run.assignments,
+        "method": run.method,
+        "rationale": run.rationale,
+    }
+
+
+class SetDefaultBody(BaseModel):
+    ingredient_id: int
+    supplier_id: int
+
+
+@app.post("/api/supplier-catalog/set-default")
+def set_supplier_default(
+    body: SetDefaultBody,
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    """Manually override the default supplier for an ingredient.
+
+    Clears is_default on the current default row for that ingredient and sets
+    it on the chosen catalog row; creates a ManagerChange(kind=sourcing_default)
+    so the override is visible on the Roba Desk.
+    """
+    import time
+
+    # Clear all existing defaults for this ingredient
+    rows = (
+        db_session.query(models.SupplierCatalog)
+        .filter(models.SupplierCatalog.ingredient_id == body.ingredient_id)
+        .all()
+    )
+    prev_default = next((r for r in rows if r.is_default), None)
+    target_row = next((r for r in rows if r.supplier_id == body.supplier_id), None)
+    if target_row is None:
+        raise HTTPException(status_code=404, detail="Supplier does not supply that ingredient")
+
+    if prev_default and prev_default.id == target_row.id:
+        # No change needed
+        return {"changed": False}
+
+    prev_supplier_name = None
+    if prev_default:
+        prev_sup = db_session.get(models.Supplier, prev_default.supplier_id)
+        prev_supplier_name = prev_sup.name if prev_sup else str(prev_default.supplier_id)
+
+    new_sup = db_session.get(models.Supplier, body.supplier_id)
+    new_supplier_name = new_sup.name if new_sup else str(body.supplier_id)
+
+    ing = db_session.get(models.Ingredient, body.ingredient_id)
+    ing_name = ing.name if ing else str(body.ingredient_id)
+
+    for row in rows:
+        row.is_default = 1 if row.supplier_id == body.supplier_id else 0
+    db_session.commit()
+
+    # Create ManagerChange so the desk card shows up
+    change = models.ManagerChange(
+        kind="sourcing_default",
+        status="applied",
+        auto_applied=0,
+        summary=f"Manual override: {ing_name} → {new_supplier_name}",
+        details={
+            "ingredient_id": body.ingredient_id,
+            "ingredient_name": ing_name,
+            "supplier_id_before": prev_default.supplier_id if prev_default else None,
+            "supplier_name_before": prev_supplier_name,
+            "supplier_id_after": body.supplier_id,
+            "supplier_name_after": new_supplier_name,
+            "rationale": "Manual override via Control surface",
+        },
+        created_at=time.time(),
+        resolved_at=time.time(),
+    )
+    db_session.add(change)
+    db_session.commit()
+    db_session.refresh(change)
+    ctx.hub.broadcast("manager_change", {"change_id": change.id})
+
+    return {"changed": True, "change_id": change.id}
 
 
 class NegotiateBody(BaseModel):

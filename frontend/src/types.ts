@@ -379,6 +379,7 @@ export interface SupplierParty {
 export interface CompetitorParty {
   id: number;
   name: string;
-  phone: string | null;
-  cuisine: string | null;
+  /** Backend returns either a string array or a plain string. */
+  cuisine: string[] | string | null;
+  phone?: string | null;
 }

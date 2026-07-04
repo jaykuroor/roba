@@ -168,7 +168,12 @@ function PartyChooser({ onSelect }: PartyChooserProps) {
               >
                 <div>
                   <p className="font-medium text-text">{c.name}</p>
-                  {c.cuisine && <p className="text-xs text-text/50">{c.cuisine}</p>}
+                  {c.cuisine && (
+                    <p className="text-xs text-text/50">
+                      {Array.isArray(c.cuisine) ? c.cuisine.join(", ") : c.cuisine}
+                    </p>
+                  )}
+                  {c.phone && <p className="text-xs text-text/40">{c.phone}</p>}
                 </div>
                 {busy === `c-${c.id}` ? (
                   <RefreshCw size={14} className="text-accent animate-spin" />
