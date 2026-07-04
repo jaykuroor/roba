@@ -85,6 +85,35 @@ def create_all():
     from . import models  # noqa: F401  (import registers all models on Base.metadata)
 
     Base.metadata.create_all(bind=engine)
+    _ensure_columns()
+
+
+def _ensure_columns() -> None:
+    """Idempotent ALTER TABLE for columns added after the initial schema.
+
+    Runs on every startup so existing ``demo.db`` files gain the new columns
+    without requiring a full reset.  SQLite silently ignores duplicate-column
+    errors via the ``ignore_errors=True`` check.
+    """
+    _new_cols = [
+        # (table, column, ddl_type_default)
+        ("suppliers",       "phone",            "TEXT"),
+        ("suppliers",       "delivery_charge",  "REAL DEFAULT 0.0"),
+        ("suppliers",       "volume_discount",  "TEXT"),          # JSON stored as TEXT
+        ("supplier_catalog","is_default",        "INTEGER DEFAULT 0"),
+        ("supplier_catalog","discount",          "TEXT"),
+    ]
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        for table, col, ddl in _new_cols:
+            try:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+            except Exception:  # noqa: BLE001  column already exists
+                pass
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_db():

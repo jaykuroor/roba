@@ -182,6 +182,7 @@ class Validator:
                 "id": sup_id, "name": "Auto Supplier",
                 "lead_time_days": 2.0, "reliability_score": 0.85,
                 "min_order_value": 0.0, "contact": "auto@supplier.local",
+                "phone": None, "delivery_charge": 0.0, "volume_discount": None,
             })
             for iid in uncovered:
                 catalog.append({
@@ -189,6 +190,7 @@ class Validator:
                     "supplier_id": sup_id, "ingredient_id": iid,
                     "current_price": 1.0, "unit": "g", "pack_size": 1.0,
                     "availability": "in_stock", "updated_at": 0.0,
+                    "is_default": 1, "discount": None,
                 })
             repaired = True
 
@@ -394,6 +396,8 @@ class Seeder:
                 "lead_time_days": float(sup.get("lead_time_days") or 2.0),
                 "reliability_score": 0.9, "min_order_value": 50.0,
                 "contact": "orders@supplier.local",
+                "phone": sup.get("phone"), "delivery_charge": float(sup.get("delivery_charge") or 0.0),
+                "volume_discount": sup.get("volume_discount"),
             })
         n_suppliers = len(data["suppliers"])
         for ing in data["ingredients"]:
@@ -404,6 +408,7 @@ class Seeder:
                 "current_price": 2.0, "unit": ing["base_unit"],
                 "pack_size": 1000.0 if ing["base_unit"] != "each" else 12.0,
                 "availability": "in_stock", "updated_at": 0.0,
+                "is_default": 1, "discount": None,
             })
 
         # Staff + coverage (cover every station).

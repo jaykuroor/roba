@@ -101,6 +101,22 @@ COMPETITOR_CALL_TARGETS = 2
 COMPETITOR_AGGREGATOR_POLL_SIM_S = 1800
 COMPETITOR_MENU_REFRESH_SIM_S = 7200
 
+# sourcing optimizer (call overhaul)
+# SOURCING_RUN_INTERVAL_SIM_S: how often to re-run the MILP/greedy sourcing solve.
+SOURCING_RUN_INTERVAL_SIM_S = float(os.getenv("SOURCING_RUN_INTERVAL_SIM_S", str(54000.0 * 3)))  # ~3 sim-days
+# SOURCING_SWITCHING_COST: default per-ingredient switching cost (currency). Overridable via AppSettings.
+SOURCING_SWITCHING_COST = float(os.getenv("SOURCING_SWITCHING_COST", "5.0"))
+# SOURCING_HORIZON_DAYS: default planning horizon. Overridable via AppSettings.
+SOURCING_HORIZON_DAYS = float(os.getenv("SOURCING_HORIZON_DAYS", "7.0"))
+# NEGOTIATION_COOLDOWN_SIM_S: minimum sim-time between negotiation calls for the same supplier+ingredient.
+NEGOTIATION_COOLDOWN_SIM_S = float(os.getenv("NEGOTIATION_COOLDOWN_SIM_S", str(54000.0 * 7)))  # ~1 sim-week
+# NEGOTIATION_MIN_SAVINGS_PCT: minimum % price improvement required before requesting a call.
+NEGOTIATION_MIN_SAVINGS_PCT = float(os.getenv("NEGOTIATION_MIN_SAVINGS_PCT", "8.0"))
+# AUTO_APPLY_SUPPLIER_CHANGES: runtime default (overridable via AppSettings DB row).
+AUTO_APPLY_SUPPLIER_CHANGES = os.getenv("AUTO_APPLY_SUPPLIER_CHANGES", "0").lower() in {
+    "1", "true", "yes", "on"
+}
+
 # llm — Vertex AI only; Groq/OpenRouter removed
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 LLM_FALLBACK = ["gemini", "canned"]

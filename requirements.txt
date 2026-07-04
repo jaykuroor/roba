@@ -8,3 +8,4 @@ google-auth>=2.0.0
 python-dotenv>=1.0.1
 websockets>=16.0
 aiofiles>=25.1.0
+pulp>=2.9.0

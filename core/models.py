@@ -166,6 +166,10 @@ class Supplier(Base):
     reliability_score = mapped_column(Float)
     min_order_value = mapped_column(Float)
     contact = mapped_column(String)
+    # Extended fields (call overhaul)
+    phone = mapped_column(String, nullable=True)                # for Add-supplier + onboarding call
+    delivery_charge = mapped_column(Float, default=0.0)         # fixed delivery fee per order
+    volume_discount = mapped_column(JSON, nullable=True)        # [{min_value, discount_pct}, …]
 
     def __repr__(self):
         return f"<Supplier id={self.id} name={self.name!r} lead_time_days={self.lead_time_days}>"
@@ -182,10 +186,14 @@ class SupplierCatalog(Base):
     pack_size = mapped_column(Float)
     availability = mapped_column(String)       # in_stock | limited | out
     updated_at = mapped_column(Float)
+    # Extended fields (call overhaul)
+    is_default = mapped_column(Integer, default=0)  # 0/1 — MILP solver-chosen default per ingredient
+    discount = mapped_column(JSON, nullable=True)   # [{min_qty, unit_price}, …] per-item price breaks
 
     def __repr__(self):
         return (f"<SupplierCatalog id={self.id} supplier_id={self.supplier_id} "
-                f"ingredient_id={self.ingredient_id} current_price={self.current_price}>")
+                f"ingredient_id={self.ingredient_id} current_price={self.current_price} "
+                f"is_default={self.is_default}>")
 
 
 # ---------------------------------------------------------------------------
@@ -1028,6 +1036,97 @@ class EventLog(Base):
 
 
 # ---------------------------------------------------------------------------
+# §19.3-ext  Manager changes + sourcing audit (call overhaul)
+# ---------------------------------------------------------------------------
+
+class ManagerChange(Base):
+    """A pending/applied/reverted supplier change surfaced on the Manager Roba Desk.
+
+    ``kind``:
+      - ``sourcing_default`` — MILP solver changed the default supplier for an ingredient.
+      - ``call_price``       — a supplier negotiation call resulted in an agreed price.
+      - ``onboarding``       — a new-supplier onboarding call populated catalog entries.
+      - ``supplier_data``    — manual edit to supplier price/availability/delivery.
+
+    ``status``:
+      - ``pending``   — awaiting user action (auto_apply is OFF).
+      - ``applied``   — change has been written to the catalog (auto_applied=1 or user applied).
+      - ``reverted``  — applied change was rolled back.
+      - ``dismissed`` — user dismissed without applying.
+
+    ``details``: ``{before, after, rationale, call_id?, ingredient_id?, supplier_id?, …}``
+    ``auto_applied``: 1 when written automatically (auto_apply setting was ON at creation time).
+    """
+    __tablename__ = "manager_changes"
+
+    id = _pk()
+    kind = mapped_column(String)              # sourcing_default | call_price | onboarding | supplier_data
+    status = mapped_column(String, default="pending")  # pending | applied | reverted | dismissed
+    auto_applied = mapped_column(Integer, default=0)   # bool 0/1
+    summary = mapped_column(Text)
+    details = mapped_column(JSON)             # {before, after, rationale, call_id?, …}
+    created_at = mapped_column(Float)
+    resolved_at = mapped_column(Float, nullable=True)
+
+    def __repr__(self):
+        return (f"<ManagerChange id={self.id} kind={self.kind!r} "
+                f"status={self.status!r}>")
+
+
+class SourcingRun(Base):
+    """Audit log for each least-cost sourcing solve (MILP or greedy fallback).
+
+    ``method``: ``milp`` | ``greedy`` | ``fallback`` (pure-Python when PuLP absent).
+    ``assignments``: ``[{ingredient_id, supplier_id, qty, unit_price, reason}, …]``
+    ``rationale``: human-readable explanation of main allocation decisions.
+    """
+    __tablename__ = "sourcing_runs"
+
+    id = _pk()
+    created_at = mapped_column(Float)
+    horizon_days = mapped_column(Float)
+    total_cost = mapped_column(Float)
+    prev_cost = mapped_column(Float, nullable=True)
+    savings = mapped_column(Float, nullable=True)
+    assignments = mapped_column(JSON)         # list of allocation records
+    method = mapped_column(String)            # milp | greedy | fallback
+    rationale = mapped_column(Text, nullable=True)
+
+    def __repr__(self):
+        return (f"<SourcingRun id={self.id} method={self.method!r} "
+                f"total_cost={self.total_cost} savings={self.savings}>")
+
+
+# ---------------------------------------------------------------------------
+# §19.4-ext  App settings (singleton, id=1) — persists across resets
+# ---------------------------------------------------------------------------
+
+class AppSettings(Base):
+    """Singleton row (id=1) for operator-controlled feature flags.
+
+    ``auto_apply_supplier_changes``: when 1, accepted call outcomes and sourcing
+      defaults are applied immediately to the catalog; a ManagerChange card is
+      still created (status=applied) so the manager can review/revert.
+
+    ``sourcing_switching_cost``: per-ingredient-per-period cost (currency) charged
+      by the MILP solver when switching away from the current default supplier.
+      Acts as a hysteresis guard — prevents churn on small savings.
+
+    ``sourcing_horizon_days``: how many days of demand to plan for in each solve.
+    """
+    __tablename__ = "app_settings"
+
+    id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    auto_apply_supplier_changes = mapped_column(Integer, default=0)  # bool 0/1
+    sourcing_switching_cost = mapped_column(Float, default=5.0)
+    sourcing_horizon_days = mapped_column(Float, default=7.0)
+
+    def __repr__(self):
+        return (f"<AppSettings id={self.id} "
+                f"auto_apply={self.auto_apply_supplier_changes}>")
+
+
+# ---------------------------------------------------------------------------
 # Table groupings (used by db.reset_db).
 #
 # These mostly mirror the §19 sections, with one deliberate deviation:
@@ -1058,8 +1157,10 @@ INTELLIGENCE_MODELS = [
     SupplierPriceHistory, Negotiation,
     ApprovalRequest, ForecastJob, HorizonForecast, HorizonForecastLine,
     Promotion, UserFact, LLMCallLog, WeatherLog, Call,
+    ManagerChange, SourcingRun,
 ]
 
 CONTROL_MODELS = [
     SimState, SimSettings, Scenario, ScenarioEvent, EventLog,
+    AppSettings,
 ]
