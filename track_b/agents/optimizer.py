@@ -23,10 +23,12 @@ from core import config
 from core.agent_base import BaseAgent
 from core.llm import CANNED_NOTE
 from core.models import (
+    AppSettings,
     Ingredient,
     InventoryLevel,
     InventoryLot,
     InventoryOptimizerMemory,
+    ManagerChange,
     MenuItem,
     MenuToggle,
     OrderLine,
@@ -35,6 +37,7 @@ from core.models import (
     PurchaseOrderLine,
     Recipe,
     RecipeLine,
+    SourcingRun,
     Supplier,
     SupplierCatalog,
 )
@@ -44,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 # Signal groups this agent listens to (02 §B4.2).
 GROUPS = ["inventory", "procurement"]
+
+# Lazy import; only pulled in when run_sourcing_plan executes so the solver
+# dependency (PuLP) is optional for the rest of the optimizer.
+def _import_solve_sourcing() -> Any:
+    from track_b.procurement.sourcing import solve_sourcing  # noqa: PLC0415
+    return solve_sourcing
 
 # JSON schema for the LLM optimizer action list.
 _OPTIMIZE_SCHEMA: Dict[str, Any] = {
@@ -55,9 +64,11 @@ _OPTIMIZE_SCHEMA: Dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["toggle_item", "create_deal", "reorder", "defer_reorder"]},
+                               "enum": ["toggle_item", "create_deal", "reorder",
+                                        "defer_reorder", "request_negotiation"]},
                     "menu_item_id": {"type": "integer"},
                     "ingredient_id": {"type": "integer"},
+                    "supplier_id": {"type": "integer"},
                     "toggle_direction": {"type": "string", "enum": ["disable", "enable"]},
                     "discount_pct": {"type": "number"},
                     "reason": {"type": "string"},
@@ -101,12 +112,16 @@ class InventoryOptimizer(BaseAgent):
         # reorder sweep knows which ingredient to watch for re-enabling
         # (menu_toggles has no ingredient_id column; this is in-process only).
         self._toggle_cause: Dict[int, int] = {}
+        self._market_spectator: Any = None
 
     def attach_procurement(self, procurement: Any) -> None:
         self.procurement = procurement
 
     def attach_approvals(self, approvals: Any) -> None:
         self.approvals = approvals
+
+    def attach_market_spectator(self, market_spectator: Any) -> None:
+        self._market_spectator = market_spectator
 
     # -- signal handling ----------------------------------------------------
 
@@ -229,6 +244,7 @@ class InventoryOptimizer(BaseAgent):
                     "pack_size": c.pack_size or 1.0,
                     "availability": c.availability,
                     "unit": c.unit,
+                    "is_default": int(getattr(c, "is_default", 0) or 0),
                 }
                 for c in catalog
             ]
@@ -244,7 +260,14 @@ class InventoryOptimizer(BaseAgent):
         finally:
             session.close()
 
-        candidate = self._choose_supplier(specs, lead_by_supplier)
+        # Prefer the MILP-chosen default supplier; fall back to heuristic scorer.
+        default_specs = [
+            s for s in specs
+            if s.get("is_default") == 1 and s["availability"] != "out"
+        ]
+        candidate = default_specs[0] if default_specs else self._choose_supplier(
+            specs, lead_by_supplier
+        )
         if candidate is None:
             self.log_event(
                 "reorder_failed",
@@ -796,14 +819,69 @@ class InventoryOptimizer(BaseAgent):
                     "role": "system",
                     "content": (
                         "You are Roba's inventory optimizer AI. Based on the provided restaurant "
-                        "inventory state, demand forecasts, and optimization memory, produce a "
-                        "list of inventory and menu actions to maximize profitability and minimize "
-                        "waste. Reason carefully about shared ingredients across dishes — disabling "
+                        "inventory state, demand forecasts, supplier data, and optimization memory, "
+                        "produce a list of inventory and menu actions.\n\n"
+                        "AVAILABLE ACTIONS:\n"
+                        "- toggle_item: disable/enable a menu item (menu_item_id, toggle_direction)\n"
+                        "- create_deal: propose a discount promo (ingredient_id, discount_pct)\n"
+                        "- reorder: trigger an immediate reorder (ingredient_id)\n"
+                        "- defer_reorder: defer a pending reorder (ingredient_id)\n"
+                        "- request_negotiation: request a supplier negotiation call "
+                        "(supplier_id, ingredient_id). ONLY use when ALL criteria are met:\n"
+                        "  (a) price has risen SUSTAINABLY (≥3 consecutive data points or "
+                        "≥15% above historical median), AND\n"
+                        "  (b) there is strong evidence of potential savings OR a cheaper "
+                        "alternate supplier whose savings over the week exceed the switching "
+                        "cost, AND\n"
+                        "  (c) no negotiation with this supplier+ingredient pair is already in "
+                        "progress or was completed recently (check optimizer_memory for "
+                        "negotiation_cooldown entries), AND\n"
+                        "  (d) total potential savings over the forecast horizon are meaningful "
+                        "(not just cents).\n\n"
+                        "FEW-SHOT EXAMPLES for request_negotiation:\n\n"
+                        "EXAMPLE 1 — DO request negotiation:\n"
+                        "Context: tomato price has risen from $0.003 to $0.0045/g over 3 weeks "
+                        "(50% above median). We order 80g/day = ~560g/week. Potential weekly "
+                        "savings if we get back to $0.003: ($0.0045-$0.003)*560=$0.84/week = "
+                        "$3.36/month. Switching cost $5. No recent negotiation in memory.\n"
+                        "→ ACTION: request_negotiation supplier_id=1 ingredient_id=3, "
+                        "confidence=0.78. Reason: sustained 3-week price rise 50% above median; "
+                        "meaningful monthly savings justify a call.\n\n"
+                        "EXAMPLE 2 — DO NOT request negotiation (single spike):\n"
+                        "Context: mozzarella spiked last Wednesday (weather event per notes), "
+                        "price back near median the same week. Only 1 elevated price point.\n"
+                        "→ NO action. Reason: single transient spike with no sustained trend.\n\n"
+                        "EXAMPLE 3 — DO NOT request negotiation (savings too small):\n"
+                        "Context: olive oil from SupplierA costs $0.0052/g, SupplierB offers "
+                        "$0.0051/g. Weekly demand 20g. Potential savings: $0.02/week. "
+                        "Switching cost $5.\n"
+                        "→ NO action. Reason: switching cost ($5) vastly exceeds weekly savings "
+                        "($0.02); a call would cost more in management time than it saves.\n\n"
+                        "EXAMPLE 4 — DO request negotiation (alternate supplier much cheaper):\n"
+                        "Context: cream from CurrentCo $0.008/g, AlternateDairy $0.0055/g. "
+                        "Weekly demand 300g. Savings: ($0.008-$0.0055)*300=$0.75/week. "
+                        "Over 4 weeks = $3.00 < switching cost $5 — marginal. But if the "
+                        "optimizer_memory shows 3 late deliveries from CurrentCo in past 30 days "
+                        "causing stockouts, the reliability cost also justifies switching.\n"
+                        "→ ACTION: request_negotiation, confidence=0.72. Reason: sustained price "
+                        "gap plus late-delivery pattern makes incumbent unreliable.\n\n"
+                        "EXAMPLE 5 — DO NOT request negotiation (cooldown):\n"
+                        "Context: optimizer_memory shows negotiation_cooldown entry for "
+                        "supplier_id=2,ingredient_id=5 created 8 sim-days ago. "
+                        "NEGOTIATION_COOLDOWN is ~7 sim-days.\n"
+                        "→ NO action. Reason: negotiation already requested recently; cooldown "
+                        "not yet expired.\n\n"
+                        "EXAMPLE 6 — DO NOT request negotiation (no better alternative):\n"
+                        "Context: basil from SingleSupplier is the only supplier in catalog. "
+                        "Price is 10% above historical median but no alternate exists.\n"
+                        "→ NO action. Reason: no competitive leverage; a negotiation call "
+                        "without an alternative weakens our position. Flag for sourcing review.\n\n"
+                        "Reason carefully about shared ingredients across dishes — disabling "
                         "a lower-margin dish can preserve a scarce ingredient for a higher-margin "
-                        "dish. Propose deals (discounts) for items near waste/expiry. Suggest "
-                        "reorder timing adjustments based on demand patterns. Respond with JSON "
-                        "matching the schema: {actions: [{action, menu_item_id?, ingredient_id?, "
-                        "toggle_direction?, discount_pct?, reason, confidence}], summary}."
+                        "dish. Propose deals (discounts) for items near waste/expiry. "
+                        "Respond with JSON matching the schema: {actions: [{action, "
+                        "menu_item_id?, ingredient_id?, supplier_id?, toggle_direction?, "
+                        "discount_pct?, reason, confidence}], summary}."
                     ),
                 },
                 {"role": "user", "content": f"Inventory context:\n{context}"},
@@ -971,6 +1049,20 @@ class InventoryOptimizer(BaseAgent):
                             source="llm",
                         )
                         applied.append(f"defer_reorder:ingredient:{ingredient_id}")
+                elif kind == "request_negotiation":
+                    supplier_id = action.get("supplier_id")
+                    ingredient_id = action.get("ingredient_id")
+                    if (
+                        supplier_id is not None
+                        and ingredient_id is not None
+                        and self._market_spectator is not None
+                    ):
+                        self._market_spectator.negotiate(
+                            int(supplier_id), int(ingredient_id)
+                        )
+                        applied.append(
+                            f"request_negotiation:s{supplier_id}:i{ingredient_id}"
+                        )
             except Exception:  # noqa: BLE001
                 logger.exception("Optimizer LLM action %s failed", kind)
 
@@ -1064,6 +1156,275 @@ class InventoryOptimizer(BaseAgent):
             "promo_proposal",
             f"[LLM] Proposed {trigger} promo for {ing_name} ({discount_pct:.0f}% off).",
             {"promo_id": promo_id, "ingredient_id": ingredient_id},
+        )
+
+    # -- sourcing plan (Phase 2b) ------------------------------------------------
+
+    def run_sourcing_plan(self) -> None:
+        """Run the MILP least-cost sourcing solve on the full ingredient catalog.
+
+        Computes the optimal default-supplier assignment for every ingredient
+        (accounting for item cost, delivery charge, switching cost, spoilage,
+        volume discounts), writes a :class:`core.models.SourcingRun` audit row,
+        updates :attr:`SupplierCatalog.is_default`, and for each changed default
+        creates a :class:`core.models.ManagerChange` card + broadcasts
+        ``manager_change`` on the operator WebSocket.
+
+        Scheduled on a longer cadence via ``track_b.agents.__init__.register``
+        and also callable on-demand via ``POST /api/track-b/optimizer/sourcing/run``.
+        """
+        solve_sourcing = _import_solve_sourcing()
+        now = self.sim_time
+
+        session = self.db_session_factory()
+        try:
+            ings = session.query(Ingredient).all()
+            ingredients = [
+                {
+                    "id": int(i.id),
+                    "name": i.name,
+                    "perishable": bool(i.perishable),
+                    "shelf_life_days": float(i.shelf_life_days or 0.0),
+                    "current_default_supplier_id": None,
+                }
+                for i in ings
+            ]
+            ing_ids = [int(i.id) for i in ings]
+
+            catalog_rows = session.query(SupplierCatalog).all()
+            catalog = [
+                {
+                    "id": int(c.id),
+                    "supplier_id": int(c.supplier_id),
+                    "ingredient_id": int(c.ingredient_id),
+                    "current_price": float(c.current_price or 0.0),
+                    "pack_size": float(c.pack_size or 1.0),
+                    "availability": c.availability or "in_stock",
+                    "unit": c.unit or "each",
+                    "is_default": int(getattr(c, "is_default", 0) or 0),
+                    "discount": getattr(c, "discount", None),
+                }
+                for c in catalog_rows
+            ]
+
+            default_sup: Dict[int, int] = {}
+            for c in catalog:
+                if c["is_default"]:
+                    default_sup[c["ingredient_id"]] = c["supplier_id"]
+            for i in ingredients:
+                i["current_default_supplier_id"] = default_sup.get(i["id"])
+
+            supplier_rows = session.query(Supplier).all()
+            sup_name_map: Dict[int, str] = {int(s.id): s.name for s in supplier_rows}
+            suppliers = [
+                {
+                    "id": int(s.id),
+                    "name": s.name,
+                    "delivery_charge": float(getattr(s, "delivery_charge", None) or 0.0),
+                    "min_order_value": 0.0,
+                    "lead_time_days": float(s.lead_time_days or 1.0),
+                    "reliability_score": 1.0,
+                    "volume_discount": getattr(s, "volume_discount", None),
+                }
+                for s in supplier_rows
+            ]
+
+            # Pull reliability scores from memory
+            mem_rows = (
+                session.query(InventoryOptimizerMemory)
+                .filter(InventoryOptimizerMemory.scope_type == "supplier")
+                .all()
+            )
+            for m in mem_rows:
+                try:
+                    s_id = int(str(m.scope_ref).split(":")[0])
+                    if isinstance(m.insight, dict):
+                        rel = float(m.insight.get("reliability_score", 1.0))
+                        for s in suppliers:
+                            if s["id"] == s_id:
+                                s["reliability_score"] = rel
+                except (ValueError, TypeError, AttributeError):
+                    pass
+
+            settings = (
+                session.query(AppSettings)
+                .filter(AppSettings.id == 1)
+                .first()
+            )
+            auto_apply = bool(
+                settings.auto_apply_supplier_changes if settings else
+                config.AUTO_APPLY_SUPPLIER_CHANGES
+            )
+            switching_cost = float(
+                settings.sourcing_switching_cost
+                if (settings and hasattr(settings, "sourcing_switching_cost"))
+                else config.SOURCING_SWITCHING_COST
+            )
+            horizon_days = float(
+                settings.sourcing_horizon_days
+                if (settings and hasattr(settings, "sourcing_horizon_days"))
+                else config.SOURCING_HORIZON_DAYS
+            )
+
+            ing_name_map: Dict[int, str] = {int(i.id): i.name for i in ings}
+        finally:
+            session.close()
+
+        # Estimate demand using forecast horizon
+        demand: Dict[int, float] = {}
+        for iid in ing_ids:
+            d = self._demand_over_lead(iid, horizon_days)
+            if d > 0:
+                demand[iid] = d
+
+        if not demand:
+            self.log_event(
+                "sourcing_plan_skipped",
+                "Sourcing plan skipped: no demand forecast data available.",
+                {},
+            )
+            return
+
+        params = {
+            "switching_cost": switching_cost,
+            "horizon_days": horizon_days,
+        }
+
+        try:
+            solution = solve_sourcing(ingredients, catalog, suppliers, demand, params)
+        except Exception:
+            logger.exception("Sourcing solve failed entirely; skipping this run.")
+            return
+
+        # Compute prev_cost from existing defaults
+        prev_cost = 0.0
+        for iid, qty in demand.items():
+            s_id = default_sup.get(iid)
+            if s_id is None:
+                continue
+            c = next(
+                (cc for cc in catalog
+                 if cc["ingredient_id"] == iid and cc["supplier_id"] == s_id),
+                None,
+            )
+            if c:
+                prev_cost += float(c["current_price"] or 0.0) * qty
+        savings = round(prev_cost - solution.total_cost, 4)
+
+        session = self.db_session_factory()
+        try:
+            run = SourcingRun(
+                created_at=now,
+                horizon_days=horizon_days,
+                total_cost=solution.total_cost,
+                prev_cost=round(prev_cost, 4),
+                savings=savings,
+                assignments=solution.assignments,
+                method=solution.method,
+                rationale=solution.rationale,
+            )
+            session.add(run)
+            session.flush()
+            run_id = run.id
+
+            changes_created: List[Dict[str, Any]] = []
+
+            for asgn in solution.assignments:
+                iid = int(asgn["ingredient_id"])
+                new_s_id = int(asgn["supplier_id"])
+
+                # Clear old default, set new one for this ingredient
+                for c_row in (
+                    session.query(SupplierCatalog)
+                    .filter(SupplierCatalog.ingredient_id == iid)
+                    .all()
+                ):
+                    c_row.is_default = 1 if int(c_row.supplier_id) == new_s_id else 0
+
+                if not asgn.get("is_default_change"):
+                    continue
+
+                old_s_id = default_sup.get(iid)
+                old_cat = next(
+                    (cc for cc in catalog
+                     if cc["ingredient_id"] == iid and cc["supplier_id"] == (old_s_id or -1)),
+                    None,
+                )
+                new_cat = next(
+                    (cc for cc in catalog
+                     if cc["ingredient_id"] == iid and cc["supplier_id"] == new_s_id),
+                    None,
+                )
+
+                ing_name = ing_name_map.get(iid, str(iid))
+                old_s_name = sup_name_map.get(old_s_id, str(old_s_id)) if old_s_id else "None"
+                new_s_name = sup_name_map.get(new_s_id, str(new_s_id))
+
+                details = {
+                    "ingredient_id": iid,
+                    "ingredient_name": ing_name,
+                    "supplier_id_before": old_s_id,
+                    "supplier_id_after": new_s_id,
+                    "supplier_name_before": old_s_name,
+                    "supplier_name_after": new_s_name,
+                    "price_before": float(old_cat["current_price"]) if old_cat else 0.0,
+                    "price_after": float(new_cat["current_price"]) if new_cat else 0.0,
+                    "rationale": solution.rationale,
+                    "run_id": run_id,
+                    "estimated_savings": round(savings, 4),
+                    "method": solution.method,
+                }
+
+                change = ManagerChange(
+                    kind="sourcing_default",
+                    status="applied" if auto_apply else "pending",
+                    auto_applied=1 if auto_apply else 0,
+                    summary=(
+                        f"Default supplier for {ing_name}: "
+                        f"{old_s_name} → {new_s_name}"
+                    ),
+                    details=details,
+                    created_at=now,
+                    resolved_at=now if auto_apply else None,
+                )
+                session.add(change)
+                session.flush()
+                changes_created.append(
+                    {"change_id": change.id, "details": details}
+                )
+
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception("Sourcing plan DB writes failed.")
+            return
+        finally:
+            session.close()
+
+        for ch in changes_created:
+            self.broadcast("manager_change", {
+                "change_id": ch["change_id"],
+                "details": ch["details"],
+            })
+
+        self.log_event(
+            "sourcing_plan",
+            (
+                f"Sourcing plan ({solution.method}): "
+                f"total_cost={solution.total_cost:.4f}, "
+                f"prev_cost={prev_cost:.4f}, "
+                f"savings={savings:.4f}, "
+                f"changes={len(changes_created)}. "
+                f"{solution.rationale}"
+            ),
+            {
+                "method": solution.method,
+                "total_cost": solution.total_cost,
+                "prev_cost": round(prev_cost, 4),
+                "savings": savings,
+                "n_changes": len(changes_created),
+                "run_id": run_id,
+            },
         )
 
     def _remember(

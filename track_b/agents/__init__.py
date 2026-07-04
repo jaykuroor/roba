@@ -101,6 +101,14 @@ def register(
         interval_sim_s=config.WEATHER_FETCH_SIM_S,
         name="market_price_review",
     )
+    orchestrator.register(
+        "interval",
+        optimizer.run_sourcing_plan,
+        interval_sim_s=config.SOURCING_RUN_INTERVAL_SIM_S,
+        name="optimizer_sourcing_plan",
+    )
+    # Wire market spectator into optimizer so LLM pass can request negotiations
+    optimizer.attach_market_spectator(market)
 
     components: Dict[str, Any] = {
         "ledger": ledger,

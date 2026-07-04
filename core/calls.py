@@ -28,6 +28,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .llm import CANNED_NOTE
+from . import call_personas
 from .models import Call, Competitor, CompetitorOffer, Supplier, SupplierCatalog
 from .signals import SignalType
 
@@ -84,16 +85,75 @@ class CallSubsystem:
 
     # -- request (§8.2) -----------------------------------------------------
 
-    def request(
+    def start_direct(
         self,
         agent: str,
         counterparty_type: str,
         counterparty_id: int,
         purpose: str,
     ) -> Call:
-        """Create a ``requested`` call + an ``outbound_call`` approval and emit
-        ``CALL_REQUEST`` (§8.2). If a call is already active, the approval card
-        is noted "waiting for current call to end" (§6.3)."""
+        """Start a call immediately without an approval card (user-initiated).
+
+        Creates the ``Call`` row as ``active`` straight away, freezes the clock
+        and emits ``CALL_STARTED``.  No ``ApprovalRequest`` is created.
+        """
+        return self.request(
+            agent=agent,
+            counterparty_type=counterparty_type,
+            counterparty_id=counterparty_id,
+            purpose=purpose,
+            require_approval=False,
+        )
+
+    def request(
+        self,
+        agent: str,
+        counterparty_type: str,
+        counterparty_id: int,
+        purpose: str,
+        require_approval: bool = True,
+    ) -> Call:
+        """Create a call.
+
+        When ``require_approval=True`` (default): creates a ``requested`` call +
+        an ``outbound_call`` approval card, emits ``CALL_REQUEST`` (§8.2).
+
+        When ``require_approval=False``: bypasses the approval card; the call is
+        immediately set ``active`` and ``CALL_STARTED`` is emitted directly.
+        Use this path for user-initiated calls from the UI.
+
+        If a call is already active, the call is queued (FIFO, §6.3).
+        """
+        # require_approval=False path: skip the approval card entirely
+        if not require_approval:
+            call_mode = self.clock.current_state().get("call_mode") or "freeze"
+            session = self.db_session_factory()
+            try:
+                call = Call(
+                    agent=agent,
+                    counterparty_type=counterparty_type,
+                    counterparty_id=counterparty_id,
+                    purpose=purpose,
+                    status="requested",
+                    approval_id=None,
+                    transcript=[],
+                    outcome=None,
+                    started_at=None,
+                    ended_at=None,
+                    clock_action=call_mode,
+                )
+                session.add(call)
+                session.commit()
+                session.refresh(call)
+                call_id = call.id
+                session.expunge(call)
+            finally:
+                session.close()
+            # Go straight to active — bypassing approval card
+            self._set_status(call_id, "approved")
+            self._start_call(call_id)
+            return self._load(call_id) or call  # type: ignore[return-value]
+
         if self.approvals is None:
             raise RuntimeError("CallSubsystem.approvals not attached")
 
@@ -401,48 +461,64 @@ class CallSubsystem:
     # -- prompts / schemas (§8.3 / §8.5) -----------------------------------
 
     def _supplier_system_prompt(self, call: Call) -> str:
-        """Market Spectator goal: lower the unit price / better terms, opening
-        with current price context, polite and businesslike (§8.3)."""
-        context = ""
+        """Market Spectator goal: lower the unit price / better terms (§8.3).
+        Delegates to call_personas.supplier_negotiation_prompt for a richer,
+        worked-example prompt shared by both text and live-voice calls.
+        """
+        supplier_name = f"Supplier #{call.counterparty_id}"
+        ingredient_name = "the target ingredient"
+        current_price = 0.0
+        unit = "unit"
         session = self.db_session_factory()
         try:
+            from .models import Ingredient as _Ingredient  # noqa: PLC0415
             supplier = session.get(Supplier, call.counterparty_id)
             if supplier is not None:
-                context = f" You are speaking with {supplier.name}."
-                cat = (
-                    session.query(SupplierCatalog)
-                    .filter(SupplierCatalog.supplier_id == supplier.id)
-                    .first()
-                )
-                if cat is not None:
-                    context += (
-                        f" Current price is {cat.current_price} per {cat.unit}."
-                    )
+                supplier_name = supplier.name
+            cat = (
+                session.query(SupplierCatalog)
+                .filter(SupplierCatalog.supplier_id == call.counterparty_id)
+                .first()
+            )
+            if cat is not None:
+                current_price = float(cat.current_price or 0.0)
+                unit = str(cat.unit or "unit")
+                ing = session.get(_Ingredient, cat.ingredient_id)
+                if ing is not None:
+                    ingredient_name = ing.name
         finally:
             session.close()
-        return (
-            "You are a restaurant's purchasing agent on a supplier call. Your "
-            "goal is to lower the unit price and/or secure better terms for a "
-            "target ingredient. Stay polite and businesslike, and close by "
-            "confirming the agreed number." + context
+        return call_personas.supplier_negotiation_prompt(
+            supplier_name=supplier_name,
+            ingredient_name=ingredient_name,
+            current_price=current_price,
+            unit=unit,
         )
 
     def _competitor_system_prompt(self, call: Call) -> str:
-        """Competitor Intelligence persona: an ordinary customer asking which
-        dish is most popular; never reveals research intent (§8.1 / §8.3)."""
-        context = ""
+        """Competitor Intelligence persona (§8.1 / §8.3).
+        Delegates to call_personas.competitor_intel_prompt so text calls and
+        live-voice calls share the same rich, example-backed persona.
+        """
+        competitor_name = f"the restaurant"
+        cuisine = ""
+        distance_km = 0.0
         session = self.db_session_factory()
         try:
             competitor = session.get(Competitor, call.counterparty_id)
             if competitor is not None:
-                context = f" You are calling {competitor.name}."
+                competitor_name = competitor.name
+                if isinstance(competitor.cuisine, list) and competitor.cuisine:
+                    cuisine = competitor.cuisine[0]
+                elif isinstance(competitor.cuisine, str):
+                    cuisine = competitor.cuisine
+                distance_km = float(competitor.distance_km or 0.0)
         finally:
             session.close()
-        return (
-            "You are a regular customer calling a restaurant. Politely ask what "
-            "their most popular / customer-favourite dish is, and prices if it "
-            "comes up naturally. Keep it to 2–4 short questions. Never reveal "
-            "that you are doing research or that you are an AI." + context
+        return call_personas.competitor_intel_prompt(
+            competitor_name=competitor_name,
+            cuisine=cuisine,
+            distance_km=distance_km,
         )
 
     @staticmethod

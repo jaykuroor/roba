@@ -55,6 +55,37 @@ from .config import GEMINI_LIVE_MODEL
 
 logger = logging.getLogger(__name__)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-call hint queues (populated by POST /api/calls/{id}/hint).
+# Key = call_id.  The live bridge drains each queue and injects coaching hints
+# as silent context messages to the Gemini session.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_call_hint_queues: Dict[int, "asyncio.Queue[str]"] = {}
+
+
+def register_call_session(call_id: int) -> "asyncio.Queue[str]":
+    """Register a hint queue for an active call session. Returns the queue."""
+    q: "asyncio.Queue[str]" = asyncio.Queue()
+    _call_hint_queues[call_id] = q
+    return q
+
+
+def enqueue_call_hint(call_id: int, text: str) -> bool:
+    """Enqueue a spectator coaching hint. Returns False if no session registered."""
+    q = _call_hint_queues.get(call_id)
+    if q is not None:
+        q.put_nowait(text)
+        return True
+    return False
+
+
+def unregister_call_session(call_id: int) -> None:
+    """Remove the hint queue for a call session (called on bridge teardown)."""
+    _call_hint_queues.pop(call_id, None)
+
+
 _RESPONSE_TIMEOUT_S = 20.0
 _CONNECT_TIMEOUT_S = 10.0
 _RESUME_BACKOFF_S = (1.0, 2.0, 4.0)   # per-attempt wait before retrying a resume
@@ -675,6 +706,23 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "When using consult_reasoner, say a short filler ('Let me think on that...') before calling.\n\n"
         + _FEW_SHOTS
     ),
+    # Call-bound roles: system instruction is built dynamically from call_personas
+    # when call_id is set.  These static stubs serve as fallbacks only.
+    "supplier_call": (
+        "You are Roba, calling a supplier as the restaurant purchasing agent. "
+        "Your goal is to negotiate a lower unit price and/or better delivery terms. "
+        "You placed this call -- speak first with a professional greeting."
+    ),
+    "competitor_call": (
+        "You are Roba, posing as a regular curious customer calling a restaurant. "
+        "Learn about their popular dishes, prices, and specials without revealing "
+        "that you represent a competing restaurant."
+    ),
+    "onboarding_call": (
+        "You are Roba, welcoming a new potential supplier on their first call. "
+        "Gather their full catalog: ingredients, prices, pack sizes, minimums, "
+        "delivery charge, and lead time. You placed this call -- speak first."
+    ),
     "cook": (
         "You are Roba, the AI kitchen desk. Concise kitchen-friendly replies (1-2 sentences max).\n\n"
         "CORE RULES:\n"
@@ -715,6 +763,8 @@ async def live_bridge(
     mic_mode: str = "ptt",
     model: Optional[str] = None,
     voice_actions: Optional[Any] = None,
+    call_id: Optional[int] = None,
+    calls: Optional[Any] = None,
 ) -> None:
     """Bridge a client WebSocket to a Vertex AI Live session.
 
@@ -758,6 +808,56 @@ async def live_bridge(
         live_model = model
 
     system_instruction = _SYSTEM_INSTRUCTIONS.get(role, _SYSTEM_INSTRUCTIONS["manager"])
+
+    # For call-bound roles, build a richer dynamic persona from the DB.
+    if call_id is not None and calls is not None and role in ("supplier_call", "competitor_call", "onboarding_call"):
+        try:
+            from . import call_personas as _cp  # noqa: PLC0415
+            from .models import Supplier as _Supplier, SupplierCatalog as _SCat  # noqa: PLC0415
+            from .models import Competitor as _Competitor, Ingredient as _Ing  # noqa: PLC0415
+            _call = calls._load(call_id)
+            if _call is not None:
+                _db_sess = voice_processor.db_session_factory()
+                try:
+                    if role == "supplier_call":
+                        _sup = _db_sess.get(_Supplier, _call.counterparty_id)
+                        _cat = (
+                            _db_sess.query(_SCat)
+                            .filter(_SCat.supplier_id == _call.counterparty_id)
+                            .first()
+                        )
+                        _ing = _db_sess.get(_Ing, _cat.ingredient_id) if _cat else None
+                        system_instruction = _cp.supplier_negotiation_prompt(
+                            supplier_name=_sup.name if _sup else f"Supplier #{_call.counterparty_id}",
+                            ingredient_name=_ing.name if _ing else "the ingredient",
+                            current_price=float(_cat.current_price or 0.0) if _cat else 0.0,
+                            unit=str(_cat.unit or "unit") if _cat else "unit",
+                        )
+                    elif role == "competitor_call":
+                        _comp = _db_sess.get(_Competitor, _call.counterparty_id)
+                        _cuisine = ""
+                        _dist = 0.0
+                        if _comp:
+                            if isinstance(_comp.cuisine, list) and _comp.cuisine:
+                                _cuisine = _comp.cuisine[0]
+                            elif isinstance(_comp.cuisine, str):
+                                _cuisine = _comp.cuisine
+                            _dist = float(_comp.distance_km or 0.0)
+                        system_instruction = _cp.competitor_intel_prompt(
+                            competitor_name=_comp.name if _comp else f"Restaurant #{_call.counterparty_id}",
+                            cuisine=_cuisine,
+                            distance_km=_dist,
+                        )
+                    elif role == "onboarding_call":
+                        _sup = _db_sess.get(_Supplier, _call.counterparty_id)
+                        system_instruction = _cp.supplier_onboarding_prompt(
+                            supplier_name=_sup.name if _sup else f"Supplier #{_call.counterparty_id}",
+                            phone=str(_sup.phone or "") if _sup else "",
+                        )
+                finally:
+                    _db_sess.close()
+        except Exception as _persona_exc:  # noqa: BLE001
+            logger.warning("call_personas build failed: %s", _persona_exc)
 
     # Slim injected context: just key numbers so the model uses tools for details.
     try:
@@ -843,17 +943,52 @@ async def live_bridge(
         bridge.resume_wanted = False
         fail_streak = 0
 
+        # For call-bound sessions, register the hint queue and inject an opener.
+        if call_id is not None:
+            hint_queue = register_call_session(call_id)
+            try:
+                await session.send_client_content(
+                    turns={"parts": [{"text": "(Begin the call now. You called them -- speak first with a professional greeting and state your purpose.)"}]},
+                    turn_complete=True,
+                )
+            except Exception as _oe:  # noqa: BLE001
+                logger.warning("call opener inject failed: %s", _oe)
+        else:
+            hint_queue = None
+
+        async def _drain_hints(s: Any, hq: Any) -> None:
+            """Drain the hint queue and inject each hint as a silent coaching note."""
+            try:
+                while True:
+                    hint = await hq.get()
+                    try:
+                        await s.send_client_content(
+                            turns={"parts": [{"text": f"(Coaching note from your manager -- internalize this but do NOT say it aloud: {hint})"}]},
+                            turn_complete=False,
+                        )
+                    except Exception as _he:  # noqa: BLE001
+                        logger.warning("hint inject failed: %s", _he)
+            except asyncio.CancelledError:
+                pass
+
         try:
             task_c2g = asyncio.create_task(
-                _client_to_gemini(websocket, session, voice_processor, voice_actions, buffers, bridge),
+                _client_to_gemini(websocket, session, voice_processor, voice_actions, buffers, bridge, call_id=call_id),
                 name="voice_live_c2g",
             )
             task_g2c = asyncio.create_task(
-                _gemini_to_client(websocket, session, voice_processor, role, mode, voice_actions, buffers, bridge),
+                _gemini_to_client(websocket, session, voice_processor, role, mode, voice_actions, buffers, bridge, call_id=call_id, calls=calls),
                 name="voice_live_g2c",
             )
+            all_tasks: list = [task_c2g, task_g2c]
+            if hint_queue is not None:
+                task_hints = asyncio.create_task(
+                    _drain_hints(session, hint_queue),
+                    name="voice_live_hints",
+                )
+                all_tasks.append(task_hints)
             done, pending = await asyncio.wait(
-                [task_c2g, task_g2c], return_when=asyncio.FIRST_COMPLETED
+                all_tasks, return_when=asyncio.FIRST_COMPLETED
             )
             for t in pending:
                 t.cancel()
@@ -891,10 +1026,24 @@ async def live_bridge(
         # Genuine error (already surfaced to the client) — stop the loop.
         break
 
+    # ── Call teardown: end the call row and unregister hint queue. ────────────
+    if call_id is not None:
+        try:
+            if calls is not None:
+                _loaded = calls._load(call_id)
+                if _loaded is not None and _loaded.status == "active":
+                    calls.end_call(call_id)
+        except Exception as _td_exc:  # noqa: BLE001
+            logger.warning("call teardown end_call failed: %s", _td_exc)
+        finally:
+            unregister_call_session(call_id)
+
 
 async def _client_to_gemini(
     websocket: Any, session: Any, voice_processor: Any, voice_actions: Optional[Any],
     buffers: "_TurnBuffer", bridge: "_BridgeState",
+    *,
+    call_id: Optional[int] = None,
 ) -> None:
     """Read frames from the browser WS and relay to the Live session."""
     from google.genai import types as _gtypes
@@ -936,6 +1085,11 @@ async def _client_to_gemini(
                             turns={"parts": [{"text": text}]},
                             turn_complete=True,
                         )
+                elif msg_type == "spectator_hint":
+                    # Manager on the same tab injects a coaching hint.
+                    hint_text = str(msg.get("text") or "")
+                    if hint_text and call_id is not None:
+                        enqueue_call_hint(call_id, hint_text)
                 elif msg_type in ("confirm_plan", "cancel_plan"):
                     # Confirm/Cancel buttons from the browser UI.
                     plan_id = str(msg.get("plan_id") or "")
@@ -1062,8 +1216,20 @@ async def _emit_partial(websocket: Any, role: str, buffers: "_TurnBuffer") -> No
         })
 
 
-async def _flush_transcript(websocket: Any, role: str, buffers: "_TurnBuffer") -> None:
-    """Emit the buffered text as a FINAL transcript line."""
+async def _flush_transcript(
+    websocket: Any,
+    role: str,
+    buffers: "_TurnBuffer",
+    *,
+    call_id: Optional[int] = None,
+    calls: Optional[Any] = None,
+) -> None:
+    """Emit the buffered text as a FINAL transcript line.
+
+    When ``call_id`` is set, also mirrors the turn to ``calls.add_turn``:
+    ``role="user"`` maps to ``"counterparty"`` (the human on the mic) and
+    ``role="roba"`` maps to ``"agent"`` (Roba's spoken output).
+    """
     text = buffers.take(role)
     if text:
         await _safe_send_json(websocket, {
@@ -1073,6 +1239,13 @@ async def _flush_transcript(websocket: Any, role: str, buffers: "_TurnBuffer") -
             "turn_id": buffers.turn_id(role),
             "final": True,
         })
+        if call_id is not None and calls is not None:
+            call_role = "counterparty" if role == "user" else "agent"
+            try:
+                import asyncio as _asyncio  # noqa: PLC0415
+                await _asyncio.to_thread(calls.add_turn, call_id, call_role, text)
+            except Exception as _mt_exc:  # noqa: BLE001
+                logger.warning("calls.add_turn mirror failed: %s", _mt_exc)
 
 
 def _merge_transcript_chunk(buf: list, incoming: str) -> None:
@@ -1112,6 +1285,9 @@ async def _gemini_to_client(
     voice_actions: Optional[Any],
     buffers: "_TurnBuffer",
     bridge: "_BridgeState",
+    *,
+    call_id: Optional[int] = None,
+    calls: Optional[Any] = None,
 ) -> None:
     """Read from the Vertex AI Live session and relay audio/events to the browser."""
     from google.genai import types as _gtypes
@@ -1124,6 +1300,7 @@ async def _gemini_to_client(
                         await _handle_chunk(
                             chunk, websocket, session, voice_processor,
                             role, mode, _gtypes, buffers, voice_actions, bridge,
+                            call_id=call_id, calls=calls,
                         )
             except asyncio.TimeoutError:
                 logger.debug("Vertex AI Live idle (no output in %.0fs)", _RESPONSE_TIMEOUT_S)
@@ -1161,6 +1338,9 @@ async def _handle_chunk(
     buffers: "_TurnBuffer",
     voice_actions: Optional[Any],
     bridge: "_BridgeState",
+    *,
+    call_id: Optional[int] = None,
+    calls: Optional[Any] = None,
 ) -> None:
     """Process one LiveServerMessage chunk."""
     # ── Session lifecycle events ─────────────────────────────────────────────
@@ -1215,15 +1395,15 @@ async def _handle_chunk(
             # whatever text had arrived so far ("do we" instead of the full
             # utterance).  The user turn is finalized exclusively on
             # turn_complete (or interrupted for barge-in).
-            await _flush_transcript(websocket, "roba", buffers)
+            await _flush_transcript(websocket, "roba", buffers, call_id=call_id, calls=calls)
         if getattr(sc, "interrupted", False):
-            await _flush_transcript(websocket, "roba", buffers)
+            await _flush_transcript(websocket, "roba", buffers, call_id=call_id, calls=calls)
             await _safe_send_json(websocket, {"type": "interrupted"})
         if getattr(sc, "turn_complete", False):
-            await _flush_transcript(websocket, "roba", buffers)
+            await _flush_transcript(websocket, "roba", buffers, call_id=call_id, calls=calls)
             # In conversation mode, finalize user turn here (PTT already finalized on activity_end)
             if buffers._user_open:
-                await _flush_transcript(websocket, "user", buffers)
+                await _flush_transcript(websocket, "user", buffers, call_id=call_id, calls=calls)
                 buffers.close_user_turn()
             await _safe_send_json(websocket, {"type": "turn_complete"})
 

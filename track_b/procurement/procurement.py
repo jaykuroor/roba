@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from core import config
 from core.events import log_event as core_log_event
-from core.models import EventLog, PurchaseOrder, PurchaseOrderLine, Supplier
+from core.models import EventLog, InventoryOptimizerMemory, PurchaseOrder, PurchaseOrderLine, Supplier
 from core.signals import SignalType
 
 
@@ -202,11 +202,14 @@ class Procurement:
     # -- delivery (§B4.4) -----------------------------------------------------
 
     def _deliver(self, po_id: int) -> None:
+        now = self.sim_time
         session = self.db_session_factory()
         try:
             po = session.get(PurchaseOrder, po_id)
             if po is None or po.status != "placed":
                 return
+            supplier_id = po.supplier_id
+            expected = float(po.expected_delivery or now)
             po.status = "delivered"
             session.commit()
         finally:
@@ -216,3 +219,60 @@ class Procurement:
         self.log_event(
             "po_delivered", f"PO #{po_id} delivered.", {"po_id": po_id}
         )
+
+        # Track late deliveries for sourcing reliability scoring.
+        late_by = now - expected
+        if late_by > 3600.0:  # >1 sim-hour grace period
+            self._record_supplier_reliability(supplier_id, late_by, now)
+
+    def _record_supplier_reliability(
+        self, supplier_id: int, late_by: float, now: float
+    ) -> None:
+        """Update InventoryOptimizerMemory with rolling late-delivery stats."""
+        scope_ref = str(supplier_id)
+        session = self.db_session_factory()
+        try:
+            existing = (
+                session.query(InventoryOptimizerMemory)
+                .filter(
+                    InventoryOptimizerMemory.scope_type == "supplier",
+                    InventoryOptimizerMemory.scope_ref == scope_ref,
+                )
+                .first()
+            )
+            if existing is not None and isinstance(existing.insight, dict):
+                prev = existing.insight
+                late_count = int(prev.get("late_delivery_count", 0)) + 1
+                total_late = float(prev.get("total_late_seconds", 0.0)) + late_by
+                # Reliability score: simple exponential decay — each late delivery
+                # reduces reliability by ~10%, min 0.1.
+                reliability = max(0.1, float(prev.get("reliability_score", 1.0)) * 0.90)
+                existing.insight = {
+                    "late_delivery_count": late_count,
+                    "total_late_seconds": total_late,
+                    "last_late_at": now,
+                    "reliability_score": round(reliability, 3),
+                }
+                existing.last_seen_at = now
+            else:
+                session.add(InventoryOptimizerMemory(
+                    scope_type="supplier",
+                    scope_ref=scope_ref,
+                    insight={
+                        "late_delivery_count": 1,
+                        "total_late_seconds": late_by,
+                        "last_late_at": now,
+                        "reliability_score": 0.90,
+                    },
+                    evidence=None,
+                    confidence=0.9,
+                    created_at=now,
+                    last_seen_at=now,
+                    valid_until=None,
+                    source="procurement",
+                ))
+            session.commit()
+        except Exception:
+            session.rollback()
+        finally:
+            session.close()

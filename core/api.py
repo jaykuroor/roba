@@ -1921,6 +1921,259 @@ def call_end(call_id: int) -> Dict[str, Any]:
     return {"call_id": call_id, "outcome": outcome}
 
 
+# ---------------------------------------------------------------------------
+# Call overhaul — new call/hint/parties endpoints
+# ---------------------------------------------------------------------------
+
+class StartCallBody(BaseModel):
+    counterparty_type: str          # "supplier" | "competitor"
+    counterparty_id: int
+    purpose: str = ""
+    agent: str = "user"
+
+
+class CallHintBody(BaseModel):
+    text: str
+
+
+@app.post("/api/calls")
+def start_call(body: StartCallBody) -> Dict[str, Any]:
+    """Start a call immediately (user-initiated; no approval card).
+
+    Returns ``{call_id, status, counterparty_type, counterparty_id}`` so the
+    browser can open ``/call?call_id=<id>`` in a new tab straight away.
+    """
+    _sync_bus_to_clock()
+    call = ctx.calls.start_direct(
+        agent=body.agent,
+        counterparty_type=body.counterparty_type,
+        counterparty_id=body.counterparty_id,
+        purpose=body.purpose or f"User-initiated {body.counterparty_type} call",
+    )
+    return {
+        "call_id": call.id,
+        "status": call.status,
+        "counterparty_type": call.counterparty_type,
+        "counterparty_id": call.counterparty_id,
+    }
+
+
+@app.post("/api/calls/{call_id}/hint")
+def call_hint(call_id: int, body: CallHintBody) -> Dict[str, Any]:
+    """Enqueue a spectator coaching hint into the active live session."""
+    from .voice_live import enqueue_call_hint
+    queued = enqueue_call_hint(call_id, body.text)
+    return {"call_id": call_id, "queued": queued}
+
+
+@app.get("/api/presets/current/parties")
+def get_current_parties(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Return suppliers + competitors from the current restaurant preset.
+
+    Used by the call page's direct-open chooser so the user can pick which
+    party to role-play as.
+    """
+    suppliers = db_session.query(models.Supplier).order_by(models.Supplier.name).all()
+    competitors = db_session.query(models.Competitor).order_by(models.Competitor.name).all()
+    return {
+        "suppliers": [
+            {"id": s.id, "name": s.name, "phone": s.phone, "contact": s.contact,
+             "delivery_charge": s.delivery_charge}
+            for s in suppliers
+        ],
+        "competitors": [
+            {"id": c.id, "name": c.name, "cuisine": c.cuisine,
+             "distance_km": c.distance_km, "rating": c.rating, "is_open": c.is_open}
+            for c in competitors
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Manager changes
+# ---------------------------------------------------------------------------
+
+def _change_to_dict(c: models.ManagerChange) -> Dict[str, Any]:
+    return {
+        "id": c.id,
+        "kind": c.kind,
+        "status": c.status,
+        "auto_applied": bool(c.auto_applied),
+        "summary": c.summary,
+        "details": c.details,
+        "created_at": c.created_at,
+        "resolved_at": c.resolved_at,
+    }
+
+
+@app.get("/api/manager/changes")
+def list_manager_changes(
+    status: Optional[str] = Query(None),
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    """Return manager change cards (for Manager Roba Desk)."""
+    q = db_session.query(models.ManagerChange).order_by(
+        models.ManagerChange.created_at.desc()
+    )
+    if status:
+        q = q.filter(models.ManagerChange.status == status)
+    return [_change_to_dict(c) for c in q.all()]
+
+
+def _apply_change_to_db(change: models.ManagerChange, db_session: Any, direction: str = "after") -> None:
+    """Write ``details[direction]`` state back to supplier tables."""
+    details = change.details or {}
+    state = details.get(direction, {})
+    supplier_id = details.get("supplier_id")
+    ingredient_id = details.get("ingredient_id")
+
+    if change.kind in ("call_price", "sourcing_default"):
+        if ingredient_id is not None and supplier_id is not None:
+            # Update is_default for sourcing_default changes
+            if change.kind == "sourcing_default":
+                new_default = state.get("supplier_id", supplier_id)
+                # Clear existing defaults for this ingredient
+                db_session.query(models.SupplierCatalog).filter(
+                    models.SupplierCatalog.ingredient_id == ingredient_id
+                ).update({models.SupplierCatalog.is_default: 0})
+                # Set new default
+                db_session.query(models.SupplierCatalog).filter(
+                    models.SupplierCatalog.supplier_id == new_default,
+                    models.SupplierCatalog.ingredient_id == ingredient_id,
+                ).update({models.SupplierCatalog.is_default: 1})
+            # Update price for call_price changes
+            if change.kind == "call_price":
+                new_price = state.get("price")
+                if new_price is not None and ingredient_id and supplier_id:
+                    db_session.query(models.SupplierCatalog).filter(
+                        models.SupplierCatalog.supplier_id == supplier_id,
+                        models.SupplierCatalog.ingredient_id == ingredient_id,
+                    ).update({models.SupplierCatalog.current_price: float(new_price)})
+    elif change.kind == "onboarding":
+        # Apply / revert catalog entries from the onboarding outcome
+        entries = state.get("catalog_entries", [])
+        for entry in entries:
+            s_id = entry.get("supplier_id") or supplier_id
+            i_id = entry.get("ingredient_id")
+            if not s_id or not i_id:
+                continue
+            existing = db_session.query(models.SupplierCatalog).filter(
+                models.SupplierCatalog.supplier_id == s_id,
+                models.SupplierCatalog.ingredient_id == i_id,
+            ).first()
+            if direction == "after":
+                if existing:
+                    existing.current_price = float(entry.get("price", existing.current_price))
+                    existing.availability = entry.get("availability", existing.availability)
+                else:
+                    db_session.add(models.SupplierCatalog(
+                        supplier_id=s_id, ingredient_id=i_id,
+                        current_price=float(entry.get("price", 1.0)),
+                        unit=entry.get("unit", "g"),
+                        pack_size=float(entry.get("pack_size", 1.0)),
+                        availability=entry.get("availability", "in_stock"),
+                        updated_at=0.0, is_default=0,
+                    ))
+            else:  # revert ("before") — remove added entries
+                if existing:
+                    db_session.delete(existing)
+
+
+@app.post("/api/manager/changes/{change_id}/apply")
+def apply_manager_change(change_id: int, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Apply a pending manager change to the catalog."""
+    change = db_session.get(models.ManagerChange, change_id)
+    if change is None:
+        raise HTTPException(status_code=404, detail=f"Change {change_id} not found")
+    if change.status not in ("pending",):
+        raise HTTPException(status_code=409, detail=f"Change is already {change.status}")
+    now = float(ctx.bus.sim_time) if hasattr(ctx, "bus") else 0.0
+    _apply_change_to_db(change, db_session, "after")
+    change.status = "applied"
+    change.resolved_at = now
+    db_session.commit()
+    ctx.hub.broadcast("manager_change", _change_to_dict(change))
+    return _change_to_dict(change)
+
+
+@app.post("/api/manager/changes/{change_id}/revert")
+def revert_manager_change(change_id: int, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Revert an applied manager change."""
+    change = db_session.get(models.ManagerChange, change_id)
+    if change is None:
+        raise HTTPException(status_code=404, detail=f"Change {change_id} not found")
+    if change.status not in ("applied",):
+        raise HTTPException(status_code=409, detail=f"Cannot revert change with status {change.status!r}")
+    now = float(ctx.bus.sim_time) if hasattr(ctx, "bus") else 0.0
+    _apply_change_to_db(change, db_session, "before")
+    change.status = "reverted"
+    change.resolved_at = now
+    db_session.commit()
+    ctx.hub.broadcast("manager_change", _change_to_dict(change))
+    return _change_to_dict(change)
+
+
+@app.post("/api/manager/changes/{change_id}/dismiss")
+def dismiss_manager_change(change_id: int, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Dismiss a pending manager change without applying it."""
+    change = db_session.get(models.ManagerChange, change_id)
+    if change is None:
+        raise HTTPException(status_code=404, detail=f"Change {change_id} not found")
+    now = float(ctx.bus.sim_time) if hasattr(ctx, "bus") else 0.0
+    change.status = "dismissed"
+    change.resolved_at = now
+    db_session.commit()
+    ctx.hub.broadcast("manager_change", _change_to_dict(change))
+    return _change_to_dict(change)
+
+
+# ---------------------------------------------------------------------------
+# Auto-apply setting
+# ---------------------------------------------------------------------------
+
+class AutoApplyBody(BaseModel):
+    auto_apply: bool
+
+
+@app.get("/api/settings/auto-apply")
+def get_auto_apply(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Return the current auto-apply-supplier-changes setting."""
+    settings = db_session.get(models.AppSettings, 1)
+    enabled = bool(settings.auto_apply_supplier_changes) if settings else False
+    return {"auto_apply": enabled}
+
+
+@app.post("/api/settings/auto-apply")
+def set_auto_apply(body: AutoApplyBody, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Toggle auto-apply-supplier-changes."""
+    settings = db_session.get(models.AppSettings, 1)
+    if settings is None:
+        settings = models.AppSettings(id=1, auto_apply_supplier_changes=int(body.auto_apply))
+        db_session.add(settings)
+    else:
+        settings.auto_apply_supplier_changes = int(body.auto_apply)
+    db_session.commit()
+    ctx.hub.broadcast("auto_apply_changed", {"auto_apply": body.auto_apply})
+    return {"auto_apply": body.auto_apply}
+
+
+# ---------------------------------------------------------------------------
+# Sourcing run endpoint (trigger on-demand)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/track-b/optimizer/sourcing/run")
+def run_sourcing_plan() -> Dict[str, Any]:
+    """Trigger an immediate sourcing solve (on-demand from Control)."""
+    optimizer = (ctx.tracks.get("track_b") or {}).get("optimizer")
+    if optimizer is None:
+        raise HTTPException(status_code=503, detail="Optimizer not active")
+    try:
+        optimizer.run_sourcing_plan()
+        return {"status": "ok"}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 class NegotiateBody(BaseModel):
     supplier_id: int
     ingredient_id: int
@@ -2095,6 +2348,7 @@ async def voice_live_endpoint(
     mode: str = Query("confirm"),
     mic_mode: str = Query("ptt"),
     model: Optional[str] = Query(None),
+    call_id: Optional[int] = Query(None),
 ) -> None:
     """Gemini Live API bridge (Stream B5).
 
@@ -2105,6 +2359,8 @@ async def voice_live_endpoint(
                             explicit activity_start / activity_end frames.
     mic_mode="conversation" Default automatic VAD; Gemini detects turn ends.
     model=<id>              Override the live model (validated against allowlist).
+    call_id=<int>           When set, bridges a specific call row — uses the
+                            call-bound persona and mirrors turns to calls.add_turn.
     """
     await websocket.accept()
     try:
@@ -2117,6 +2373,8 @@ async def voice_live_endpoint(
             mic_mode=mic_mode,
             model=model,
             voice_actions=ctx.voice_actions,
+            call_id=call_id,
+            calls=ctx.calls,
         )
     except Exception:  # noqa: BLE001
         logger.exception("voice live endpoint error")
