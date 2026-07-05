@@ -1291,6 +1291,13 @@ def read_competitor_intel(
     return [_row_to_dict(r) for r in query.order_by(models.CompetitorIntel.sim_time.asc()).all()]
 
 
+@app.get("/api/calls/active")
+def read_active_call(db_session: Any = Depends(db.get_db)) -> Optional[Dict[str, Any]]:
+    """Return the single status='active' Call (with transcript), or null."""
+    row = db_session.query(models.Call).filter(models.Call.status == "active").first()
+    return _row_to_dict(row) if row is not None else None
+
+
 @app.get("/api/calls")
 def read_calls(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
     return [_row_to_dict(r) for r in db_session.query(models.Call).all()]

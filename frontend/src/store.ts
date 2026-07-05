@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { apiGet } from "./api";
 import type { ApprovalRequest, Call, CallTurn, ManagerChange, SimState, Weather } from "./types";
 
 // A tiny Zustand-style external store: a single mutable state object, a set of
@@ -100,6 +101,21 @@ export const actions = {
 
   endCall(): void {
     setState({ activeCall: null, callTurns: [] });
+  },
+
+  /** Fetch the currently-active call from the server and sync the store.
+   *  Called on socket open/reconnect so late-joining surfaces show the
+   *  indicator even when they missed the `call_started` WS event. */
+  hydrateActiveCall(): void {
+    apiGet<Call | null>("/api/calls/active")
+      .then((call) => {
+        if (call) {
+          actions.startCall(call);
+        } else if (state.activeCall !== null) {
+          actions.endCall();
+        }
+      })
+      .catch(() => undefined);
   },
 
   appendCallTurn(turn: CallTurn): void {

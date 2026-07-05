@@ -69,6 +69,9 @@ export class WsClient {
         return;
       }
       actions.setWsConnected(true);
+      // Hydrate active call so late-joining tabs show the indicator even when
+      // they missed the fire-and-forget `call_started` event.
+      actions.hydrateActiveCall();
     };
 
     socket.onmessage = (ev: MessageEvent) => {

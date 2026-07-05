@@ -539,11 +539,10 @@ export function ManagerVoice() {
 
   // Connect the operator WS so the desk receives call_started / call_ended /
   // manager_change events and the ActiveCallCard lights up — mirroring MenuPage.
+  // Do NOT call wsClient.close() on unmount: wsClient is a global singleton with
+  // no refcounting; closing it here suppresses auto-reconnect for every other tab.
   useEffect(() => {
     wsClient.connect();
-    return () => {
-      wsClient.close();
-    };
   }, []);
 
   useEffect(() => {
