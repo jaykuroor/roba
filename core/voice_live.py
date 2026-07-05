@@ -758,6 +758,21 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "Gather their full catalog: ingredients, prices, pack sizes, minimums, "
         "delivery charge, and lead time. You placed this call -- speak first."
     ),
+    # Inbound roles: a supplier or competitor calls the restaurant; Roba answers
+    # as the manager.  Dynamic persona built from inbound_supplier_prompt /
+    # inbound_competitor_prompt when call_id is set; these stubs are fallbacks.
+    "inbound_supplier_call": (
+        "You are the restaurant manager. A supplier is calling you. "
+        "Answer the phone, identify your restaurant, and listen to what they have to say. "
+        "Restate any key facts (new prices, delays) to confirm them. "
+        "Do NOT make purchasing commitments."
+    ),
+    "inbound_competitor_call": (
+        "You are the restaurant manager. A competitor or industry contact is calling you. "
+        "Answer professionally, identify your restaurant, and listen to their message. "
+        "Restate key facts to confirm them. "
+        "Do NOT reveal sensitive internal information."
+    ),
     "cook": (
         "You are Roba, the AI kitchen desk. Concise kitchen-friendly replies (1-2 sentences max).\n\n"
         "CORE RULES:\n"
@@ -845,7 +860,8 @@ async def live_bridge(
     system_instruction = _SYSTEM_INSTRUCTIONS.get(role, _SYSTEM_INSTRUCTIONS["manager"])
 
     # For call-bound roles, build a richer dynamic persona from the DB.
-    if call_id is not None and calls is not None and role in ("supplier_call", "competitor_call", "onboarding_call"):
+    _CALL_ROLES = ("supplier_call", "competitor_call", "onboarding_call", "inbound_supplier_call", "inbound_competitor_call")
+    if call_id is not None and calls is not None and role in _CALL_ROLES:
         try:
             from . import call_personas as _cp  # noqa: PLC0415
             from .models import (  # noqa: PLC0415
@@ -931,6 +947,21 @@ async def live_bridge(
                         system_instruction = _cp.supplier_onboarding_prompt(
                             supplier_name=_sup.name if _sup else f"Supplier #{_call.counterparty_id}",
                             phone=str(_sup.phone or "") if _sup else "",
+                            restaurant_title=_identity["title"],
+                            restaurant_location=_identity["location"],
+                        )
+                    elif role == "inbound_supplier_call":
+                        _sup = _db_sess.get(_Supplier, _call.counterparty_id)
+                        system_instruction = _cp.inbound_supplier_prompt(
+                            supplier_name=_sup.name if _sup else f"Supplier #{_call.counterparty_id}",
+                            phone=str(_sup.phone or "") if _sup else "",
+                            restaurant_title=_identity["title"],
+                            restaurant_location=_identity["location"],
+                        )
+                    elif role == "inbound_competitor_call":
+                        _comp = _db_sess.get(_Competitor, _call.counterparty_id)
+                        system_instruction = _cp.inbound_competitor_prompt(
+                            competitor_name=_comp.name if _comp else f"Restaurant #{_call.counterparty_id}",
                             restaurant_title=_identity["title"],
                             restaurant_location=_identity["location"],
                         )
@@ -1027,8 +1058,18 @@ async def live_bridge(
         if call_id is not None:
             hint_queue = register_call_session(call_id)
             try:
+                _inbound_roles = ("inbound_supplier_call", "inbound_competitor_call")
+                if role in _inbound_roles:
+                    _opener_text = (
+                        "(The phone is ringing -- you are the restaurant manager and a caller is coming through. "
+                        "Answer with a brief professional greeting identifying your restaurant, then wait for the caller to explain why they rang.)"
+                    )
+                else:
+                    _opener_text = (
+                        "(Begin the call now. You called them -- speak first with a professional greeting and state your purpose.)"
+                    )
                 await session.send_client_content(
-                    turns={"parts": [{"text": "(Begin the call now. You called them -- speak first with a professional greeting and state your purpose.)"}]},
+                    turns={"parts": [{"text": _opener_text}]},
                     turn_complete=True,
                 )
             except Exception as _oe:  # noqa: BLE001

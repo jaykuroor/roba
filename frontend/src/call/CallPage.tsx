@@ -40,12 +40,18 @@ function roleLabel(role: string): string {
   if (role === "supplier_call") return "Supplier";
   if (role === "competitor_call") return "Competitor";
   if (role === "onboarding_call") return "New Supplier";
+  if (role === "inbound_supplier_call") return "Supplier";
+  if (role === "inbound_competitor_call") return "Competitor";
   return "Counterparty";
 }
 
 function roleBanner(role: string, partyName?: string): string {
   if (role === "onboarding_call") return `Roba is welcoming ${partyName ?? "the new supplier"}`;
   if (role === "competitor_call") return `Roba is gathering intel on ${partyName ?? "the competitor"}`;
+  if (role === "inbound_supplier_call")
+    return `You are calling as ${partyName ?? "the supplier"} — Roba answers as the restaurant manager`;
+  if (role === "inbound_competitor_call")
+    return `You are calling as ${partyName ?? "the competitor"} — Roba answers as the restaurant manager`;
   return `Roba is negotiating with ${partyName ?? "the supplier"}`;
 }
 
@@ -119,16 +125,18 @@ function PartyChooser({ onSelect }: PartyChooserProps) {
   return (
     <div className="flex flex-col gap-5">
       <div className="text-center">
-        <h2 className="text-xl font-bold text-text">Who are you calling?</h2>
+        <h2 className="text-xl font-bold text-text">Call the restaurant</h2>
         <p className="mt-1 text-sm text-text/50">
-          Select a supplier or competitor. Roba will drive the call — you play the counterparty.
+          You play the supplier or competitor phoning in — Roba answers as the restaurant
+          manager. Use this to simulate inbound calls: announce a price change, a delivery
+          delay, new menu intel, or anything you'd want the restaurant to know.
         </p>
       </div>
 
       {suppliers.length > 0 && (
         <section>
           <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-text/40">
-            Suppliers
+            Call as a supplier
           </p>
           <div className="grid gap-2">
             {suppliers.map((s) => (
@@ -156,7 +164,7 @@ function PartyChooser({ onSelect }: PartyChooserProps) {
       {competitors.length > 0 && (
         <section>
           <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-text/40">
-            Competitors
+            Call as a competitor
           </p>
           <div className="grid gap-2">
             {competitors.map((c) => (
@@ -368,12 +376,13 @@ export default function CallPage() {
     name: string,
   ) {
     setChooserError(null);
-    const role = type === "competitor" ? "competitor_call" : "supplier_call";
+    // Inbound: human plays the counterparty; Roba answers as the restaurant manager.
+    const role = type === "competitor" ? "inbound_competitor_call" : "inbound_supplier_call";
     try {
       const res = await apiPost<{ call_id: number }>("/api/calls", {
         counterparty_type: type,
         counterparty_id: id,
-        purpose: type === "competitor" ? "competitor intel" : "supplier negotiation",
+        purpose: `inbound ${type} call`,
       });
       setPartyName(name);
       setResolvedRole(role);

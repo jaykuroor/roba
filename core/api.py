@@ -1977,6 +1977,8 @@ class StartCallBody(BaseModel):
     counterparty_id: int
     purpose: str = ""
     agent: str = "user"
+    note: str = ""
+    ingredient_id: Optional[int] = None
 
 
 class CallHintBody(BaseModel):
@@ -1996,6 +1998,8 @@ def start_call(body: StartCallBody) -> Dict[str, Any]:
         counterparty_type=body.counterparty_type,
         counterparty_id=body.counterparty_id,
         purpose=body.purpose or f"User-initiated {body.counterparty_type} call",
+        note=body.note,
+        ingredient_id=body.ingredient_id,
     )
     return {
         "call_id": call.id,

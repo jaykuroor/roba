@@ -33,6 +33,7 @@ const TABS: TabDef[] = [
   { id: "competitors", label: "Competitors" },
   { id: "reviews",     label: "Reviews" },
   { id: "suppliers",   label: "Suppliers" },
+  { id: "procurement", label: "Procurement" },
   { id: "activity",    label: "Activity" },
   { id: "signals",     label: "Signals" },
 ];
@@ -54,6 +55,10 @@ function Panel({ id }: { id: string }) {
     case "reviews":     return <ReviewPanel />;
     case "suppliers": {
       const p = TRACK_B_PANELS.find((p) => p.name === "Suppliers");
+      return p ? <p.component /> : null;
+    }
+    case "procurement": {
+      const p = TRACK_B_PANELS.find((p) => p.name === "Procurement");
       return p ? <p.component /> : null;
     }
     case "activity": {
