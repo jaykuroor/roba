@@ -104,10 +104,10 @@ export default function VoicePage() {
       </header>
 
       <main className={
-        role === "cook"
-          /* Cook: full-width height-filling pane — CookVoice owns the internal layout */
+        role
+          /* Both desks: full-width height-filling pane — each desk owns its internal layout */
           ? "flex-1 min-h-0 w-full overflow-hidden px-4 py-4"
-          /* Manager + role chooser: centred narrow column, scrollable if it grows tall */
+          /* Role chooser only: centred narrow column, scrollable if it grows tall */
           : "flex-1 min-h-0 mx-auto w-full max-w-lg overflow-y-auto px-4 py-8"
       }>
         {/* Role chooser */}

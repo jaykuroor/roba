@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import config
 from .clock import DAY_OPEN_OFFSET, SECONDS_PER_DAY
 from .models import (
+    AppSettings,
     BatchDefinition,
     Competitor,
     CompetitorOffer,
@@ -609,6 +610,30 @@ class Seeder:
                 for row in data.get(key, []):
                     session.add(model(**self._coerce_row(model, row)))
                 session.flush()
+
+            # AppSettings singleton — seed/update restaurant identity from preset meta.
+            meta = data.get("meta", {})
+            app_settings = session.get(AppSettings, 1)
+            if app_settings is None:
+                app_settings = AppSettings(
+                    id=1,
+                    auto_apply_supplier_changes=0,
+                    sourcing_switching_cost=5.0,
+                    sourcing_horizon_days=7.0,
+                    restaurant_title=meta.get("title") or meta.get("name"),
+                    restaurant_location=meta.get("location"),
+                    restaurant_phone=meta.get("phone"),
+                )
+                session.add(app_settings)
+            else:
+                # Always refresh identity from preset so re-seeding stays in sync.
+                if meta.get("title") or meta.get("name"):
+                    app_settings.restaurant_title = meta.get("title") or meta.get("name")
+                if meta.get("location"):
+                    app_settings.restaurant_location = meta.get("location")
+                if meta.get("phone"):
+                    app_settings.restaurant_phone = meta.get("phone")
+            session.flush()
 
             # sim_state / sim_settings singletons — only if absent (§12.4).
             if session.get(SimState, 1) is None:

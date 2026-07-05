@@ -11,7 +11,7 @@ import { TRACK_B_PANELS } from "../track_b";
 // be shared by the Console (/) and Panels (/panels) routes.
 
 const TRACK_A_TABS = ["Forecast", "Competitors", "Reviews", "Staff", "Signal Feed"];
-const TRACK_B_TABS = ["Inventory", "Expiry", "Suppliers", "Activity Log"];
+const TRACK_B_TABS = ["Inventory", "Expiry", "Suppliers", "Procurement", "Activity Log"];
 
 type Track = "A" | "B" | "POS";
 interface ActiveTab {

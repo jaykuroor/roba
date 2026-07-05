@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { apiGet } from "../api";
 import { wsClient } from "../ws";
 import type { Ingredient, InventoryLevel, MenuItem, MenuToggleEvent } from "../types";
+import { formatQty } from "../utils/units";
 
 export function InventoryDashboard() {
   const [levels, setLevels] = useState<InventoryLevel[]>([]);
@@ -68,6 +69,11 @@ export function InventoryDashboard() {
     return (id: number) => map.get(id) ?? `#${id}`;
   }, [ingredients]);
 
+  const ingredientUnit = useMemo(() => {
+    const map = new Map(ingredients.map((i) => [i.id, i.base_unit]));
+    return (id: number) => map.get(id) ?? "g";
+  }, [ingredients]);
+
   const menuItemsByIngredient = useMemo(() => {
     // No recipe join is exposed over REST, so this only reflects items we can
     // already see are disabled — listed globally below the table instead.
@@ -96,6 +102,7 @@ export function InventoryDashboard() {
         <tbody>
           {levels.map((lvl) => {
             const onHand = lvl.on_hand_cached ?? 0;
+            const unit = ingredientUnit(lvl.ingredient_id);
             const low = lvl.safety_stock != null && onHand <= lvl.safety_stock;
             const out = onHand <= 0;
             const drift =
@@ -109,12 +116,18 @@ export function InventoryDashboard() {
                 }
               >
                 <td className="py-1 font-medium text-text">{ingredientName(lvl.ingredient_id)}</td>
-                <td className="py-1 text-text/80">{onHand.toFixed(1)}</td>
-                <td className="py-1 text-text/60">{lvl.safety_stock?.toFixed(1) ?? "—"}</td>
-                <td className="py-1 text-text/60">{lvl.reorder_point?.toFixed(1) ?? "—"}</td>
-                <td className="py-1 text-text/60">{lvl.par_level?.toFixed(1) ?? "—"}</td>
+                <td className="py-1 text-text/80">{formatQty(onHand, unit)}</td>
                 <td className="py-1 text-text/60">
-                  {drift != null ? (drift === 0 ? "in sync" : drift.toFixed(1)) : "—"}
+                  {lvl.safety_stock != null ? formatQty(lvl.safety_stock, unit) : "—"}
+                </td>
+                <td className="py-1 text-text/60">
+                  {lvl.reorder_point != null ? formatQty(lvl.reorder_point, unit) : "—"}
+                </td>
+                <td className="py-1 text-text/60">
+                  {lvl.par_level != null ? formatQty(lvl.par_level, unit) : "—"}
+                </td>
+                <td className="py-1 text-text/60">
+                  {drift != null ? (drift === 0 ? "in sync" : formatQty(Math.abs(drift), unit)) : "—"}
                 </td>
               </tr>
             );

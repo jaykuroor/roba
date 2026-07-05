@@ -247,6 +247,7 @@ class VoiceActions:
 
     def get_supplier_prices(self, ingredient_name: Optional[str] = None) -> Dict[str, Any]:
         from .models import Ingredient, Supplier, SupplierCatalog
+        from .formatter import format_price_per_unit
         session = self.db_session_factory()
         try:
             ingredients = {int(ing.id): ing for ing in session.query(Ingredient).all()}
@@ -257,12 +258,25 @@ class VoiceActions:
                 sup = suppliers.get(int(cat.supplier_id or 0))
                 if not ing or not sup:
                     continue
+                raw_price = float(cat.current_price) if cat.current_price is not None else 0.0
+                cat_unit = cat.unit or "g"
+                base_unit = str(ing.base_unit or "g")
+                # Convert price to per-base-unit, then format for display
+                if cat_unit == "kg" and base_unit == "g":
+                    price_per_base = raw_price / 1000.0
+                elif cat_unit == "g" and base_unit == "g":
+                    price_per_base = raw_price
+                else:
+                    price_per_base = raw_price
+                disp_price, disp_unit = format_price_per_unit(price_per_base, base_unit)
                 all_rows.append({
                     "ingredient": ing.name,
                     "supplier": sup.name,
-                    "price": float(cat.current_price) if cat.current_price is not None else None,
-                    "unit": cat.unit,
+                    "price": raw_price,
+                    "price_display": f"{disp_price} per {disp_unit}",
+                    "unit": cat_unit,
                     "availability": cat.availability,
+                    "is_default": bool(getattr(cat, "is_default", 0)),
                 })
         finally:
             session.close()
@@ -608,11 +622,14 @@ class VoiceActions:
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("adjust_inventory recompute_availability failed", exc_info=True)
+            from .formatter import format_qty
             return {
                 "ok": True,
                 "ingredient": ing_name,
                 "on_hand_before": current,
+                "on_hand_before_display": format_qty(current, ing_unit),
                 "on_hand_after": new_qty,
+                "on_hand_after_display": format_qty(new_qty, ing_unit),
                 "unit": ing_unit,
             }
 
@@ -1078,30 +1095,64 @@ class VoiceActions:
 
     def request_outbound_call(
         self,
-        target: str,
         counterparty_type: str,
         purpose: str,
+        target: str = "",
+        ingredient: str = "",
+        note: str = "",
     ) -> Dict[str, Any]:
-        """Stage an outbound call — always requires approval (never auto-applied)."""
+        """Stage an outbound call — always requires approval (never auto-applied).
+
+        When ``ingredient`` is provided and counterparty_type is 'supplier',
+        the system resolves the default supplier for that ingredient automatically.
+        ``note`` is forwarded as operator instructions to the AI caller.
+        """
+        # Resolve ingredient → supplier when ingredient is given
+        resolved_target = target
+        ingredient_id: Optional[int] = None
+        ingredient_name: str = ingredient or ""
+        if counterparty_type == "supplier" and ingredient:
+            ing_id, ing_name, sup_id, sup_name = self.vp._resolve_supplier_for_ingredient(ingredient)
+            if sup_id:
+                ingredient_id = ing_id
+                ingredient_name = ing_name
+                if not resolved_target:
+                    resolved_target = sup_name
+
         def _apply():
             try:
                 if self.vp.calls is not None:
+                    cid = self.vp._resolve_counterparty_id(counterparty_type, resolved_target)
                     self.vp.calls.request(
                         agent="manager",
                         counterparty_type=counterparty_type,
-                        counterparty_id=self.vp._resolve_counterparty_id(counterparty_type, target),
+                        counterparty_id=cid,
                         purpose=purpose,
+                        note=note,
+                        ingredient_id=ingredient_id,
                     )
             except Exception:  # noqa: BLE001
                 pass
             return {
                 "ok": True,
-                "target": target,
+                "target": resolved_target,
                 "type": counterparty_type,
+                "ingredient": ingredient_name,
                 "status": "approval_requested",
             }
+        # Build a human-readable card label
+        _label_parts = [f"Call {resolved_target or counterparty_type}"]
+        if ingredient_name:
+            _label_parts.append(f"re: {ingredient_name}")
+        if purpose and purpose not in ("negotiate",):
+            _label_parts.append(f"({purpose})")
+        elif purpose == "negotiate":
+            _label_parts.append("— negotiate price")
+        if note:
+            _label_parts.append(f"[note: {note[:60]}]")
+        human_readable = " ".join(_label_parts) + "."
         # Always staged regardless of mode.
-        return self._stage_or_apply("confirm", _apply, human_readable=f"Request call to {target} ({purpose}).")
+        return self._stage_or_apply("confirm", _apply, human_readable=human_readable)
 
     def consult_reasoner(self, question: str, context: Optional[str] = None) -> Dict[str, Any]:
         """Consult the background reasoning model for complex decisions.

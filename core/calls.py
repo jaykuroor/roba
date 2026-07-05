@@ -91,6 +91,9 @@ class CallSubsystem:
         counterparty_type: str,
         counterparty_id: int,
         purpose: str,
+        note: str = "",
+        ingredient_id: Optional[int] = None,
+        intel_goal: str = "",
     ) -> Call:
         """Start a call immediately without an approval card (user-initiated).
 
@@ -103,6 +106,9 @@ class CallSubsystem:
             counterparty_id=counterparty_id,
             purpose=purpose,
             require_approval=False,
+            note=note,
+            ingredient_id=ingredient_id,
+            intel_goal=intel_goal,
         )
 
     def request(
@@ -112,6 +118,9 @@ class CallSubsystem:
         counterparty_id: int,
         purpose: str,
         require_approval: bool = True,
+        note: str = "",
+        ingredient_id: Optional[int] = None,
+        intel_goal: str = "",
     ) -> Call:
         """Create a call.
 
@@ -124,6 +133,17 @@ class CallSubsystem:
 
         If a call is already active, the call is queued (FIFO, §6.3).
         """
+        # Build optional per-call metadata
+        _call_meta: Optional[Dict[str, Any]] = None
+        if note or ingredient_id or intel_goal:
+            _call_meta = {}
+            if note:
+                _call_meta["note"] = note
+            if ingredient_id:
+                _call_meta["ingredient_id"] = ingredient_id
+            if intel_goal:
+                _call_meta["intel_goal"] = intel_goal
+
         # require_approval=False path: skip the approval card entirely
         if not require_approval:
             call_mode = self.clock.current_state().get("call_mode") or "freeze"
@@ -141,6 +161,7 @@ class CallSubsystem:
                     started_at=None,
                     ended_at=None,
                     clock_action=call_mode,
+                    call_metadata=_call_meta,
                 )
                 session.add(call)
                 session.commit()
@@ -175,6 +196,7 @@ class CallSubsystem:
                 started_at=None,
                 ended_at=None,
                 clock_action=call_mode,
+                call_metadata=_call_meta,
             )
             session.add(call)
             session.commit()
@@ -381,6 +403,18 @@ class CallSubsystem:
             source="calls",
         )
 
+        # Persist a call_price ManagerChange when a supplier negotiation agreed a price.
+        if (
+            isinstance(outcome, dict)
+            and call.counterparty_type == "supplier"
+            and outcome.get("agreed")
+            and outcome.get("agreed_price") is not None
+        ):
+            try:
+                self._create_call_price_change(call, outcome)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("call_price ManagerChange creation failed: %s", _exc)
+
         # Restore the clock to its pre-call state/speed (§6.3).
         restore = self._clock_restore.pop(call_id, None)
         if restore is not None:
@@ -391,6 +425,91 @@ class CallSubsystem:
         # A second call that was queued while this one ran can now start.
         self._start_next_pending()
         return outcome
+
+    def _create_call_price_change(self, call: Call, outcome: Dict[str, Any]) -> None:
+        """Create a ManagerChange(kind='call_price') so the agreed price surfaces
+        as a desk card for the manager to apply/revert (§8.5 / workstream E)."""
+        from .models import (  # noqa: PLC0415
+            ManagerChange as _MC,
+            Supplier as _Sup,
+            SupplierCatalog as _SCat,
+            Ingredient as _Ing,
+        )
+        agreed_price = float(outcome["agreed_price"])
+        meta = call.call_metadata or {}
+
+        session = self.db_session_factory()
+        try:
+            sup = session.get(_Sup, call.counterparty_id)
+            sup_name = sup.name if sup else f"Supplier #{call.counterparty_id}"
+
+            # Find the relevant catalog row
+            target_ing_id = meta.get("ingredient_id")
+            if target_ing_id:
+                cat = (
+                    session.query(_SCat)
+                    .filter(
+                        _SCat.supplier_id == call.counterparty_id,
+                        _SCat.ingredient_id == int(target_ing_id),
+                    )
+                    .first()
+                )
+            else:
+                cat = (
+                    session.query(_SCat)
+                    .filter(
+                        _SCat.supplier_id == call.counterparty_id,
+                        _SCat.is_default == 1,
+                    )
+                    .first()
+                ) or (
+                    session.query(_SCat)
+                    .filter(_SCat.supplier_id == call.counterparty_id)
+                    .first()
+                )
+
+            if cat is None:
+                return
+
+            ing = session.get(_Ing, cat.ingredient_id)
+            ing_name = ing.name if ing else f"ingredient #{cat.ingredient_id}"
+            current_price = float(cat.current_price or 0.0)
+
+            cat_unit = cat.unit or "g"
+            # Build human-readable price strings (per kg for display)
+            if cat_unit == "g":
+                before_disp = f"€{current_price * 1000:.2f}/kg"
+                after_disp = f"€{agreed_price * 1000:.2f}/kg"
+            else:
+                before_disp = f"€{current_price:.2f}/{cat_unit}"
+                after_disp = f"€{agreed_price:.2f}/{cat_unit}"
+
+            change = _MC(
+                kind="call_price",
+                status="pending",
+                summary=f"Price for {ing_name} ({sup_name}): {before_disp} → {after_disp}",
+                created_at=float(self.bus.sim_time),
+                details={
+                    "before": {"price": current_price, "unit": cat_unit},
+                    "after": {"price": agreed_price, "unit": cat_unit},
+                    "rationale": outcome.get("agreed_terms") or "Negotiated price agreed on call",
+                    "call_id": call.id,
+                    "catalog_id": cat.id,
+                    "ingredient_id": cat.ingredient_id,
+                    "supplier_id": call.counterparty_id,
+                    "ingredient_name": ing_name,
+                    "supplier_name": sup_name,
+                },
+            )
+            session.add(change)
+            session.commit()
+
+            self._broadcast(
+                "manager_change",
+                {"kind": "call_price", "id": change.id, "ingredient": ing_name, "supplier": sup_name},
+            )
+        finally:
+            session.close()
 
     def _extract_outcome(self, call_id: int) -> Optional[Dict[str, Any]]:
         """Send the transcript to the LLM with the §8.5 schema and store the
@@ -460,39 +579,83 @@ class CallSubsystem:
 
     # -- prompts / schemas (§8.3 / §8.5) -----------------------------------
 
+    def _get_identity(self) -> Dict[str, str]:
+        """Return the restaurant identity from AppSettings (with fallbacks)."""
+        from .models import AppSettings as _AppSettings  # noqa: PLC0415
+        session = self.db_session_factory()
+        try:
+            settings = session.get(_AppSettings, 1)
+            if settings is not None:
+                return settings.get_identity()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            session.close()
+        return {"title": "the restaurant", "location": "", "phone": ""}
+
     def _supplier_system_prompt(self, call: Call) -> str:
         """Market Spectator goal: lower the unit price / better terms (§8.3).
         Delegates to call_personas.supplier_negotiation_prompt for a richer,
         worked-example prompt shared by both text and live-voice calls.
         """
+        from .models import Ingredient as _Ingredient  # noqa: PLC0415
         supplier_name = f"Supplier #{call.counterparty_id}"
         ingredient_name = "the target ingredient"
         current_price = 0.0
-        unit = "unit"
+        unit = "g"
+        meta = call.call_metadata or {}
+        note = str(meta.get("note") or "")
+        target_ingredient_id = meta.get("ingredient_id")
+
         session = self.db_session_factory()
         try:
-            from .models import Ingredient as _Ingredient  # noqa: PLC0415
             supplier = session.get(Supplier, call.counterparty_id)
             if supplier is not None:
                 supplier_name = supplier.name
-            cat = (
-                session.query(SupplierCatalog)
-                .filter(SupplierCatalog.supplier_id == call.counterparty_id)
-                .first()
-            )
+
+            # Prefer the specifically-targeted ingredient if provided
+            if target_ingredient_id:
+                cat = (
+                    session.query(SupplierCatalog)
+                    .filter(
+                        SupplierCatalog.supplier_id == call.counterparty_id,
+                        SupplierCatalog.ingredient_id == int(target_ingredient_id),
+                    )
+                    .first()
+                )
+            else:
+                # Fall back to the default (is_default=1) catalog row
+                cat = (
+                    session.query(SupplierCatalog)
+                    .filter(
+                        SupplierCatalog.supplier_id == call.counterparty_id,
+                        SupplierCatalog.is_default == 1,
+                    )
+                    .first()
+                ) or (
+                    session.query(SupplierCatalog)
+                    .filter(SupplierCatalog.supplier_id == call.counterparty_id)
+                    .first()
+                )
+
             if cat is not None:
                 current_price = float(cat.current_price or 0.0)
-                unit = str(cat.unit or "unit")
+                unit = str(cat.unit or "g")
                 ing = session.get(_Ingredient, cat.ingredient_id)
                 if ing is not None:
                     ingredient_name = ing.name
         finally:
             session.close()
+
+        identity = self._get_identity()
         return call_personas.supplier_negotiation_prompt(
             supplier_name=supplier_name,
             ingredient_name=ingredient_name,
             current_price=current_price,
             unit=unit,
+            restaurant_title=identity["title"],
+            restaurant_location=identity["location"],
+            note=note,
         )
 
     def _competitor_system_prompt(self, call: Call) -> str:
@@ -500,9 +663,13 @@ class CallSubsystem:
         Delegates to call_personas.competitor_intel_prompt so text calls and
         live-voice calls share the same rich, example-backed persona.
         """
-        competitor_name = f"the restaurant"
+        competitor_name = "the restaurant"
         cuisine = ""
         distance_km = 0.0
+        known_dishes: List[str] = []
+        meta = call.call_metadata or {}
+        intel_goal = str(meta.get("intel_goal") or "")
+
         session = self.db_session_factory()
         try:
             competitor = session.get(Competitor, call.counterparty_id)
@@ -513,12 +680,22 @@ class CallSubsystem:
                 elif isinstance(competitor.cuisine, str):
                     cuisine = competitor.cuisine
                 distance_km = float(competitor.distance_km or 0.0)
+            # Load known dishes from competitor_offers
+            from .models import CompetitorOffer as _CO  # noqa: PLC0415
+            offers = (
+                session.query(_CO)
+                .filter(_CO.competitor_id == call.counterparty_id)
+                .all()
+            )
+            known_dishes = [o.dish_name for o in offers if o.dish_name]
         finally:
             session.close()
         return call_personas.competitor_intel_prompt(
             competitor_name=competitor_name,
             cuisine=cuisine,
             distance_km=distance_km,
+            known_dishes=known_dishes or None,
+            intel_goal=intel_goal,
         )
 
     @staticmethod

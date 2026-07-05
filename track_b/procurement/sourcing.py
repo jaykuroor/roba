@@ -384,6 +384,17 @@ def _solve_milp(
         s_id: pulp.LpVariable(f"y_{s_id}", cat="Binary") for s_id in all_sup_ids
     }
 
+    # Supplier-level value-discount tier binaries (C4)
+    # vol_tier[s_id][tier_idx] = binary: tier_idx-th threshold reached for supplier s_id
+    vol_tier: Dict[int, List[Any]] = {}
+    for s_id in all_sup_ids:
+        sup = sup_by_id.get(s_id, {})
+        vd = sup.get("volume_discount") or []
+        vol_tier[s_id] = [
+            pulp.LpVariable(f"vt_{s_id}_{ti}", cat="Binary")
+            for ti in range(len(vd))
+        ]
+
     # ------------------------------------------------------------------
     # Objective: minimise total landed cost
     # ------------------------------------------------------------------
@@ -403,7 +414,7 @@ def _solve_milp(
             # (1) Base item cost
             obj_terms.append(p * x[iid, s_id])
 
-            # (6) Volume-discount savings
+            # (6) Per-item volume-discount savings (qty threshold in grams)
             disc_tiers = c.get("discount") or []
             if disc_tiers:
                 tier = disc_tiers[0]  # lowest threshold tier
@@ -435,6 +446,41 @@ def _solve_milp(
         dc = float(sup.get("delivery_charge") or 0.0)
         if dc > 0:
             obj_terms.append(dc * y[s_id])
+
+    # (7) Supplier-level value-discount rebates (C4)
+    # When total spend for supplier s_id >= threshold, rebate discount_pct% of that spend.
+    # Modelled with a linear approximation: rebate = discount_pct/100 * (order_value - threshold*tier)
+    # using big-M linearisation to gate the tier binary.
+    sup_order_val: Dict[int, Any] = {}
+    for s_id in all_sup_ids:
+        ings_from_s = [
+            int(i["id"]) for i in active_ings
+            if s_id in ing_sups.get(int(i["id"]), [])
+        ]
+        if ings_from_s:
+            sup_order_val[s_id] = pulp.lpSum(
+                float(cat_by_is.get((iid, s_id), {}).get("current_price") or 0.0)
+                * x[iid, s_id]
+                for iid in ings_from_s
+            )
+        sup = sup_by_id.get(s_id, {})
+        vd = sup.get("volume_discount") or []
+        for ti, tier in enumerate(vd):
+            threshold = float(tier.get("min_value") or 0.0)
+            disc_pct = float(tier.get("discount_pct") or 0.0)
+            if threshold <= 0 or disc_pct <= 0 or s_id not in sup_order_val:
+                continue
+            vt = vol_tier[s_id][ti]
+            ov = sup_order_val[s_id]
+            # tier reached → order_value >= threshold
+            prob += ov >= threshold * vt, f"vol_tier_lb_{s_id}_{ti}"
+            # order_value not large enough → tier forced off (big-M)
+            tier_M = M * 20  # order value is in currency, not grams
+            prob += ov <= threshold + tier_M * vt, f"vol_tier_ub_{s_id}_{ti}"
+            # rebate = discount_pct% of order value (only when tier reached)
+            # approximated as: rebate = (disc_pct/100) * threshold * vt (conservative)
+            rebate = (disc_pct / 100.0) * threshold * vt
+            obj_terms.append(-rebate)
 
     prob += pulp.lpSum(obj_terms)
 
@@ -530,12 +576,20 @@ def _solve_milp(
     prob.solve(solver)
 
     if prob.status != 1:  # 1 = Optimal
+        status_name = pulp.LpStatus.get(prob.status, "unknown")
         logger.warning(
             "MILP not optimal (status=%d / %s); falling back to greedy.",
             prob.status,
-            pulp.LpStatus.get(prob.status, "unknown"),
+            status_name,
         )
-        return solve_sourcing_greedy(ingredients, catalog, suppliers, demand, params)
+        # Surface infeasibility: run greedy but mark as fallback with a rationale
+        greedy_sol = solve_sourcing_greedy(ingredients, catalog, suppliers, demand, params)
+        greedy_sol.method = "fallback"
+        greedy_sol.rationale = (
+            f"MILP was {status_name} (status {prob.status}); greedy fallback used. "
+            + (greedy_sol.rationale or "")
+        ).strip()
+        return greedy_sol
 
     # ------------------------------------------------------------------
     # Extract solution

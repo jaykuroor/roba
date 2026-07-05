@@ -22,6 +22,62 @@ from . import config
 from .models import OrderLine, WasteEvent
 from .signals import SignalType
 
+
+# ---------------------------------------------------------------------------
+# Quantity / price formatters
+# Centralised so the voice agent, negotiation prompts, inventory panels, and
+# reasoner all speak the same human unit:
+#   ≥ 1000 g  → kg (e.g. 1500 g → "1.5 kg")
+#   ≥ 1000 ml → L  (e.g. 2000 ml → "2 L")
+#   < 1000    → native unit
+#   "each"    → unchanged
+# ---------------------------------------------------------------------------
+
+def format_qty(value: float, base_unit: str) -> str:
+    """Format a raw quantity (in base_unit) to a human-readable string.
+
+    Examples:
+        format_qty(1500, "g")   → "1.5 kg"
+        format_qty(800, "g")    → "800 g"
+        format_qty(2000, "ml")  → "2 L"
+        format_qty(3, "each")   → "3"
+    """
+    u = (base_unit or "g").strip().lower()
+    if u == "g":
+        if value >= 1000:
+            kg = value / 1000
+            # Strip trailing zeros: 1.500 → 1.5, 2.000 → 2
+            return f"{kg:g} kg"
+        return f"{value:g} g"
+    if u == "ml":
+        if value >= 1000:
+            litres = value / 1000
+            return f"{litres:g} L"
+        return f"{value:g} ml"
+    # "each" or unknown
+    return f"{value:g}"
+
+
+def format_price_per_unit(price_per_base: float, base_unit: str) -> tuple[float, str]:
+    """Convert a per-base-unit price to the display unit.
+
+    Returns (display_price, display_unit) so callers can format as they like.
+
+    Examples:
+        format_price_per_unit(0.004, "g")  → (4.0, "kg")
+        format_price_per_unit(0.8,   "g")  → (0.8, "g")   # < 1 g → stays per g
+        format_price_per_unit(0.002, "ml") → (2.0, "L")
+        format_price_per_unit(1.5,   "each") → (1.5, "each")
+    """
+    u = (base_unit or "g").strip().lower()
+    if u == "g":
+        price_kg = price_per_base * 1000
+        return (round(price_kg, 4), "kg")
+    if u == "ml":
+        price_l = price_per_base * 1000
+        return (round(price_l, 4), "L")
+    return (round(price_per_base, 4), base_unit or "each")
+
 # §16 routing — which signal groups each waste type fans out to.
 WASTE_ROUTING: Dict[str, List[str]] = {
     "overproduction": ["inventory", "forecasting", "procurement", "human"],

@@ -492,16 +492,43 @@ _TOOLS: list[dict[str, Any]] = [
                 "name": "request_outbound_call",
                 "description": (
                     "Request an approval-gated outbound call to a competitor or supplier. "
-                    "Always requires manager approval before it proceeds."
+                    "Always requires manager approval before it proceeds. "
+                    "Use 'ingredient' when the user says 'call our suppliers for [X]' — "
+                    "set ingredient to the ingredient name (e.g. 'tomato') and the system "
+                    "resolves the default supplier automatically. "
+                    "Use 'note' to pass any specific instructions for the AI caller."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "target": {"type": "string", "description": "Name of the competitor or supplier."},
+                        "target": {
+                            "type": "string",
+                            "description": (
+                                "Name of the competitor or supplier. May be a partial name, "
+                                "a cuisine type (for competitors), or omitted when 'ingredient' is set."
+                            ),
+                        },
                         "counterparty_type": {"type": "string", "enum": ["competitor", "supplier"]},
-                        "purpose": {"type": "string"},
+                        "purpose": {
+                            "type": "string",
+                            "description": "Call purpose: 'negotiate', 'intel', 'onboarding', etc.",
+                        },
+                        "ingredient": {
+                            "type": "string",
+                            "description": (
+                                "Optional ingredient name — the system will find the default supplier "
+                                "for this ingredient. Use when the user says 'call our supplier for tomatoes'."
+                            ),
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": (
+                                "Optional operator note for the AI caller, e.g. 'push hard on price', "
+                                "'ask about bulk discounts'. Forwarded verbatim to the call agent."
+                            ),
+                        },
                     },
-                    "required": ["target", "counterparty_type", "purpose"],
+                    "required": ["counterparty_type", "purpose"],
                 },
             },
             {
@@ -694,7 +721,15 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "• Interval forecast → forecast_demand(range=week|day|daypart|custom, daypart=..., day_offset=..., item_name=...)\n"
         "  ↳ ALWAYS set item_name when the user names a specific dish.\n"
         "• Trigger agents → run_forecast / run_inventory_optimizer / run_competitor_scan / process_reviews\n"
-        "• Outbound call → request_outbound_call (always requires approval)\n"
+        "• Outbound call → request_outbound_call(counterparty_type=supplier|competitor, purpose=negotiate|intel|onboarding, "
+        "target=<name or partial>, ingredient=<ingredient name when calling supplier for specific item>, note=<operator instructions>)\n"
+        "  Examples:\n"
+        "    'call our suppliers for tomatoes and negotiate' → request_outbound_call(counterparty_type='supplier', "
+        "purpose='negotiate', ingredient='tomato')\n"
+        "    'call a competitor selling pizza' → request_outbound_call(counterparty_type='competitor', "
+        "purpose='intel', target='pizza')\n"
+        "    'call GreenFarm and push on price' → request_outbound_call(counterparty_type='supplier', "
+        "purpose='negotiate', target='GreenFarm', note='push hard on price')\n"
         "• Complex trade-off → consult_reasoner(question=..., context=...)\n\n"
         "BATCH STATUS VOCABULARY: 'decided'=awaiting approval; 'approved'=ready to cook; "
         "'ready'=cooked; 'skipped'=decided to skip.\n\n"
@@ -813,25 +848,60 @@ async def live_bridge(
     if call_id is not None and calls is not None and role in ("supplier_call", "competitor_call", "onboarding_call"):
         try:
             from . import call_personas as _cp  # noqa: PLC0415
-            from .models import Supplier as _Supplier, SupplierCatalog as _SCat  # noqa: PLC0415
-            from .models import Competitor as _Competitor, Ingredient as _Ing  # noqa: PLC0415
+            from .models import (  # noqa: PLC0415
+                AppSettings as _AppSettings,
+                Competitor as _Competitor,
+                CompetitorOffer as _CO,
+                Ingredient as _Ing,
+                Supplier as _Supplier,
+                SupplierCatalog as _SCat,
+            )
             _call = calls._load(call_id)
             if _call is not None:
                 _db_sess = voice_processor.db_session_factory()
                 try:
+                    # Load restaurant identity for supplier personas
+                    _identity: dict = {"title": "the restaurant", "location": "", "phone": ""}
+                    _app_cfg = _db_sess.get(_AppSettings, 1)
+                    if _app_cfg is not None:
+                        _identity = _app_cfg.get_identity()
+
+                    _call_meta = _call.call_metadata or {}
+
                     if role == "supplier_call":
                         _sup = _db_sess.get(_Supplier, _call.counterparty_id)
-                        _cat = (
-                            _db_sess.query(_SCat)
-                            .filter(_SCat.supplier_id == _call.counterparty_id)
-                            .first()
-                        )
+                        _target_ing_id = _call_meta.get("ingredient_id")
+                        if _target_ing_id:
+                            _cat = (
+                                _db_sess.query(_SCat)
+                                .filter(
+                                    _SCat.supplier_id == _call.counterparty_id,
+                                    _SCat.ingredient_id == int(_target_ing_id),
+                                )
+                                .first()
+                            )
+                        else:
+                            _cat = (
+                                _db_sess.query(_SCat)
+                                .filter(
+                                    _SCat.supplier_id == _call.counterparty_id,
+                                    _SCat.is_default == 1,
+                                )
+                                .first()
+                            ) or (
+                                _db_sess.query(_SCat)
+                                .filter(_SCat.supplier_id == _call.counterparty_id)
+                                .first()
+                            )
                         _ing = _db_sess.get(_Ing, _cat.ingredient_id) if _cat else None
                         system_instruction = _cp.supplier_negotiation_prompt(
                             supplier_name=_sup.name if _sup else f"Supplier #{_call.counterparty_id}",
                             ingredient_name=_ing.name if _ing else "the ingredient",
                             current_price=float(_cat.current_price or 0.0) if _cat else 0.0,
-                            unit=str(_cat.unit or "unit") if _cat else "unit",
+                            unit=str(_cat.unit or "g") if _cat else "g",
+                            restaurant_title=_identity["title"],
+                            restaurant_location=_identity["location"],
+                            note=str(_call_meta.get("note") or ""),
                         )
                     elif role == "competitor_call":
                         _comp = _db_sess.get(_Competitor, _call.counterparty_id)
@@ -843,16 +913,26 @@ async def live_bridge(
                             elif isinstance(_comp.cuisine, str):
                                 _cuisine = _comp.cuisine
                             _dist = float(_comp.distance_km or 0.0)
+                        _offers = (
+                            _db_sess.query(_CO)
+                            .filter(_CO.competitor_id == _call.counterparty_id)
+                            .all()
+                        )
+                        _known_dishes = [o.dish_name for o in _offers if o.dish_name] or None
                         system_instruction = _cp.competitor_intel_prompt(
                             competitor_name=_comp.name if _comp else f"Restaurant #{_call.counterparty_id}",
                             cuisine=_cuisine,
                             distance_km=_dist,
+                            known_dishes=_known_dishes,
+                            intel_goal=str(_call_meta.get("intel_goal") or ""),
                         )
                     elif role == "onboarding_call":
                         _sup = _db_sess.get(_Supplier, _call.counterparty_id)
                         system_instruction = _cp.supplier_onboarding_prompt(
                             supplier_name=_sup.name if _sup else f"Supplier #{_call.counterparty_id}",
                             phone=str(_sup.phone or "") if _sup else "",
+                            restaurant_title=_identity["title"],
+                            restaurant_location=_identity["location"],
                         )
                 finally:
                     _db_sess.close()
@@ -1726,9 +1806,11 @@ async def _execute_tool(
                 return {"error": "VoiceActions not available"}
             return await asyncio.to_thread(
                 va.request_outbound_call,
-                target=str(args.get("target", "")),
                 counterparty_type=str(args.get("counterparty_type", "competitor")),
                 purpose=str(args.get("purpose", "")),
+                target=str(args.get("target", "")),
+                ingredient=str(args.get("ingredient", "")),
+                note=str(args.get("note", "")),
             )
 
         if name == "confirm_plan":

@@ -2,6 +2,9 @@
   "meta": {
     "preset_id": "bellas_kitchen",
     "name": "Bella's Kitchen",
+    "title": "Bella's Kitchen",
+    "location": "42 Via Roma, Midtown",
+    "phone": "+1-555-8400",
     "cuisine": "italian",
     "history_days": 30,
     "history_orders_per_day": 40

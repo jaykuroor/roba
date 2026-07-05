@@ -4,9 +4,11 @@ import { Save } from "lucide-react";
 import { apiGet, apiPatch } from "../../api";
 import type { Ingredient, InventoryLevel, InventoryLot } from "../../types";
 import { SectionHeading } from "./shared";
+import { formatQty } from "../../utils/units";
 
 interface LevelRow extends InventoryLevel {
   ingredient_name?: string;
+  ingredient_unit?: "g" | "ml" | "each";
   patch?: Partial<InventoryLevel>;
 }
 
@@ -112,9 +114,11 @@ function InventoryLevelsEditor() {
       apiGet<Ingredient[]>("/api/ingredients"),
     ]).then(([levels, ings]) => {
       const ingMap = new Map(ings.map((i) => [i.id, i.name]));
+      const unitMap = new Map(ings.map((i) => [i.id, i.base_unit]));
       setRows(levels.map((l) => ({
         ...l,
         ingredient_name: ingMap.get(l.ingredient_id) ?? `#${l.ingredient_id}`,
+        ingredient_unit: unitMap.get(l.ingredient_id) ?? "g",
         patch: {},
       })));
     }).catch(() => undefined);
@@ -165,7 +169,7 @@ function InventoryLevelsEditor() {
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-sm font-medium text-text">{row.ingredient_name}</span>
                 <span className="text-xs tabular-nums text-text/50">
-                  on hand: <span className="text-success font-medium">{(row.on_hand_cached ?? 0).toFixed(2)}</span>
+                  on hand: <span className="text-success font-medium">{formatQty(row.on_hand_cached ?? 0, row.ingredient_unit ?? "g")}</span>
                 </span>
               </div>
               <div className="flex flex-wrap gap-3">
@@ -203,6 +207,7 @@ function LotsView() {
   }, []);
 
   const ingMap = new Map(ingredients.map((i) => [i.id, i.name]));
+  const unitMap = new Map(ingredients.map((i) => [i.id, i.base_unit]));
 
   const activeLots = lots.filter((l) => l.status === "active");
 
@@ -213,7 +218,7 @@ function LotsView() {
         <table className="w-full text-left text-xs">
           <thead>
             <tr className="border-b border-muted bg-surface/60">
-              {["Ingredient", "Qty on hand", "Unit", "Expiry (sim-s)", "Status"].map((h) => (
+              {["Ingredient", "Qty on hand", "Expiry (sim-s)", "Status"].map((h) => (
                 <th key={h} className="px-2 py-1.5 font-medium text-text/50">{h}</th>
               ))}
             </tr>
@@ -222,8 +227,9 @@ function LotsView() {
             {activeLots.map((lot) => (
               <tr key={lot.id} className="border-b border-muted/40 last:border-0">
                 <td className="px-2 py-1">{ingMap.get(lot.ingredient_id) ?? `#${lot.ingredient_id}`}</td>
-                <td className="px-2 py-1 tabular-nums">{lot.qty_on_hand.toFixed(3)}</td>
-                <td className="px-2 py-1 text-text/50">{lot.unit}</td>
+                <td className="px-2 py-1 tabular-nums">
+                  {formatQty(lot.qty_on_hand, unitMap.get(lot.ingredient_id) ?? lot.unit ?? "g")}
+                </td>
                 <td className="px-2 py-1 tabular-nums text-text/50">{lot.expiry_date?.toFixed(0) ?? "—"}</td>
                 <td className="px-2 py-1">
                   <span className="rounded bg-success/20 px-1 py-0.5 text-[10px] text-success">{lot.status}</span>

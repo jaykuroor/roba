@@ -97,12 +97,18 @@ def _ensure_columns() -> None:
     """
     _new_cols = [
         # (table, column, ddl_type_default)
-        ("suppliers",       "phone",            "TEXT"),
-        ("suppliers",       "delivery_charge",  "REAL DEFAULT 0.0"),
-        ("suppliers",       "volume_discount",  "TEXT"),          # JSON stored as TEXT
-        ("supplier_catalog","is_default",        "INTEGER DEFAULT 0"),
-        ("supplier_catalog","discount",          "TEXT"),
-        ("competitors",     "phone",             "TEXT"),         # for direct-call chooser
+        ("suppliers",       "phone",                  "TEXT"),
+        ("suppliers",       "delivery_charge",         "REAL DEFAULT 0.0"),
+        ("suppliers",       "volume_discount",         "TEXT"),          # JSON stored as TEXT
+        ("supplier_catalog","is_default",              "INTEGER DEFAULT 0"),
+        ("supplier_catalog","discount",                "TEXT"),
+        ("competitors",     "phone",                   "TEXT"),          # for direct-call chooser
+        # Restaurant identity on AppSettings (added with identity workstream)
+        ("app_settings",    "restaurant_title",        "TEXT"),
+        ("app_settings",    "restaurant_location",     "TEXT"),
+        ("app_settings",    "restaurant_phone",        "TEXT"),
+        # Per-call operator metadata (note, ingredient, intel_goal)
+        ("calls",           "call_metadata",           "TEXT"),   # JSON stored as TEXT
     ]
     conn = engine.raw_connection()
     try:

@@ -428,6 +428,93 @@ class InventoryOptimizer(BaseAgent):
             session.close()
         return total_usage
 
+    def _net_demand_for_sourcing(
+        self,
+        ingredient_id: int,
+        lead_days: float,
+        horizon_days: float,
+    ) -> float:
+        """Net quantity to order for an ingredient so that at the end of the planning
+        horizon there is exactly enough stock to cover demand.
+
+        Formula:
+          gross_need   = forecast consumption over [now, now + lead + horizon]
+          usable_stock = portion of on_hand that can actually be consumed
+                         before it expires (perishables capped by shelf life;
+                         non-perishables use full on_hand)
+          net          = max(0, gross_need − usable_stock)
+
+        This guarantees "for the forecasted interval exactly that much is in
+        inventory" (user requirement).  Units: grams (same as base_unit).
+        """
+        # --- gross need: consumption from now until end of coverage window ---
+        total_window = lead_days + horizon_days
+        gross_need = self._demand_over_lead(ingredient_id, total_window)
+        if gross_need <= 0:
+            return 0.0
+
+        # --- usable stock ---
+        session = self.db_session_factory()
+        try:
+            # On-hand stock
+            level = (
+                session.query(InventoryLevel)
+                .filter(InventoryLevel.ingredient_id == ingredient_id)
+                .first()
+            )
+            on_hand = float(level.on_hand_cached or 0.0) if level else 0.0
+
+            # Is this ingredient perishable?
+            ing = session.get(Ingredient, ingredient_id)
+            perishable = bool(ing.perishable) if ing else False
+            shelf_life = float(ing.shelf_life_days or 0.0) if ing else 0.0
+
+            if not perishable or shelf_life <= 0:
+                # Non-perishable: full on_hand is usable within the window
+                usable_stock = on_hand
+            else:
+                # Perishable: only use stock that won't expire before it can be consumed
+                # Determine how much of on_hand expires within the planning window
+                # by querying actual lots (most accurate)
+                now_sim = float(self.bus.sim_time)
+                lots = (
+                    session.query(InventoryLot)
+                    .filter(
+                        InventoryLot.ingredient_id == ingredient_id,
+                        InventoryLot.qty_on_hand > 0,
+                    )
+                    .all()
+                )
+                if lots:
+                    # Sum lot qty that hasn't expired and can be consumed in time
+                    # "consumed in time" = expiry is within the total window from now
+                    window_end = now_sim + total_window * 86400  # sim-seconds
+                    usable_from_lots = 0.0
+                    for lot in lots:
+                        expiry = lot.expiry_date
+                        if expiry is None:
+                            # No expiry recorded — treat conservatively as usable
+                            usable_from_lots += float(lot.qty_on_hand or 0.0)
+                        elif expiry > now_sim:
+                            # Lot hasn't expired; cap consumption by remaining shelf life
+                            remaining_days = max(0.0, (expiry - now_sim) / 86400)
+                            # fraction of gross_need attributable to these remaining days
+                            daily_rate = gross_need / max(total_window, 1.0)
+                            consumable_from_lot = min(
+                                float(lot.qty_on_hand or 0.0),
+                                daily_rate * remaining_days,
+                            )
+                            usable_from_lots += consumable_from_lot
+                    usable_stock = min(on_hand, usable_from_lots)
+                else:
+                    # No lot data — fall back: only stock consumable before shelf_life expires
+                    daily_rate = gross_need / max(total_window, 1.0)
+                    usable_stock = min(on_hand, daily_rate * shelf_life)
+        finally:
+            session.close()
+
+        return max(0.0, gross_need - usable_stock)
+
     # -- dynamic par recompute -----------------------------------------------
 
     def refresh_dynamic_pars(self) -> None:
@@ -1192,20 +1279,60 @@ class InventoryOptimizer(BaseAgent):
             ing_ids = [int(i.id) for i in ings]
 
             catalog_rows = session.query(SupplierCatalog).all()
-            catalog = [
-                {
+
+            def _price_per_gram(price: float, unit: str, pack_size: float) -> float:
+                """Normalise a catalog price to per-gram so the MILP objective
+                p·x (quantity in grams) is dimensionally consistent regardless
+                of how the supplier quotes the price (per g / per kg / per pack)."""
+                u = (unit or "g").strip().lower()
+                if u == "kg":
+                    return price / 1000.0
+                if u in ("each", "pack", "unit"):
+                    # price is per pack; pack_size is grams per pack
+                    ps = pack_size if pack_size and pack_size > 0 else 1.0
+                    return price / ps
+                # "g" or unknown → price is already per gram
+                return price
+
+            catalog = []
+            for c in catalog_rows:
+                raw_price = float(c.current_price or 0.0)
+                c_unit = c.unit or "g"
+                c_pack = float(c.pack_size or 1.0)
+                price_per_g = _price_per_gram(raw_price, c_unit, c_pack)
+                # Normalise per-item discount thresholds from catalog unit → grams
+                disc = getattr(c, "discount", None)
+                if disc:
+                    normalised_disc = []
+                    for tier in disc:
+                        min_qty_g = _price_per_gram(1.0, c_unit, c_pack)  # unit factor
+                        # tier min_qty is in catalog unit → convert to grams
+                        tq = float(tier.get("min_qty") or 0.0)
+                        # Convert: if unit is kg, min_qty is kg → multiply by 1000/factor
+                        if c_unit.strip().lower() == "kg":
+                            tq_g = tq * 1000.0
+                        elif c_unit.strip().lower() in ("each", "pack", "unit"):
+                            tq_g = tq * c_pack
+                        else:
+                            tq_g = tq  # already grams
+                        disc_price_g = _price_per_gram(
+                            float(tier.get("unit_price") or raw_price), c_unit, c_pack
+                        )
+                        normalised_disc.append({"min_qty": tq_g, "unit_price": disc_price_g})
+                    disc = normalised_disc
+                catalog.append({
                     "id": int(c.id),
                     "supplier_id": int(c.supplier_id),
                     "ingredient_id": int(c.ingredient_id),
-                    "current_price": float(c.current_price or 0.0),
-                    "pack_size": float(c.pack_size or 1.0),
+                    "current_price": price_per_g,   # normalised to per-gram
+                    "original_price": raw_price,     # kept for human-readable display
+                    "original_unit": c_unit,         # original catalog unit
+                    "pack_size": c_pack,
                     "availability": c.availability or "in_stock",
-                    "unit": c.unit or "each",
+                    "unit": "g",                     # MILP always works in grams
                     "is_default": int(getattr(c, "is_default", 0) or 0),
-                    "discount": getattr(c, "discount", None),
-                }
-                for c in catalog_rows
-            ]
+                    "discount": disc,
+                })
 
             default_sup: Dict[int, int] = {}
             for c in catalog:
@@ -1221,9 +1348,10 @@ class InventoryOptimizer(BaseAgent):
                     "id": int(s.id),
                     "name": s.name,
                     "delivery_charge": float(getattr(s, "delivery_charge", None) or 0.0),
-                    "min_order_value": 0.0,
+                    # Use real DB values instead of hardcoded zeros/ones
+                    "min_order_value": float(s.min_order_value or 0.0),
                     "lead_time_days": float(s.lead_time_days or 1.0),
-                    "reliability_score": 1.0,
+                    "reliability_score": float(s.reliability_score or 1.0),
                     "volume_discount": getattr(s, "volume_discount", None),
                 }
                 for s in supplier_rows
@@ -1270,17 +1398,25 @@ class InventoryOptimizer(BaseAgent):
         finally:
             session.close()
 
-        # Estimate demand using forecast horizon
+        # Compute net demand (shortfall) per ingredient: only order what we don't have
+        # in usable stock after accounting for on-hand, expiry, and lead time.
         demand: Dict[int, float] = {}
         for iid in ing_ids:
-            d = self._demand_over_lead(iid, horizon_days)
-            if d > 0:
-                demand[iid] = d
+            # Use the default supplier's lead_time_days as the planning lead
+            lead = 1.0
+            def_s_id = default_sup.get(iid)
+            if def_s_id is not None:
+                sup_data = next((s for s in suppliers if s["id"] == def_s_id), None)
+                if sup_data:
+                    lead = float(sup_data.get("lead_time_days") or 1.0)
+            net = self._net_demand_for_sourcing(iid, lead, horizon_days)
+            if net > 0:
+                demand[iid] = net
 
         if not demand:
             self.log_event(
                 "sourcing_plan_skipped",
-                "Sourcing plan skipped: no demand forecast data available.",
+                "Sourcing plan skipped: no net demand — all ingredients sufficiently stocked.",
                 {},
             )
             return
@@ -1296,19 +1432,32 @@ class InventoryOptimizer(BaseAgent):
             logger.exception("Sourcing solve failed entirely; skipping this run.")
             return
 
-        # Compute prev_cost from existing defaults
-        prev_cost = 0.0
-        for iid, qty in demand.items():
+        # Compute prev_cost on the same landed basis as solution.total_cost:
+        # item cost (normalised per-gram × qty) + amortised delivery charge.
+        # Group default suppliers to amortise delivery over all their ingredients.
+        prev_sup_ingredients: Dict[int, List[int]] = {}  # sup_id → [ing_ids]
+        for iid in demand:
             s_id = default_sup.get(iid)
-            if s_id is None:
-                continue
-            c = next(
-                (cc for cc in catalog
-                 if cc["ingredient_id"] == iid and cc["supplier_id"] == s_id),
-                None,
-            )
-            if c:
-                prev_cost += float(c["current_price"] or 0.0) * qty
+            if s_id is not None:
+                prev_sup_ingredients.setdefault(s_id, []).append(iid)
+
+        prev_cost = 0.0
+        for s_id, iids in prev_sup_ingredients.items():
+            sup_data = next((s for s in suppliers if s["id"] == s_id), None)
+            delivery = float(sup_data.get("delivery_charge") or 0.0) if sup_data else 0.0
+            n = len(iids)
+            for iid in iids:
+                qty = demand.get(iid, 0.0)
+                c = next(
+                    (cc for cc in catalog
+                     if cc["ingredient_id"] == iid and cc["supplier_id"] == s_id),
+                    None,
+                )
+                if c:
+                    prev_cost += float(c["current_price"] or 0.0) * qty
+                    # Amortise delivery evenly across this supplier's ingredients
+                    if n > 0:
+                        prev_cost += delivery / n
         savings = round(prev_cost - solution.total_cost, 4)
 
         session = self.db_session_factory()

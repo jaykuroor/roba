@@ -2,6 +2,9 @@
   "meta": {
     "preset_id": "burger_joint",
     "name": "The Burger Joint",
+    "title": "The Burger Joint",
+    "location": "88 Main Street, Downtown",
+    "phone": "+1-555-2288",
     "cuisine": "burger",
     "history_days": 30,
     "history_orders_per_day": 40

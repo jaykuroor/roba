@@ -1205,8 +1205,55 @@ def read_waste(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
 
 
 @app.get("/api/purchase-orders")
-def read_purchase_orders(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
-    return [_row_to_dict(r) for r in db_session.query(models.PurchaseOrder).all()]
+def read_purchase_orders(
+    status: Optional[str] = Query(None, description="Filter by status: proposed|approved|placed|delivered|cancelled"),
+    include_lines: bool = Query(False, description="Include PurchaseOrderLine rows"),
+    limit: Optional[int] = Query(None, description="Max rows (for pagination)"),
+    offset: int = Query(0, description="Row offset (for pagination)"),
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    """List purchase orders with optional status filter, lines, and pagination."""
+    from .formatter import format_qty as _fq  # noqa: PLC0415
+    query = db_session.query(models.PurchaseOrder).order_by(models.PurchaseOrder.id.desc())
+    if status:
+        statuses = [s.strip() for s in status.split(",")]
+        query = query.filter(models.PurchaseOrder.status.in_(statuses))
+    if offset:
+        query = query.offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    orders = query.all()
+    result = []
+    for po in orders:
+        row = _row_to_dict(po)
+        if include_lines:
+            lines = (
+                db_session.query(models.PurchaseOrderLine)
+                .filter(models.PurchaseOrderLine.po_id == po.id)
+                .all()
+            )
+            ing_ids = {int(l.ingredient_id) for l in lines if l.ingredient_id}
+            ings = {int(i.id): i for i in db_session.query(models.Ingredient).filter(
+                models.Ingredient.id.in_(ing_ids)
+            ).all()} if ing_ids else {}
+            sup = db_session.get(models.Supplier, po.supplier_id)
+            row["supplier_name"] = sup.name if sup else str(po.supplier_id)
+            row["lines"] = []
+            for ln in lines:
+                ing = ings.get(int(ln.ingredient_id or 0))
+                base_unit = ing.base_unit if ing else (ln.unit or "g")
+                row["lines"].append({
+                    "id": ln.id,
+                    "ingredient_id": ln.ingredient_id,
+                    "ingredient_name": ing.name if ing else str(ln.ingredient_id),
+                    "qty": ln.qty,
+                    "qty_display": _fq(float(ln.qty or 0), base_unit),
+                    "unit": ln.unit,
+                    "unit_price": ln.unit_price,
+                    "line_total": ln.line_total,
+                })
+        result.append(row)
+    return result
 
 
 @app.get("/api/inventory/lots")
@@ -2157,6 +2204,41 @@ def set_auto_apply(body: AutoApplyBody, db_session: Any = Depends(db.get_db)) ->
     return {"auto_apply": body.auto_apply}
 
 
+@app.get("/api/settings/identity")
+def get_identity(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Return the restaurant identity (title, location, phone)."""
+    settings = db_session.get(models.AppSettings, 1)
+    if settings is None:
+        return {"title": "", "location": "", "phone": ""}
+    return settings.get_identity()
+
+
+class IdentityBody(BaseModel):
+    title: str = ""
+    location: str = ""
+    phone: str = ""
+
+
+@app.post("/api/settings/identity")
+def set_identity(body: IdentityBody, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Update the restaurant identity fields."""
+    settings = db_session.get(models.AppSettings, 1)
+    if settings is None:
+        settings = models.AppSettings(
+            id=1,
+            restaurant_title=body.title or None,
+            restaurant_location=body.location or None,
+            restaurant_phone=body.phone or None,
+        )
+        db_session.add(settings)
+    else:
+        settings.restaurant_title = body.title or settings.restaurant_title
+        settings.restaurant_location = body.location or settings.restaurant_location
+        settings.restaurant_phone = body.phone or settings.restaurant_phone
+    db_session.commit()
+    return settings.get_identity()
+
+
 # ---------------------------------------------------------------------------
 # Sourcing run endpoint (trigger on-demand)
 # ---------------------------------------------------------------------------
@@ -2271,20 +2353,233 @@ def set_supplier_default(
     return {"changed": True, "change_id": change.id}
 
 
+@app.get("/api/track-b/suppliers/overview")
+def get_suppliers_overview(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Per-supplier overview for the Suppliers panel.
+
+    Returns suppliers grouped into 'current' (≥1 default catalog row) and
+    'alternate' (available but not currently default).  Each supplier entry
+    includes its catalog items with planned-order quantities from the most
+    recent SourcingRun, plus any in-flight PurchaseOrders (proposed/approved/placed).
+    """
+    from .formatter import format_qty as _fq, format_price_per_unit as _fpu  # noqa: PLC0415
+
+    # Load all base data in bulk
+    suppliers = db_session.query(models.Supplier).order_by(models.Supplier.name).all()
+    catalog_rows = db_session.query(models.SupplierCatalog).all()
+    ingredients = {int(i.id): i for i in db_session.query(models.Ingredient).all()}
+
+    # Latest SourcingRun assignments → planned qty per (supplier_id, ingredient_id)
+    planned: Dict[tuple, float] = {}
+    latest_run = (
+        db_session.query(models.SourcingRun)
+        .order_by(models.SourcingRun.id.desc())
+        .first()
+    )
+    if latest_run and latest_run.assignments:
+        for asgn in (latest_run.assignments or []):
+            s_id = asgn.get("supplier_id")
+            i_id = asgn.get("ingredient_id")
+            qty = asgn.get("qty", 0)
+            if s_id and i_id:
+                planned[(int(s_id), int(i_id))] = float(qty)
+
+    # Active POs (proposed/approved/placed) lines per supplier
+    active_pos = (
+        db_session.query(models.PurchaseOrder)
+        .filter(models.PurchaseOrder.status.in_(["proposed", "approved", "placed"]))
+        .all()
+    )
+    po_lines_by_supplier: Dict[int, list] = {}
+    if active_pos:
+        po_ids = [po.id for po in active_pos]
+        po_status_by_id = {po.id: po.status for po in active_pos}
+        all_lines = (
+            db_session.query(models.PurchaseOrderLine)
+            .filter(models.PurchaseOrderLine.po_id.in_(po_ids))
+            .all()
+        )
+        for ln in all_lines:
+            po = next((p for p in active_pos if p.id == ln.po_id), None)
+            if po is None:
+                continue
+            sup_id = int(po.supplier_id)
+            po_lines_by_supplier.setdefault(sup_id, []).append({
+                "ingredient_id": ln.ingredient_id,
+                "qty": ln.qty,
+                "unit": ln.unit,
+                "unit_price": ln.unit_price,
+                "line_total": ln.line_total,
+                "po_status": po_status_by_id.get(po.id, po.status),
+            })
+
+    # Group catalog rows by supplier_id
+    catalog_by_supplier: Dict[int, list] = {}
+    for row in catalog_rows:
+        catalog_by_supplier.setdefault(int(row.supplier_id), []).append(row)
+
+    def _build_supplier_entry(sup: Any) -> Dict[str, Any]:
+        sup_id = int(sup.id)
+        cat_rows = catalog_by_supplier.get(sup_id, [])
+        items = []
+        for cat in sorted(cat_rows, key=lambda c: int(c.ingredient_id or 0)):
+            ing_id = int(cat.ingredient_id)
+            ing = ingredients.get(ing_id)
+            base_unit = ing.base_unit if ing else "g"
+            ing_name = ing.name if ing else str(ing_id)
+            # Planned qty from latest SourcingRun
+            p_qty = planned.get((sup_id, ing_id))
+            # Price normalised for display (per kg / per L)
+            price_disp_val, price_disp_unit = _fpu(
+                float(cat.current_price or 0), base_unit
+            )
+            items.append({
+                "catalog_id": cat.id,
+                "ingredient_id": ing_id,
+                "ingredient_name": ing_name,
+                "is_default": bool(cat.is_default),
+                "current_price": cat.current_price,
+                "price_display": f"{price_disp_val:.2f} per {price_disp_unit}",
+                "unit": cat.unit,
+                "base_unit": base_unit,
+                "availability": cat.availability,
+                "planned_qty": p_qty,
+                "planned_qty_display": _fq(p_qty, base_unit) if p_qty is not None else None,
+            })
+        # PO lines for this supplier (in-flight orders)
+        po_items = []
+        for ln in po_lines_by_supplier.get(sup_id, []):
+            ing_id = int(ln["ingredient_id"] or 0)
+            ing = ingredients.get(ing_id)
+            base_unit = ing.base_unit if ing else (ln.get("unit") or "g")
+            po_items.append({
+                "ingredient_id": ing_id,
+                "ingredient_name": ing.name if ing else str(ing_id),
+                "qty": ln["qty"],
+                "qty_display": _fq(float(ln["qty"] or 0), base_unit),
+                "unit_price": ln["unit_price"],
+                "line_total": ln["line_total"],
+                "po_status": ln["po_status"],
+            })
+        is_current = any(c.is_default for c in cat_rows)
+        return {
+            "id": sup_id,
+            "name": sup.name,
+            "phone": sup.phone,
+            "lead_time_days": sup.lead_time_days,
+            "reliability_score": sup.reliability_score,
+            "min_order_value": sup.min_order_value,
+            "delivery_charge": sup.delivery_charge,
+            "is_current": is_current,
+            "items": items,
+            "active_po_items": po_items,
+        }
+
+    current = []
+    alternate = []
+    for sup in suppliers:
+        entry = _build_supplier_entry(sup)
+        if entry["is_current"]:
+            current.append(entry)
+        else:
+            alternate.append(entry)
+
+    return {"current": current, "alternate": alternate}
+
+
+class OnboardSupplierBody(BaseModel):
+    name: str
+    phone: Optional[str] = None
+    lead_time_days: float = 3.0
+    reliability_score: float = 0.9
+    min_order_value: float = 0.0
+
+
+@app.post("/api/suppliers/onboard")
+def onboard_new_supplier(
+    body: OnboardSupplierBody,
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
+    """Create a new supplier and stage an onboarding call approval card.
+
+    Returns the new supplier row plus a ManagerChange id so the manager desk
+    shows a 'Call to onboard' confirmation card immediately.
+    """
+    import time as _time  # noqa: PLC0415
+
+    new_sup = models.Supplier(
+        name=body.name,
+        phone=body.phone,
+        lead_time_days=body.lead_time_days,
+        reliability_score=body.reliability_score,
+        min_order_value=body.min_order_value,
+        delivery_charge=0.0,
+    )
+    db_session.add(new_sup)
+    db_session.flush()  # get id
+
+    # Stage an onboarding call via CallSubsystem if available
+    calls = getattr(ctx, "calls", None)
+    call_id = None
+    if calls is not None:
+        try:
+            call = calls.request(
+                agent="manager",
+                counterparty_type="supplier",
+                counterparty_id=int(new_sup.id),
+                purpose="onboarding",
+                require_approval=True,
+            )
+            call_id = call.id
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Create a ManagerChange card so the desk feed shows the onboarding request
+    change = models.ManagerChange(
+        kind="onboarding",
+        status="pending",
+        auto_applied=0,
+        summary=f"New supplier: call {body.name} to onboard",
+        details={
+            "supplier_id": int(new_sup.id),
+            "supplier_name": body.name,
+            "phone": body.phone,
+            "call_id": call_id,
+            "rationale": f"Onboarding call requested for new supplier '{body.name}'",
+        },
+        created_at=_time.time(),
+        resolved_at=None,
+    )
+    db_session.add(change)
+    db_session.commit()
+    db_session.refresh(new_sup)
+    db_session.refresh(change)
+    ctx.hub.broadcast("manager_change", {"change_id": change.id})
+
+    return {
+        "supplier": _row_to_dict(new_sup),
+        "change_id": change.id,
+        "call_id": call_id,
+    }
+
+
 class NegotiateBody(BaseModel):
     supplier_id: int
-    ingredient_id: int
+    ingredient_id: Optional[int] = None
+    note: Optional[str] = None
 
 
 @app.post("/api/market/negotiate")
 def market_negotiate(body: NegotiateBody) -> Dict[str, Any]:
-    """Presenter-triggered negotiation (SupplierEditor's "Negotiate" button,
-    02 §B6) — routes into Track B's Market Spectator, which creates the
-    approval-gated outbound call (§8.2)."""
+    """Presenter-triggered negotiation — creates an approval-gated outbound call.
+
+    Accepts an optional free-text ``note`` that is forwarded to the AI caller
+    as operator instructions, and an optional ``ingredient_id`` to focus on.
+    """
     market = (ctx.tracks.get("track_b") or {}).get("market_spectator")
     if market is None:
         raise HTTPException(status_code=503, detail="Market Spectator not active")
-    market.negotiate(body.supplier_id, body.ingredient_id)
+    market.negotiate(body.supplier_id, body.ingredient_id, note=body.note or "")
     return {"supplier_id": body.supplier_id, "ingredient_id": body.ingredient_id, "requested": True}
 
 

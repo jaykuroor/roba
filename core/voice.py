@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from .clock import DAY_CLOSE_OFFSET, DAY_OPEN_OFFSET, SECONDS_PER_DAY
 from .config import EVENT_MULT, VOICE_DEFAULT_MODE, VOICE_EMIT_LEGACY_USER_FACT
+from .formatter import format_qty, format_price_per_unit
 from .llm import CANNED_NOTE
 from .module_capabilities import capability_prompt_context
 from .models import (
@@ -807,24 +808,86 @@ class VoiceProcessor:
         finally:
             session.close()
 
+    def _resolve_supplier_for_ingredient(
+        self, ingredient_text: str
+    ) -> tuple:
+        """Resolve (ingredient_id, ingredient_name, supplier_id, supplier_name)
+        for the default supplier of the named ingredient.
+
+        Falls back to first catalog row for that ingredient if no default.
+        Returns (None, ingredient_text, None, ingredient_text) when not found.
+        """
+        from .models import Ingredient as _Ing, SupplierCatalog as _SCat, Supplier as _Sup
+        low = ingredient_text.lower().strip()
+        session = self.db_session_factory()
+        try:
+            # Find ingredient by name (fuzzy)
+            ings = session.query(_Ing).all()
+            ing = None
+            for candidate in sorted(ings, key=lambda i: len(i.name or ""), reverse=True):
+                if (candidate.name or "").lower() == low:
+                    ing = candidate
+                    break
+            if ing is None:
+                for candidate in sorted(ings, key=lambda i: len(i.name or ""), reverse=True):
+                    if low in (candidate.name or "").lower():
+                        ing = candidate
+                        break
+            if ing is None:
+                return (None, ingredient_text, None, ingredient_text)
+            # Find default catalog row
+            default_cat = (
+                session.query(_SCat)
+                .filter(_SCat.ingredient_id == ing.id, _SCat.is_default == 1)
+                .first()
+            )
+            if default_cat is None:
+                # Any catalog row
+                default_cat = (
+                    session.query(_SCat)
+                    .filter(_SCat.ingredient_id == ing.id)
+                    .first()
+                )
+            if default_cat is None:
+                return (int(ing.id), str(ing.name), None, ingredient_text)
+            sup = session.get(_Sup, default_cat.supplier_id)
+            return (
+                int(ing.id),
+                str(ing.name),
+                int(default_cat.supplier_id),
+                str(sup.name) if sup else ingredient_text,
+            )
+        finally:
+            session.close()
+
     def _resolve_counterparty_id(self, ctype: str, text: str) -> int:
-        """Resolve a competitor or supplier id from text (best-effort, 0 if unknown)."""
+        """Resolve a competitor or supplier id from text (best-effort, 0 if unknown).
+
+        For competitors, also matches on cuisine type (e.g. 'pizza' → first
+        competitor whose cuisine contains 'pizza').
+        """
         from .models import Competitor
-        low = text.lower()
+        low = (text or "").lower()
         session = self.db_session_factory()
         try:
             if ctype == "competitor":
                 rows = session.query(Competitor).all()
+                # First pass: name match
                 for row in sorted(rows, key=lambda r: len(r.name or ""), reverse=True):
-                    if (row.name or "").lower() in low:
+                    if (row.name or "").lower() in low or low in (row.name or "").lower():
                         return int(row.id)
-                # Return first competitor as fallback.
+                # Second pass: cuisine match (e.g. "pizza")
+                for row in rows:
+                    cuisine = (row.cuisine or "").lower()
+                    if low and (low in cuisine or cuisine in low):
+                        return int(row.id)
+                # Fallback: first competitor
                 first = session.query(Competitor).first()
                 return int(first.id) if first else 0
             elif ctype == "supplier":
                 rows = session.query(Supplier).all()
                 for row in sorted(rows, key=lambda r: len(r.name or ""), reverse=True):
-                    if (row.name or "").lower() in low:
+                    if (row.name or "").lower() in low or low in (row.name or "").lower():
                         return int(row.id)
                 first = session.query(Supplier).first()
                 return int(first.id) if first else 0
@@ -961,30 +1024,32 @@ class VoiceProcessor:
                 int(ingredient.id): ingredient
                 for ingredient in session.query(Ingredient).all()
             }
-            inventory_rows = [
-                {
-                    "ingredient_id": int(level.ingredient_id),
-                    "name": (
-                        str(ingredient_lookup[int(level.ingredient_id)].name or "")
-                        if int(level.ingredient_id) in ingredient_lookup
-                        else str(level.ingredient_id)
-                    ),
-                    # on_hand is expressed in the ingredient's base unit (g | ml | each).
-                    "unit": (
-                        str(ingredient_lookup[int(level.ingredient_id)].base_unit or "")
-                        if int(level.ingredient_id) in ingredient_lookup
-                        else None
-                    ),
-                    "on_hand": float(level.on_hand_cached or 0.0),
+            _inv_rows_raw = (
+                session.query(InventoryLevel)
+                .order_by(InventoryLevel.ingredient_id.asc())
+                .all()
+            )
+            inventory_rows = []
+            for level in _inv_rows_raw[:40]:
+                _iid = int(level.ingredient_id)
+                _ing = ingredient_lookup.get(_iid)
+                _base_unit = str(_ing.base_unit or "g") if _ing else "g"
+                _on_hand_raw = float(level.on_hand_cached or 0.0)
+                # Format quantity in human-readable units (g→kg above 1000)
+                _on_hand_fmt = format_qty(_on_hand_raw, _base_unit)
+                inventory_rows.append({
+                    "ingredient_id": _iid,
+                    "name": str(_ing.name or "") if _ing else str(_iid),
+                    # on_hand_display is already in the right display unit (kg/L/each)
+                    "on_hand_display": _on_hand_fmt,
+                    # Raw value kept for tool use; display field should be preferred for speech
+                    "on_hand": _on_hand_raw,
+                    "unit": _base_unit,
                     "last_counted_qty": (
                         float(level.last_counted_qty)
                         if level.last_counted_qty is not None else None
                     ),
-                }
-                for level in session.query(InventoryLevel)
-                .order_by(InventoryLevel.ingredient_id.asc())
-                .all()
-            ][:40]
+                })
 
             # --- batch board (last 6 sim-hours, capped at 15 rows) ---
             from . import kitchen as _kitchen
@@ -1063,7 +1128,7 @@ class VoiceProcessor:
                 "category_rule": "Category words like dessert, desserts, pizza, pasta, or beverages cascade to every active menu item in that category.",
                 "equipment_rule": "Equipment failures only affect items whose station, category, item name, or description indicates that equipment.",
                 "hard_zero_rule": "Broken equipment, out-of-stock required ingredients, no-more, over, done, finished, and 86 instructions are hard production_unavailable constraints.",
-                "inventory_units_rule": "Each inventory row has a 'name' and a 'unit' (g, ml, or each); 'on_hand' is the quantity in that unit. Always state the unit when reporting a quantity and never read 'on_hand' as a raw item count.",
+                "inventory_units_rule": "Each inventory row has 'on_hand_display' (pre-formatted, e.g. '1.5 kg' or '800 g') — always use this field when speaking quantities. Quantities ≥ 1000 g are already expressed as kg; ≥ 1000 ml as L. Never report raw 'on_hand' grams when on_hand_display is available. Always include the unit.",
                 "status_vocabulary": (
                     "Batch state vocabulary (use EXACTLY these terms — do not invent others): "
                     "state=skipped: decision is 'skip', do not cook; "
@@ -1103,19 +1168,24 @@ class VoiceProcessor:
                 .all()
             ):
                 ing = ingredients.get(int(level.ingredient_id))
+                base_unit = str(ing.base_unit or "g") if ing and ing.base_unit else "g"
+                on_hand_raw = float(level.on_hand_cached or 0.0)
+                par_raw = float(level.par_level) if level.par_level is not None else None
+                reorder_raw = float(level.reorder_point) if level.reorder_point is not None else None
                 all_rows.append({
                     "ingredient_id": int(level.ingredient_id),
                     "name": str(ing.name or "") if ing else str(level.ingredient_id),
-                    "unit": (str(ing.base_unit or "") if ing and ing.base_unit else None),
-                    "on_hand": float(level.on_hand_cached or 0.0),
+                    "unit": base_unit,
+                    "on_hand": on_hand_raw,
+                    "on_hand_display": format_qty(on_hand_raw, base_unit),
                     "last_counted_qty": (
                         float(level.last_counted_qty)
                         if level.last_counted_qty is not None else None
                     ),
-                    "par_level": float(level.par_level) if level.par_level is not None else None,
-                    "reorder_point": (
-                        float(level.reorder_point) if level.reorder_point is not None else None
-                    ),
+                    "par_level": par_raw,
+                    "par_level_display": format_qty(par_raw, base_unit) if par_raw is not None else None,
+                    "reorder_point": reorder_raw,
+                    "reorder_point_display": format_qty(reorder_raw, base_unit) if reorder_raw is not None else None,
                 })
         finally:
             session.close()

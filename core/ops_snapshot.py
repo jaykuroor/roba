@@ -199,15 +199,20 @@ def build_ops_snapshot(
         # 6. Low-stock / OOS constraints
         # ------------------------------------------------------------------
         low_stock_items: List[Dict[str, Any]] = []
+        from .formatter import format_qty as _fq
         for inv in session.query(InventoryLevel).all():
             oh = float(inv.on_hand_cached or 0)
             ss = float(inv.safety_stock or 0)
             if oh <= max(ss, 0):
                 ing = session.get(Ingredient, inv.ingredient_id)
+                base_unit = str(ing.base_unit or "g") if ing else "g"
                 low_stock_items.append({
                     "ingredient": ing.name if ing else str(inv.ingredient_id),
                     "on_hand": oh,
+                    "on_hand_display": _fq(oh, base_unit),
                     "safety_stock": ss,
+                    "safety_stock_display": _fq(ss, base_unit),
+                    "unit": base_unit,
                     "status": "depleted" if oh <= 0 else "below_safety_stock",
                 })
 

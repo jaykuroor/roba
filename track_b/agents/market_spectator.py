@@ -62,12 +62,16 @@ class MarketSpectator(BaseAgent):
     def attach_calls(self, calls: Any) -> None:
         self.calls = calls
 
-    def negotiate(self, supplier_id: int, ingredient_id: int) -> None:
+    def negotiate(self, supplier_id: int, ingredient_id: Optional[int] = None, note: str = "") -> None:
         """Presenter-triggered negotiation (the SupplierEditor "Negotiate"
-        button, §B6) — same path the periodic price review uses."""
-        if (supplier_id, ingredient_id) in self._negotiating:
+        button, §B6) — same path the periodic price review uses.
+
+        ``ingredient_id`` may be None (negotiate general supplier terms).
+        ``note`` is an optional operator instruction forwarded to the AI caller.
+        """
+        if ingredient_id is not None and (supplier_id, ingredient_id) in self._negotiating:
             return
-        self._start_negotiation(supplier_id, ingredient_id)
+        self._start_negotiation(supplier_id, ingredient_id, note=note)
 
     # -- signal handling ----------------------------------------------------
 
@@ -186,10 +190,10 @@ class MarketSpectator(BaseAgent):
             return float(prices[mid])
         return float(prices[mid - 1] + prices[mid]) / 2.0
 
-    def _start_negotiation(self, supplier_id: int, ingredient_id: int) -> None:
+    def _start_negotiation(self, supplier_id: int, ingredient_id: Optional[int], note: str = "") -> None:
         session = self.db_session_factory()
         try:
-            ing_name = self._ingredient_name(session, ingredient_id)
+            ing_name = self._ingredient_name(session, ingredient_id) if ingredient_id else "general terms"
         finally:
             session.close()
 
@@ -198,8 +202,11 @@ class MarketSpectator(BaseAgent):
             counterparty_type="supplier",
             counterparty_id=supplier_id,
             purpose=f"negotiate {ing_name} price",
+            note=note,
+            ingredient_id=ingredient_id,
         )
-        self._call_ingredient[call.id] = ingredient_id
+        if ingredient_id is not None:
+            self._call_ingredient[call.id] = ingredient_id
         self._negotiating.add((supplier_id, ingredient_id))
 
         # Record cooldown timestamp so we don't re-request within NEGOTIATION_COOLDOWN_SIM_S

@@ -461,7 +461,7 @@ function CardsBoard({
   const recentChanges = changes.filter((c) => c.status === "applied").slice(0, 5);
 
   return (
-    <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
+    <div className="flex flex-col gap-3 p-3">
       {/* Active call */}
       {activeCall && <ActiveCallCard />}
 
@@ -721,10 +721,20 @@ export function ManagerVoice() {
     </details>
   ) : null;
 
-  const cardsBoard = <CardsBoard approvals={approvals} onResolve={handleResolve} />;
+  const cardsBoard = (
+    <section className="flex flex-col min-h-0 rounded-xl border border-muted/40 bg-surface/60 overflow-hidden">
+      <div className="shrink-0 flex items-center gap-2 border-b border-muted/30 px-3 py-2.5">
+        <Radio size={14} className="text-accent" />
+        <span className="text-sm font-semibold text-text">Ops Board</span>
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <CardsBoard approvals={approvals} onResolve={handleResolve} />
+      </div>
+    </section>
+  );
 
   const voiceDesk = (
-    <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
+    <div className="flex flex-col gap-3 min-h-0 overflow-hidden">
       {modeToggles}
       {errorStrip}
       {micArea}

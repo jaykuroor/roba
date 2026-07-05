@@ -948,6 +948,8 @@ class Call(Base):
     started_at = mapped_column(Float)
     ended_at = mapped_column(Float)
     clock_action = mapped_column(String)       # freeze | slow
+    # Optional per-call metadata: {note, ingredient_id, ingredient_name, intel_goal}
+    call_metadata = mapped_column(JSON, nullable=True)
 
     def __repr__(self):
         return (f"<Call id={self.id} agent={self.agent!r} "
@@ -1114,6 +1116,10 @@ class AppSettings(Base):
       Acts as a hysteresis guard — prevents churn on small savings.
 
     ``sourcing_horizon_days``: how many days of demand to plan for in each solve.
+
+    ``restaurant_title`` / ``restaurant_location`` / ``restaurant_phone``: identity
+      fields seeded from the active preset's meta block; surfaced to outbound call
+      personas so the AI says the correct restaurant name and address.
     """
     __tablename__ = "app_settings"
 
@@ -1121,10 +1127,23 @@ class AppSettings(Base):
     auto_apply_supplier_changes = mapped_column(Integer, default=0)  # bool 0/1
     sourcing_switching_cost = mapped_column(Float, default=5.0)
     sourcing_horizon_days = mapped_column(Float, default=7.0)
+    # Restaurant identity (seeded from preset meta; nullable so upgrades are safe)
+    restaurant_title = mapped_column(String, nullable=True)
+    restaurant_location = mapped_column(String, nullable=True)
+    restaurant_phone = mapped_column(String, nullable=True)
+
+    def get_identity(self) -> dict:
+        """Return restaurant identity with safe fallbacks."""
+        return {
+            "title": self.restaurant_title or "the restaurant",
+            "location": self.restaurant_location or "",
+            "phone": self.restaurant_phone or "",
+        }
 
     def __repr__(self):
         return (f"<AppSettings id={self.id} "
-                f"auto_apply={self.auto_apply_supplier_changes}>")
+                f"auto_apply={self.auto_apply_supplier_changes} "
+                f"title={self.restaurant_title!r}>")
 
 
 # ---------------------------------------------------------------------------
