@@ -109,6 +109,9 @@ def _ensure_columns() -> None:
         ("app_settings",    "restaurant_phone",        "TEXT"),
         # Per-call operator metadata (note, ingredient, intel_goal)
         ("calls",           "call_metadata",           "TEXT"),   # JSON stored as TEXT
+        # SupplierTerm columns (added with robust-capture workstream)
+        ("supplier_terms",  "unit_basis",              "TEXT"),
+        ("supplier_terms",  "manager_change_id",       "INTEGER"),
     ]
     conn = engine.raw_connection()
     try:

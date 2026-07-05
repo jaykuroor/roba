@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .llm import CANNED_NOTE
 from . import call_personas
-from .models import Call, Competitor, CompetitorOffer, Supplier, SupplierCatalog
+from .models import Call, Competitor, CompetitorOffer, Ingredient, Supplier, SupplierCatalog, SupplierTerm
 from .signals import SignalType
 
 logger = logging.getLogger(__name__)
@@ -403,17 +403,22 @@ class CallSubsystem:
             source="calls",
         )
 
-        # Persist a call_price ManagerChange when a supplier negotiation agreed a price.
-        if (
-            isinstance(outcome, dict)
-            and call.counterparty_type == "supplier"
-            and outcome.get("agreed")
-            and outcome.get("agreed_price") is not None
-        ):
-            try:
-                self._create_call_price_change(call, outcome)
-            except Exception as _exc:  # noqa: BLE001
-                logger.warning("call_price ManagerChange creation failed: %s", _exc)
+        # Persist SupplierTerm cards from post-call extraction (new array format).
+        # For supplier calls the schema now returns {"updates": [...]}.
+        # Any terms already captured live by record_supplier_update are skipped (dedupe).
+        if isinstance(outcome, dict) and call.counterparty_type == "supplier":
+            updates = outcome.get("updates")
+            if isinstance(updates, list) and updates:
+                try:
+                    self._process_extracted_updates(call, updates)
+                except Exception as _exc:  # noqa: BLE001
+                    logger.warning("extracted supplier updates processing failed: %s", _exc)
+            # Backward-compat: old single-price schema (text calls, legacy)
+            elif outcome.get("agreed") and outcome.get("agreed_price") is not None:
+                try:
+                    self._create_call_price_change(call, outcome)
+                except Exception as _exc:  # noqa: BLE001
+                    logger.warning("call_price ManagerChange creation failed: %s", _exc)
 
         # Restore the clock to its pre-call state/speed (§6.3).
         restore = self._clock_restore.pop(call_id, None)
@@ -515,7 +520,14 @@ class CallSubsystem:
         """Send the transcript to the LLM with the §8.5 schema and store the
         parsed result in ``calls.outcome``. Writes **no** track tables — the
         initiating agent persists its own record on ``CALL_OUTCOME``. A canned
-        / unusable parse stores ``null`` (safe no-op)."""
+        / unusable parse stores ``null`` (safe no-op).
+
+        For supplier calls, uses a hardened extraction prompt with:
+        - explicit verbatim-grounding rules (no paraphrase, no inference)
+        - deterministic amount reporting (LLM reports raw number, Python normalises)
+        - low temperature (0.2) to minimise hallucination
+        - structured array schema covering discounts, scope (all/ingredient), and expiry
+        """
         call = self._load(call_id)
         if call is None:
             return None
@@ -524,20 +536,45 @@ class CallSubsystem:
         transcript_text = "\n".join(
             f"{t.get('role')}: {t.get('text')}" for t in (call.transcript or [])
         )
+
+        if call.counterparty_type == "supplier":
+            system_prompt = (
+                "You extract ALL supplier updates from a call transcript. "
+                "The caller is a supplier phoning the restaurant.\n\n"
+                "CRITICAL RULES — follow exactly:\n"
+                "1. NEVER invent or infer values. Extract ONLY what the caller explicitly stated.\n"
+                "2. VERBATIM QUOTE: verbatim_quote must be the caller's exact words. Never paraphrase.\n"
+                "3. DISCOUNTS vs PRICES: '20% off' = update_type=discount, amount_kind=percent_discount, amount=20. "
+                "A price like '€4.20 per kg' = update_type=price_change, amount_kind=absolute_price, amount=4.20, unit=per_kg.\n"
+                "4. DO NOT DO MATH. Report amount exactly as stated. '20%' → amount=20.0, NOT 0.20. "
+                "The system normalises amounts in code — never convert.\n"
+                "5. SCOPE: 'all items' / 'everything' / 'all products' / 'whole range' → scope=all. "
+                "Named item → scope=ingredient, ingredient_name=<exact name stated>.\n"
+                "6. EXPIRY: No expiry stated → expiry_kind=none. "
+                "'for 2 orders' → expiry_kind=for_n_orders, expires_hint='for 2 orders'. "
+                "'until end of month' → expiry_kind=until_date, expires_hint='until end of month'.\n"
+                "7. CONFIDENCE: 1.0 = caller stated it clearly. 0.5 = somewhat ambiguous. "
+                "0.0 = you'd be guessing. Do not include items below 0.5.\n"
+                "8. If nothing was stated, return {\"updates\": []}.\n"
+            )
+        else:
+            system_prompt = (
+                "You extract the structured outcome of a phone call from its transcript. "
+                "Respond only with JSON matching the requested fields. "
+                "If nothing usable was agreed/learned, return empty values."
+            )
+
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You extract the structured outcome of a phone call from its "
-                    "transcript. Respond only with JSON matching the requested "
-                    "fields. If nothing usable was agreed/learned, return empty "
-                    "values."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": transcript_text},
         ]
+
+        # Low temperature for supplier extraction to minimise hallucination.
+        temp = 0.2 if call.counterparty_type == "supplier" else None
+        max_tok = 600 if call.counterparty_type == "supplier" else 300
         result = self.llm.complete(
-            messages, json_schema=schema, max_tokens=300, use_site="outcome_extraction"
+            messages, json_schema=schema, max_tokens=max_tok,
+            use_site="outcome_extraction", temperature=temp,
         )
 
         if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
@@ -700,17 +737,72 @@ class CallSubsystem:
 
     @staticmethod
     def _outcome_schema(counterparty_type: str) -> Dict[str, Any]:
-        """The §8.5 JSON schema for the outcome, by counterparty type."""
+        """The §8.5 JSON schema for the outcome, by counterparty type.
+
+        Supplier schema: array of structured updates so discounts, scope (all/ingredient),
+        and expiry are captured faithfully without hallucination.
+        Competitor schema: unchanged (popular_dishes / price_points).
+        """
         if counterparty_type == "supplier":
             return {
                 "type": "object",
                 "properties": {
-                    "ingredient_id": {"type": "integer"},
-                    "agreed_price": {"type": "number"},
-                    "agreed_terms": {"type": "string"},
-                    "agreed": {"type": "boolean"},
+                    "updates": {
+                        "type": "array",
+                        "description": "All pricing/discount/availability/lead-time updates the caller stated.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "update_type": {
+                                    "type": "string",
+                                    "description": "price_change | discount | availability | lead_time | other",
+                                },
+                                "scope": {
+                                    "type": "string",
+                                    "description": "'all' if applies to all items from this supplier, 'ingredient' if specific.",
+                                },
+                                "ingredient_name": {
+                                    "type": "string",
+                                    "description": "Exact ingredient name as stated (omit when scope=all).",
+                                },
+                                "amount": {
+                                    "type": "number",
+                                    "description": "Numeric value exactly as stated (20 for '20%', 4.20 for '€4.20'). Do NOT convert.",
+                                },
+                                "amount_kind": {
+                                    "type": "string",
+                                    "description": "absolute_price | percent_discount | percent_increase | availability_status | days",
+                                },
+                                "unit": {
+                                    "type": "string",
+                                    "description": "Unit as stated, e.g. 'per_kg', 'per_g', 'per_litre', 'each'. Omit if not applicable.",
+                                },
+                                "effective": {
+                                    "type": "string",
+                                    "description": "'immediate' or 'from_date'.",
+                                },
+                                "expiry_kind": {
+                                    "type": "string",
+                                    "description": "'none' (permanent), 'until_date', 'for_n_orders'.",
+                                },
+                                "expires_hint": {
+                                    "type": "string",
+                                    "description": "Natural-language expiry as stated, e.g. 'end of month', 'for 2 orders'. Omit if none.",
+                                },
+                                "verbatim_quote": {
+                                    "type": "string",
+                                    "description": "The caller's EXACT words stating this update. Never paraphrase.",
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "description": "0.0–1.0 confidence this was clearly stated (not inferred).",
+                                },
+                            },
+                            "required": ["update_type", "scope", "amount_kind", "verbatim_quote", "confidence"],
+                        },
+                    },
                 },
-                "required": ["agreed"],
+                "required": ["updates"],
             }
         return {
             "type": "object",
@@ -720,6 +812,402 @@ class CallSubsystem:
             },
             "required": ["popular_dishes"],
         }
+
+    # -- supplier-term helpers (live capture + extraction) ------------------
+
+    def _fuzzy_match_ingredient(
+        self, session: Any, supplier_id: int, ingredient_name: str
+    ) -> Optional[int]:
+        """Return the ingredient_id for a given name, fuzzy-matching against the
+        supplier's catalog. Returns None when no match is found or name is blank."""
+        if not ingredient_name:
+            return None
+        needle = ingredient_name.strip().lower()
+        cats = (
+            session.query(SupplierCatalog, Ingredient)
+            .join(Ingredient, SupplierCatalog.ingredient_id == Ingredient.id)
+            .filter(SupplierCatalog.supplier_id == supplier_id)
+            .all()
+        )
+        # Exact match first
+        for cat, ing in cats:
+            if ing.name and ing.name.strip().lower() == needle:
+                return int(cat.ingredient_id)
+        # Substring / prefix match
+        for cat, ing in cats:
+            if ing.name and (needle in ing.name.strip().lower() or ing.name.strip().lower() in needle):
+                return int(cat.ingredient_id)
+        return None
+
+    @staticmethod
+    def _normalise_term_value(
+        amount: float, amount_kind: str, unit: str
+    ) -> Tuple[str, float]:
+        """Return (term_type, normalised_value) from the raw LLM-reported amount.
+
+        All math is deterministic Python — the LLM reports amounts exactly as
+        stated (e.g. 20 for '20%') and we convert here.
+
+        For price_override, value is normalised to per-gram to match
+        SupplierCatalog.current_price semantics.
+        For discount, value is a fraction (0.0–1.0).
+        """
+        kind = (amount_kind or "").strip().lower()
+        u = (unit or "per_kg").strip().lower()
+        if kind in ("percent_discount",):
+            # Clamp to sane range (0-100 %)
+            frac = max(0.0, min(1.0, float(amount) / 100.0))
+            return "discount", frac
+        if kind in ("percent_increase",):
+            frac = max(0.0, float(amount) / 100.0)
+            return "discount", -frac   # negative discount = price increase term
+        # price_change / absolute_price
+        price = float(amount)
+        if u in ("per_kg", "kg"):
+            return "price_override", price / 1000.0
+        if u in ("per_100g",):
+            return "price_override", price / 100.0
+        if u in ("per_litre", "litre", "per_l", "l"):
+            return "price_override", price / 1000.0
+        if u in ("per_g", "g", "gram"):
+            return "price_override", price
+        # each / unit / pack — treat as-is (non-weight items)
+        return "price_override", price
+
+    @staticmethod
+    def _parse_expiry(
+        expiry_kind: str, expires_hint: str, n: Any, now: float
+    ) -> Tuple[str, Optional[float], Optional[int]]:
+        """Return (expiry_kind, expires_at, remaining_orders) from hint text.
+
+        Python does all date arithmetic; the LLM only supplies the raw text and
+        an enum tag.  On parse failure defaults to 'none' (permanent).
+        """
+        kind = (expiry_kind or "none").strip().lower()
+        hint = (expires_hint or "").strip().lower()
+
+        if kind in ("none", "permanent", ""):
+            return "none", None, None
+
+        if kind == "for_n_orders":
+            try:
+                count = int(float(str(n or 0)))
+            except (ValueError, TypeError):
+                # Try to extract a number from the hint text
+                import re as _re
+                m = _re.search(r"(\d+)", hint)
+                count = int(m.group(1)) if m else 1
+            return "orders", None, max(1, count)
+
+        if kind == "until_date":
+            # Parse common natural-language hints to sim-second offsets from now.
+            import re as _re
+            SECONDS_PER_DAY = 86400.0
+            m_days = _re.search(r"(\d+)\s*day", hint)
+            m_weeks = _re.search(r"(\d+)\s*week", hint)
+            m_months = _re.search(r"(\d+)\s*month", hint)
+            if m_months:
+                offset = float(m_months.group(1)) * 30 * SECONDS_PER_DAY
+            elif m_weeks:
+                offset = float(m_weeks.group(1)) * 7 * SECONDS_PER_DAY
+            elif m_days:
+                offset = float(m_days.group(1)) * SECONDS_PER_DAY
+            elif "end of month" in hint or "month end" in hint:
+                offset = 30 * SECONDS_PER_DAY
+            elif "end of week" in hint or "friday" in hint:
+                offset = 7 * SECONDS_PER_DAY
+            elif "next week" in hint:
+                offset = 7 * SECONDS_PER_DAY
+            elif "next month" in hint:
+                offset = 30 * SECONDS_PER_DAY
+            else:
+                # Unknown text — store as 90-day expiry (long default, manager can adjust)
+                offset = 90 * SECONDS_PER_DAY
+            return "date", now + offset, None
+
+        return "none", None, None
+
+    def _create_supplier_term(
+        self,
+        *,
+        call: Any,
+        term_type: str,
+        value: float,
+        scope: str,
+        ingredient_id: Optional[int],
+        unit_basis: str,
+        effective_at: float,
+        expiry_kind: str,
+        expires_at: Optional[float],
+        remaining_orders: Optional[int],
+        verbatim_quote: str,
+    ) -> Optional["SupplierTerm"]:
+        """Upsert a SupplierTerm and create a ManagerChange desk card.
+
+        Deduplicates against existing terms for the same call to prevent double-capture
+        when both the live tool and post-call extraction fire for the same update.
+        Returns the term row, or None if a duplicate was found.
+        """
+        from .models import ManagerChange as _MC  # noqa: PLC0415
+
+        now = effective_at
+        session = self.db_session_factory()
+        try:
+            # Deduplicate: same call, same type, same scope, same ingredient
+            existing = (
+                session.query(SupplierTerm)
+                .filter(
+                    SupplierTerm.source_call_id == call.id,
+                    SupplierTerm.term_type == term_type,
+                    SupplierTerm.scope == scope,
+                    SupplierTerm.ingredient_id == ingredient_id,
+                )
+                .first()
+            )
+            if existing is not None:
+                return None  # already captured by live tool
+
+            # Resolve ingredient + supplier names for summary display
+            sup = session.get(Supplier, call.counterparty_id)
+            sup_name = sup.name if sup else f"Supplier #{call.counterparty_id}"
+            ing_name = "all items"
+            if ingredient_id is not None:
+                ing = session.get(Ingredient, ingredient_id)
+                ing_name = ing.name if ing else f"ingredient #{ingredient_id}"
+
+            # Build human-readable summary
+            if term_type == "discount":
+                pct = round(abs(value) * 100, 1)
+                direction = "increase" if value < 0 else "discount"
+                if scope == "all":
+                    summary = f"{pct}% {direction} on all items from {sup_name}"
+                else:
+                    summary = f"{pct}% {direction} on {ing_name} ({sup_name})"
+            else:  # price_override
+                # Convert per-gram back to per-kg for display
+                disp_price = value * 1000
+                if scope == "all":
+                    summary = f"New price on all items from {sup_name}: €{disp_price:.2f}/kg"
+                else:
+                    summary = f"New price for {ing_name} ({sup_name}): €{disp_price:.2f}/kg"
+
+            if expiry_kind == "orders":
+                summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
+            elif expiry_kind == "date" and expires_at:
+                days_left = max(1, round((expires_at - now) / 86400))
+                summary += f" (expires in ~{days_left} days)"
+            else:
+                summary += " (permanent)"
+
+            term = SupplierTerm(
+                supplier_id=call.counterparty_id,
+                ingredient_id=ingredient_id,
+                term_type=term_type,
+                value=value,
+                unit_basis=unit_basis,
+                scope=scope,
+                effective_at=effective_at,
+                expiry_kind=expiry_kind,
+                expires_at=expires_at,
+                remaining_orders=remaining_orders,
+                status="pending",
+                source_call_id=call.id,
+                verbatim_quote=verbatim_quote,
+                created_at=now,
+            )
+            session.add(term)
+            session.flush()
+
+            # Create ManagerChange desk card
+            details: Dict[str, Any] = {
+                "term_type": term_type,
+                "value": value,
+                "scope": scope,
+                "supplier_id": call.counterparty_id,
+                "supplier_name": sup_name,
+                "ingredient_id": ingredient_id,
+                "ingredient_name": ing_name,
+                "expiry_kind": expiry_kind,
+                "expires_at": expires_at,
+                "remaining_orders": remaining_orders,
+                "verbatim_quote": verbatim_quote,
+                "call_id": call.id,
+                "supplier_term_id": term.id,
+            }
+            change = _MC(
+                kind="supplier_term",
+                status="pending",
+                summary=summary,
+                created_at=now,
+                details=details,
+            )
+            session.add(change)
+            session.flush()
+            term.manager_change_id = change.id
+            session.commit()
+
+            self._broadcast(
+                "manager_change",
+                {
+                    "kind": "supplier_term",
+                    "id": change.id,
+                    "supplier": sup_name,
+                    "ingredient": ing_name,
+                    "term_type": term_type,
+                },
+            )
+            return term
+        finally:
+            session.close()
+
+    def record_supplier_update_sync(
+        self,
+        call_id: int,
+        *,
+        update_type: str,
+        scope: str,
+        ingredient_name: str = "",
+        amount: float,
+        amount_kind: str,
+        unit: str = "",
+        effective: str = "immediate",
+        expiry: str = "none",
+        date_text: str = "",
+        n: Any = None,
+        verbatim_quote: str,
+    ) -> Dict[str, Any]:
+        """Synchronous handler for the ``record_supplier_update`` live voice tool.
+
+        Called from ``_execute_tool`` in voice_live.py when the AI agent records a
+        supplier update mid-call. Creates a SupplierTerm + ManagerChange card and
+        returns a short confirmation for the agent to speak back.
+
+        All numeric normalisation is deterministic Python; the LLM reports the raw
+        values and we convert here.
+        """
+        call = self._load(call_id)
+        if call is None:
+            return {"error": "call not found"}
+
+        now = float(self.bus.sim_time)
+
+        # Resolve ingredient_id
+        session = self.db_session_factory()
+        try:
+            ingredient_id: Optional[int] = None
+            resolved_scope = (scope or "all").strip().lower()
+            if resolved_scope == "ingredient" and ingredient_name:
+                ingredient_id = self._fuzzy_match_ingredient(
+                    session, call.counterparty_id, ingredient_name
+                )
+                if ingredient_id is None:
+                    logger.info(
+                        "record_supplier_update: could not match ingredient %r for supplier %s",
+                        ingredient_name, call.counterparty_id,
+                    )
+        finally:
+            session.close()
+
+        # Normalise amount → (term_type, value)
+        term_type, value = self._normalise_term_value(amount, amount_kind, unit)
+
+        # Parse expiry
+        expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+            expiry, date_text, n, now
+        )
+
+        # Create SupplierTerm + ManagerChange
+        term = self._create_supplier_term(
+            call=call,
+            term_type=term_type,
+            value=value,
+            scope=resolved_scope,
+            ingredient_id=ingredient_id,
+            unit_basis=(unit or "").strip(),
+            effective_at=now,
+            expiry_kind=expiry_kind_str,
+            expires_at=expires_at,
+            remaining_orders=remaining_orders,
+            verbatim_quote=(verbatim_quote or "").strip(),
+        )
+
+        if term is None:
+            return {"status": "duplicate", "message": "This update was already recorded for this call."}
+
+        # Build spoken confirmation
+        if term_type == "discount":
+            pct = round(abs(value) * 100, 1)
+            direction = "increase" if value < 0 else "discount"
+            if resolved_scope == "all":
+                summary = f"{pct}% {direction} on all items"
+            else:
+                summary = f"{pct}% {direction} on {ingredient_name or 'that item'}"
+        else:
+            disp = value * 1000
+            if resolved_scope == "all":
+                summary = f"new price of €{disp:.2f}/kg on all items"
+            else:
+                summary = f"new price of €{disp:.2f}/kg on {ingredient_name or 'that item'}"
+
+        if expiry_kind_str == "orders":
+            summary += f" for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''}"
+        elif expiry_kind_str == "date":
+            summary += " until the stated date"
+        else:
+            summary += " permanently"
+
+        return {
+            "status": "recorded",
+            "message": f"Recorded: {summary}. A change card has been created for manager review.",
+        }
+
+    def _process_extracted_updates(self, call: Any, updates: List[Dict[str, Any]]) -> None:
+        """Create SupplierTerm rows for any updates found by post-call extraction
+        that were NOT already captured live by record_supplier_update."""
+        now = float(self.bus.sim_time)
+        session = self.db_session_factory()
+        try:
+            for update in updates:
+                confidence = float(update.get("confidence") or 0.0)
+                if confidence < 0.5:
+                    continue  # drop low-confidence extractions
+
+                scope = (update.get("scope") or "all").strip().lower()
+                ingredient_name = update.get("ingredient_name") or ""
+                ingredient_id: Optional[int] = None
+                if scope == "ingredient" and ingredient_name:
+                    ingredient_id = self._fuzzy_match_ingredient(
+                        session, call.counterparty_id, ingredient_name
+                    )
+
+                amount_kind = update.get("amount_kind") or ""
+                amount = float(update.get("amount") or 0.0)
+                unit = update.get("unit") or ""
+                term_type, value = self._normalise_term_value(amount, amount_kind, unit)
+
+                expiry_kind_raw = update.get("expiry_kind") or "none"
+                expires_hint = update.get("expires_hint") or ""
+                expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                    expiry_kind_raw, expires_hint, None, now
+                )
+
+                verbatim_quote = update.get("verbatim_quote") or ""
+
+                self._create_supplier_term(
+                    call=call,
+                    term_type=term_type,
+                    value=value,
+                    scope=scope,
+                    ingredient_id=ingredient_id,
+                    unit_basis=unit.strip(),
+                    effective_at=now,
+                    expiry_kind=expiry_kind_str,
+                    expires_at=expires_at,
+                    remaining_orders=remaining_orders,
+                    verbatim_quote=verbatim_quote,
+                )
+        finally:
+            session.close()
 
     # -- low-level helpers --------------------------------------------------
 

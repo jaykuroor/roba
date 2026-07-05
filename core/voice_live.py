@@ -581,6 +581,108 @@ _TOOLS: list[dict[str, Any]] = [
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Call-role tool declarations & allowlist
+# ──────────────────────────────────────────────────────────────────────────────
+
+# The only tool exposed to supplier-side call roles.
+# record_supplier_update is the live capture tool: the agent calls it
+# whenever the caller states a price change, discount, or availability update.
+_RECORD_SUPPLIER_UPDATE_DECL: dict = {
+    "function_declarations": [
+        {
+            "name": "record_supplier_update",
+            "description": (
+                "Record a supplier update stated by the caller. "
+                "ALWAYS call this tool when the caller states: a new price, a discount, "
+                "an availability change, or a lead-time change. "
+                "BEFORE calling, RESTATE the key detail back to the caller to confirm, e.g. "
+                "'Just to confirm, that's a 20% discount on all items, permanently?' "
+                "then call this tool with the confirmed figures. "
+                "This creates a manager approval card so the update can be applied to ordering."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "update_type": {
+                        "type": "string",
+                        "enum": ["price_change", "discount", "availability", "lead_time", "other"],
+                        "description": "The type of update.",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "ingredient"],
+                        "description": "'all' if the update applies to all items from this supplier; 'ingredient' if specific to one item.",
+                    },
+                    "ingredient_name": {
+                        "type": "string",
+                        "description": "The ingredient name (required when scope='ingredient').",
+                    },
+                    "amount": {
+                        "type": "number",
+                        "description": "The numeric value exactly as stated by the caller. For '20%' pass 20. For '€4.20/kg' pass 4.20. Do NOT convert.",
+                    },
+                    "amount_kind": {
+                        "type": "string",
+                        "enum": ["absolute_price", "percent_discount", "percent_increase", "availability_status", "days"],
+                        "description": "What the amount represents.",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "description": "The unit as stated by the caller, e.g. 'per_kg', 'per_g', 'per_litre', 'each'. Omit if not a price.",
+                    },
+                    "expiry": {
+                        "type": "string",
+                        "enum": ["none", "until_date", "for_n_orders"],
+                        "description": "'none' = permanent; 'until_date' = expires on a date; 'for_n_orders' = expires after N purchase orders.",
+                    },
+                    "date_text": {
+                        "type": "string",
+                        "description": "Natural-language expiry date as stated, e.g. 'end of month', 'next Friday'. Required when expiry='until_date'.",
+                    },
+                    "n": {
+                        "type": "integer",
+                        "description": "Number of orders (required when expiry='for_n_orders').",
+                    },
+                    "verbatim_quote": {
+                        "type": "string",
+                        "description": "The caller's EXACT words. Required. Never paraphrase.",
+                    },
+                },
+                "required": ["update_type", "scope", "amount", "amount_kind", "verbatim_quote"],
+            },
+        }
+    ],
+}
+
+_SUPPLIER_CALL_ROLES: frozenset = frozenset(
+    {"supplier_call", "inbound_supplier_call", "onboarding_call"}
+)
+_COMPETITOR_CALL_ROLES: frozenset = frozenset(
+    {"competitor_call", "inbound_competitor_call"}
+)
+# All call roles — no operator read/write tools exposed to any of these
+_ALL_CALL_ROLES: frozenset = _SUPPLIER_CALL_ROLES | _COMPETITOR_CALL_ROLES
+# Tool names each call role is allowed to call (defense-in-depth guard in _execute_tool)
+_CALL_ROLE_ALLOWLIST: Dict[str, frozenset] = {
+    **{r: frozenset({"record_supplier_update"}) for r in _SUPPLIER_CALL_ROLES},
+    **{r: frozenset() for r in _COMPETITOR_CALL_ROLES},
+}
+
+
+def _tools_for(role: str) -> list:
+    """Return the filtered tool list for a given role.
+
+    Call roles get only the capture tool (supplier) or nothing (competitor).
+    All other roles (manager, cook) get the full _TOOLS list.
+    """
+    if role in _SUPPLIER_CALL_ROLES:
+        return [_RECORD_SUPPLIER_UPDATE_DECL]
+    if role in _COMPETITOR_CALL_ROLES:
+        return []
+    return _TOOLS
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # System prompts
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -970,12 +1072,16 @@ async def live_bridge(
         except Exception as _persona_exc:  # noqa: BLE001
             logger.warning("call_personas build failed: %s", _persona_exc)
 
-    # Slim injected context: just key numbers so the model uses tools for details.
-    try:
-        slim_ctx = _build_slim_context(voice_processor)
-        system_instruction = system_instruction + f"\n\nCurrent context (use tools for full data):\n{slim_ctx}"
-    except Exception:  # noqa: BLE001
-        pass
+    # Slim injected context: key numbers for the operator desk.
+    # Call roles (supplier / competitor) must NOT receive this — it contains
+    # private data (inventory counts, menu state, staff) that the counterparty
+    # has no business knowing.
+    if role not in _ALL_CALL_ROLES:
+        try:
+            slim_ctx = _build_slim_context(voice_processor)
+            system_instruction = system_instruction + f"\n\nCurrent context (use tools for full data):\n{slim_ctx}"
+        except Exception:  # noqa: BLE001
+            pass
 
     realtime_input_config: Optional[Any] = None
     if mic_mode == "ptt":
@@ -995,7 +1101,7 @@ async def live_bridge(
         live_config = _gtypes.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=system_instruction,
-            tools=_TOOLS,  # type: ignore[arg-type]
+            tools=_tools_for(role),  # type: ignore[arg-type]
             input_audio_transcription=_gtypes.AudioTranscriptionConfig(),
             output_audio_transcription=_gtypes.AudioTranscriptionConfig(),
             realtime_input_config=realtime_input_config,
@@ -1534,7 +1640,7 @@ async def _handle_chunk(
         # strictly additive — only used when the model omitted the arg entirely.
         user_text = "".join(buffers.user)
         for fn_call in (chunk.tool_call.function_calls or []):
-            result = await _execute_tool(fn_call, voice_processor, role, mode, voice_actions, user_text=user_text)
+            result = await _execute_tool(fn_call, voice_processor, role, mode, voice_actions, user_text=user_text, call_id=call_id, calls=calls)
             try:
                 await session.send_tool_response(
                     function_responses=_gtypes.FunctionResponse(
@@ -1634,15 +1740,55 @@ async def _execute_tool(
     voice_actions: Optional[Any],
     *,
     user_text: str = "",
+    call_id: Optional[int] = None,
+    calls: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Execute a tool call via VoiceActions (primary) or VoiceProcessor (fallback reads)."""
+    """Execute a tool call via VoiceActions (primary) or VoiceProcessor (fallback reads).
+
+    For call roles (supplier/competitor), a role-based allowlist is enforced
+    so that no private operator data can be read and no actions can be triggered
+    by a counterparty — even if the model hallucinates a disallowed tool call.
+    """
     name = str(fn_call.name or "")
     args = dict(fn_call.args or {})
-    logger.debug("voice_live tool call: %s(%s)", name, args)
+    logger.debug("voice_live tool call: %s(%s) [role=%s]", name, args, role)
 
     va = voice_actions  # may be None in tests / legacy mode
 
+    # ── Role-based tool allowlist (call-role lockdown) ─────────────────────
+    # Any tool not in the allowlist for a call role is silently refused.
+    # This is defense-in-depth: the tool list sent to Gemini is already filtered
+    # by _tools_for(role), but we enforce here too in case of model hallucinations.
+    if role in _ALL_CALL_ROLES:
+        allowed = _CALL_ROLE_ALLOWLIST.get(role, frozenset())
+        if name not in allowed:
+            logger.info(
+                "voice_live: blocked tool %r for call role %r (not in allowlist)", name, role
+            )
+            return {"error": "This tool is not available during a call."}
+
     try:
+        # ── Supplier live-capture tool ─────────────────────────────────────
+        if name == "record_supplier_update":
+            if calls is None or call_id is None:
+                return {"error": "record_supplier_update requires an active call session"}
+            return await asyncio.to_thread(
+                calls.record_supplier_update_sync,
+                call_id,
+                update_type=str(args.get("update_type", "other")),
+                scope=str(args.get("scope", "all")),
+                ingredient_name=str(args.get("ingredient_name") or ""),
+                amount=float(args.get("amount") or 0.0),
+                amount_kind=str(args.get("amount_kind", "absolute_price")),
+                unit=str(args.get("unit") or ""),
+                effective=str(args.get("effective") or "immediate"),
+                expiry=str(args.get("expiry") or "none"),
+                date_text=str(args.get("date_text") or ""),
+                n=args.get("n"),
+                verbatim_quote=str(args.get("verbatim_quote") or ""),
+            )
+
+
         # ── Read tools ────────────────────────────────────────────────────
         if name == "get_inventory":
             if va:

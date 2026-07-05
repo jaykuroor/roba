@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from core import config
 from core.events import log_event as core_log_event
-from core.models import EventLog, InventoryOptimizerMemory, PurchaseOrder, PurchaseOrderLine, Supplier
+from core.models import EventLog, InventoryOptimizerMemory, PurchaseOrder, PurchaseOrderLine, Supplier, SupplierTerm
 from core.signals import SignalType
 
 
@@ -163,6 +163,23 @@ class Procurement:
             expected_delivery = now + lead_days * 86400.0
             po.status = "placed"
             po.expected_delivery = expected_delivery
+
+            # Decrement order-bounded SupplierTerms for this supplier.
+            order_terms = (
+                session.query(SupplierTerm)
+                .filter(
+                    SupplierTerm.supplier_id == po.supplier_id,
+                    SupplierTerm.status == "active",
+                    SupplierTerm.expiry_kind == "orders",
+                )
+                .all()
+            )
+            for ot in order_terms:
+                if ot.remaining_orders is not None and ot.remaining_orders > 0:
+                    ot.remaining_orders -= 1
+                    if ot.remaining_orders <= 0:
+                        ot.status = "expired"
+
             session.commit()
 
             lines = (

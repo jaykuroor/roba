@@ -36,6 +36,7 @@ import { apiGet, apiPost } from "../api";
 import { useActiveCall, useCallTurns, useManagerChangeVersion, actions } from "../store";
 import type { ApprovalRequest, ManagerChange } from "../types";
 import { SpectateOverlay } from "../shell/SpectateOverlay";
+import { wsClient } from "../ws";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -535,6 +536,15 @@ export function ManagerVoice() {
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [showDev, setShowDev] = useState(false);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+
+  // Connect the operator WS so the desk receives call_started / call_ended /
+  // manager_change events and the ActiveCallCard lights up — mirroring MenuPage.
+  useEffect(() => {
+    wsClient.connect();
+    return () => {
+      wsClient.close();
+    };
+  }, []);
 
   useEffect(() => {
     const load = () =>

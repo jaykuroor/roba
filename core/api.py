@@ -2100,6 +2100,17 @@ def _apply_change_to_db(change: models.ManagerChange, db_session: Any, direction
                         models.SupplierCatalog.supplier_id == supplier_id,
                         models.SupplierCatalog.ingredient_id == ingredient_id,
                     ).update({models.SupplierCatalog.current_price: float(new_price)})
+    elif change.kind == "supplier_term":
+        # Apply / revert a SupplierTerm captured from a call.
+        # Applying activates the term so it feeds the MILP; reverting deactivates it.
+        term_id = details.get("supplier_term_id")
+        if term_id is not None:
+            term = db_session.get(models.SupplierTerm, int(term_id))
+            if term is not None:
+                if direction == "after":
+                    term.status = "active"
+                else:  # revert
+                    term.status = "reverted"
     elif change.kind == "onboarding":
         # Apply / revert catalog entries from the onboarding outcome
         entries = state.get("catalog_entries", [])

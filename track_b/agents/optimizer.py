@@ -40,6 +40,7 @@ from core.models import (
     SourcingRun,
     Supplier,
     SupplierCatalog,
+    SupplierTerm,
 )
 from core.signals import SignalType
 
@@ -1280,6 +1281,54 @@ class InventoryOptimizer(BaseAgent):
 
             catalog_rows = session.query(SupplierCatalog).all()
 
+            # Load active SupplierTerms and build quick lookup structures.
+            # A term is "active" when status='active', not expired (date/orders).
+            _active_terms = (
+                session.query(SupplierTerm)
+                .filter(SupplierTerm.status == "active")
+                .all()
+            )
+
+            def _term_is_live(t: Any) -> bool:
+                """Return True if the term is still in effect (not date/order-expired)."""
+                if t.expiry_kind == "date" and t.expires_at is not None:
+                    return float(t.expires_at) >= now
+                if t.expiry_kind == "orders":
+                    return (t.remaining_orders or 0) > 0
+                return True  # expiry_kind="none" → permanent
+
+            # Build {(supplier_id, ingredient_id_or_None): [SupplierTerm]}
+            _term_map: Dict[tuple, list] = {}
+            for t in _active_terms:
+                if not _term_is_live(t):
+                    continue
+                key = (int(t.supplier_id), int(t.ingredient_id) if t.ingredient_id else None)
+                _term_map.setdefault(key, []).append(t)
+
+            def _apply_terms(supplier_id: int, ingredient_id: int, base_price_g: float) -> float:
+                """Apply any active SupplierTerms to the base per-gram price.
+
+                Precedence: ingredient-specific terms override scope='all' terms.
+                Multiple terms of the same type for the same row are rare (deduped at capture)
+                but the last one wins to be safe.
+                """
+                price = base_price_g
+                # Collect applicable terms: scope=all + scope=ingredient
+                applicable = (
+                    _term_map.get((supplier_id, None), [])          # scope=all
+                    + _term_map.get((supplier_id, ingredient_id), [])  # scope=ingredient
+                )
+                for t in applicable:
+                    if t.term_type == "price_override":
+                        price = float(t.value)      # absolute per-gram price
+                    elif t.term_type == "discount":
+                        v = float(t.value)
+                        if v < 0:                   # negative = price increase
+                            price = price * (1.0 + abs(v))
+                        else:
+                            price = price * (1.0 - v)
+                return max(0.0, price)
+
             def _price_per_gram(price: float, unit: str, pack_size: float) -> float:
                 """Normalise a catalog price to per-gram so the MILP objective
                 p·x (quantity in grams) is dimensionally consistent regardless
@@ -1300,6 +1349,8 @@ class InventoryOptimizer(BaseAgent):
                 c_unit = c.unit or "g"
                 c_pack = float(c.pack_size or 1.0)
                 price_per_g = _price_per_gram(raw_price, c_unit, c_pack)
+                # Apply any active SupplierTerms (discounts / price overrides)
+                price_per_g = _apply_terms(int(c.supplier_id), int(c.ingredient_id), price_per_g)
                 # Normalise per-item discount thresholds from catalog unit → grams
                 disc = getattr(c, "discount", None)
                 if disc:
@@ -1324,7 +1375,7 @@ class InventoryOptimizer(BaseAgent):
                     "id": int(c.id),
                     "supplier_id": int(c.supplier_id),
                     "ingredient_id": int(c.ingredient_id),
-                    "current_price": price_per_g,   # normalised to per-gram
+                    "current_price": price_per_g,   # normalised to per-gram (terms applied)
                     "original_price": raw_price,     # kept for human-readable display
                     "original_unit": c_unit,         # original catalog unit
                     "pack_size": c_pack,

@@ -1076,6 +1076,55 @@ class ManagerChange(Base):
                 f"status={self.status!r}>")
 
 
+class SupplierTerm(Base):
+    """A supplier term (price change or discount) captured from a call.
+
+    ``term_type``:
+      - ``price_override`` — new absolute price (value stored as per-gram, matching
+        SupplierCatalog.current_price).
+      - ``discount``       — fractional discount off the catalog price (0.20 = 20% off).
+
+    ``scope``:
+      - ``ingredient`` — applies to one ingredient (ingredient_id set).
+      - ``all``        — applies to all ingredients from this supplier (ingredient_id null).
+
+    ``expiry_kind``:
+      - ``none``   — permanent until reverted.
+      - ``date``   — expires after ``expires_at`` (sim-time float).
+      - ``orders`` — expires after ``remaining_orders`` purchase orders are placed.
+
+    ``status``: pending (awaiting manager approval) → active → expired | reverted.
+
+    A ManagerChange card (kind='supplier_term') is created when the term is captured;
+    applying it sets status='active', reverting it sets status='reverted'.
+    """
+    __tablename__ = "supplier_terms"
+
+    id = _pk()
+    supplier_id = mapped_column(Integer, ForeignKey("suppliers.id"))
+    ingredient_id = mapped_column(Integer, ForeignKey("ingredients.id"), nullable=True)
+    term_type = mapped_column(String)            # price_override | discount
+    value = mapped_column(Float)                 # per-gram price or fraction
+    unit_basis = mapped_column(String, nullable=True)  # unit the caller quoted, e.g. per_kg
+    scope = mapped_column(String, default="ingredient")  # ingredient | all
+    effective_at = mapped_column(Float)
+    expiry_kind = mapped_column(String, default="none")   # none | date | orders
+    expires_at = mapped_column(Float, nullable=True)       # sim-time when expiry_kind=date
+    remaining_orders = mapped_column(Integer, nullable=True)  # when expiry_kind=orders
+    status = mapped_column(String, default="pending")     # pending | active | expired | reverted
+    source_call_id = mapped_column(Integer, ForeignKey("calls.id"), nullable=True)
+    verbatim_quote = mapped_column(Text, nullable=True)   # caller's exact words
+    manager_change_id = mapped_column(Integer, nullable=True)  # linked ManagerChange.id
+    created_at = mapped_column(Float)
+
+    def __repr__(self):
+        return (
+            f"<SupplierTerm id={self.id} supplier_id={self.supplier_id} "
+            f"type={self.term_type!r} value={self.value} scope={self.scope!r} "
+            f"status={self.status!r}>"
+        )
+
+
 class SourcingRun(Base):
     """Audit log for each least-cost sourcing solve (MILP or greedy fallback).
 
@@ -1177,7 +1226,7 @@ INTELLIGENCE_MODELS = [
     SupplierPriceHistory, Negotiation,
     ApprovalRequest, ForecastJob, HorizonForecast, HorizonForecastLine,
     Promotion, UserFact, LLMCallLog, WeatherLog, Call,
-    ManagerChange, SourcingRun,
+    ManagerChange, SourcingRun, SupplierTerm,
 ]
 
 CONTROL_MODELS = [
