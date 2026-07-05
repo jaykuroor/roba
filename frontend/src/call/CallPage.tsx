@@ -230,8 +230,12 @@ function ActiveCall({ callId, role, partyName }: ActiveCallProps) {
   function handleEnd() {
     setEnded(true);
     live.stopListening();
-    // The backend finalises via the WS disconnect / idle-exit path.
-    // We just close this tab.
+    // Deterministically finalize the call (extraction, outcome persistence,
+    // call_ended broadcast). The WS-disconnect path is a fallback if this POST
+    // can't fire (e.g. tab crash), but we should not rely on it alone.
+    if (callId) {
+      apiPost(`/api/calls/${callId}/end`).catch(() => undefined);
+    }
     setTimeout(() => window.close(), 1200);
   }
 

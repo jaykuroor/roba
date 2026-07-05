@@ -1305,6 +1305,22 @@ class InventoryOptimizer(BaseAgent):
                 key = (int(t.supplier_id), int(t.ingredient_id) if t.ingredient_id else None)
                 _term_map.setdefault(key, []).append(t)
 
+            def _is_unavailable(supplier_id: int, ingredient_id: int) -> bool:
+                """Return True if any active unavailable term covers this supplier/ingredient."""
+                applicable = (
+                    _term_map.get((supplier_id, None), [])
+                    + _term_map.get((supplier_id, ingredient_id), [])
+                )
+                return any(t.term_type == "unavailable" for t in applicable)
+
+            def _effective_lead_days(supplier_id: int, base_days: float) -> float:
+                """Return lead time in days, applying any lead_time_override term."""
+                all_terms = _term_map.get((supplier_id, None), [])
+                for t in all_terms:
+                    if t.term_type == "lead_time_override":
+                        return float(t.value)
+                return base_days
+
             def _apply_terms(supplier_id: int, ingredient_id: int, base_price_g: float) -> float:
                 """Apply any active SupplierTerms to the base per-gram price.
 
@@ -1371,6 +1387,11 @@ class InventoryOptimizer(BaseAgent):
                         )
                         normalised_disc.append({"min_qty": tq_g, "unit_price": disc_price_g})
                     disc = normalised_disc
+                # Hard-exclude if an active unavailable term covers this supplier/ingredient
+                effective_availability = c.availability or "in_stock"
+                if _is_unavailable(int(c.supplier_id), int(c.ingredient_id)):
+                    effective_availability = "out"
+
                 catalog.append({
                     "id": int(c.id),
                     "supplier_id": int(c.supplier_id),
@@ -1379,7 +1400,7 @@ class InventoryOptimizer(BaseAgent):
                     "original_price": raw_price,     # kept for human-readable display
                     "original_unit": c_unit,         # original catalog unit
                     "pack_size": c_pack,
-                    "availability": c.availability or "in_stock",
+                    "availability": effective_availability,
                     "unit": "g",                     # MILP always works in grams
                     "is_default": int(getattr(c, "is_default", 0) or 0),
                     "discount": disc,
@@ -1401,7 +1422,7 @@ class InventoryOptimizer(BaseAgent):
                     "delivery_charge": float(getattr(s, "delivery_charge", None) or 0.0),
                     # Use real DB values instead of hardcoded zeros/ones
                     "min_order_value": float(s.min_order_value or 0.0),
-                    "lead_time_days": float(s.lead_time_days or 1.0),
+                    "lead_time_days": _effective_lead_days(int(s.id), float(s.lead_time_days or 1.0)),
                     "reliability_score": float(s.reliability_score or 1.0),
                     "volume_discount": getattr(s, "volume_discount", None),
                 }

@@ -15,6 +15,9 @@ export interface StoreState {
   activeCall: Call | null;
   /** Live transcript of the active call, accumulated from call_turn events. */
   callTurns: CallTurn[];
+  /** The most recently completed call, retained for the desk summary card.
+   *  Cleared when a new call starts or when the summary is dismissed. */
+  lastCompletedCall: Call | null;
   wsConnected: boolean;
   /** Incremented each time a manager_change WS event arrives; components use
    * this to trigger a refetch of the changes list. */
@@ -29,6 +32,7 @@ const initialState: StoreState = {
   pendingApprovals: [],
   activeCall: null,
   callTurns: [],
+  lastCompletedCall: null,
   wsConnected: false,
   managerChangeVersion: 0,
   managerChanges: [],
@@ -99,8 +103,16 @@ export const actions = {
     setState({ activeCall: call, callTurns: call.transcript ?? [] });
   },
 
-  endCall(): void {
-    setState({ activeCall: null, callTurns: [] });
+  endCall(completedCall?: Call): void {
+    setState({
+      activeCall: null,
+      callTurns: [],
+      lastCompletedCall: completedCall ?? state.activeCall,
+    });
+  },
+
+  dismissCompletedCall(): void {
+    setState({ lastCompletedCall: null });
   },
 
   /** Fetch the currently-active call from the server and sync the store.
@@ -112,7 +124,8 @@ export const actions = {
         if (call) {
           actions.startCall(call);
         } else if (state.activeCall !== null) {
-          actions.endCall();
+          // Clear the active indicator — don't overwrite a completed-call summary.
+          setState({ activeCall: null, callTurns: [] });
         }
       })
       .catch(() => undefined);
@@ -161,6 +174,10 @@ export function useWeather(): Weather | null {
 
 export function useCallTurns(): CallTurn[] {
   return useSelector((s) => s.callTurns);
+}
+
+export function useLastCompletedCall(): Call | null {
+  return useSelector((s) => s.lastCompletedCall);
 }
 
 export function useWsConnected(): boolean {

@@ -18,6 +18,7 @@ import {
   Check,
   X,
   PhoneCall,
+  PhoneOff,
   ExternalLink,
   ArrowLeftRight,
   RotateCcw,
@@ -33,8 +34,8 @@ import { ModeToggle } from "./ModeToggle";
 import { MicModeToggle } from "./MicModeToggle";
 import { ModelToggle } from "./ModelToggle";
 import { apiGet, apiPost } from "../api";
-import { useActiveCall, useCallTurns, useManagerChangeVersion, actions } from "../store";
-import type { ApprovalRequest, ManagerChange } from "../types";
+import { useActiveCall, useCallTurns, useLastCompletedCall, useManagerChangeVersion, actions } from "../store";
+import type { ApprovalRequest, Call, ManagerChange } from "../types";
 import { SpectateOverlay } from "../shell/SpectateOverlay";
 import { wsClient } from "../ws";
 
@@ -238,6 +239,106 @@ function ActiveCallCard() {
 }
 
 // ---------------------------------------------------------------------------
+// Completed call summary card
+// ---------------------------------------------------------------------------
+
+function CompletedCallCard({
+  call,
+  changes,
+}: {
+  call: Call;
+  changes: ManagerChange[];
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const callChanges = changes.filter(
+    (c) =>
+      c.details &&
+      typeof c.details === "object" &&
+      (c.details as Record<string, unknown>).call_id === call.id,
+  );
+
+  // Extract human-readable summary from outcome
+  const outcome = call.outcome as Record<string, unknown> | null | undefined;
+  const summaryText = outcome?.summary as string | undefined;
+
+  const transcript = call.transcript ?? [];
+  const counterpartyTurns = transcript.filter((t) => t.role === "counterparty");
+
+  return (
+    <div className="rounded-xl border border-muted/40 bg-surface/80 p-3 space-y-2">
+      <div className="flex items-center gap-2">
+        <PhoneOff size={13} className="text-muted shrink-0" />
+        <span className="text-xs font-semibold uppercase tracking-wide text-text/40">
+          Call ended
+        </span>
+        <span className="ml-auto text-xs text-text/30">#{call.id}</span>
+        <button
+          onClick={() => actions.dismissCompletedCall()}
+          className="ml-1 text-text/30 hover:text-text/60"
+          title="Dismiss"
+        >
+          <X size={12} />
+        </button>
+      </div>
+
+      <div>
+        <p className="text-sm font-medium text-text capitalize">
+          {call.counterparty_type} #{call.counterparty_id}
+        </p>
+        {call.purpose && (
+          <p className="text-xs text-text/50 mt-0.5">{call.purpose}</p>
+        )}
+      </div>
+
+      {summaryText && (
+        <div className="rounded-lg border border-muted/30 bg-surface p-2 text-xs text-text/70 whitespace-pre-wrap">
+          {summaryText}
+        </div>
+      )}
+
+      {callChanges.length > 0 && (
+        <div className="text-xs text-text/60">
+          <span className="font-medium">{callChanges.length} change card{callChanges.length !== 1 ? "s" : ""} created</span>
+          {" — review in Changes awaiting approval below."}
+        </div>
+      )}
+
+      {counterpartyTurns.length === 0 && (
+        <p className="text-xs text-warning/70">
+          ⚠ Caller turns not recorded — transcript may be incomplete.
+        </p>
+      )}
+
+      {transcript.length > 0 && (
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          className="flex items-center gap-1 text-xs text-text/40 hover:text-text/60"
+        >
+          {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+          {expanded ? "Hide" : "Show"} transcript ({transcript.length} turns)
+        </button>
+      )}
+
+      {expanded && (
+        <div className="rounded-lg border border-muted/30 bg-surface/60 p-2 space-y-1 max-h-48 overflow-y-auto">
+          {transcript.map((t, i) => (
+            <p
+              key={i}
+              className={`text-xs ${t.role === "agent" ? "text-accent/80" : "text-text/70"}`}
+            >
+              <span className="font-medium mr-1">
+                {t.role === "agent" ? "Roba:" : "Caller:"}
+              </span>
+              {t.text}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Change card (sourcing defaults / call price outcomes)
 // ---------------------------------------------------------------------------
 
@@ -259,6 +360,7 @@ function ChangeCard({
     call_price: "Price negotiated",
     onboarding: "New supplier",
     supplier_data: "Supplier update",
+    supplier_term: "Supplier term",
   };
 
   async function act(action: "apply" | "revert" | "dismiss") {
@@ -458,13 +560,18 @@ function CardsBoard({
   }, [changeVersion]);
 
   const activeCall = useActiveCall();
+  const lastCompletedCall = useLastCompletedCall();
   const pendingChanges = changes.filter((c) => c.status === "pending");
   const recentChanges = changes.filter((c) => c.status === "applied").slice(0, 5);
 
   return (
     <div className="flex flex-col gap-3 p-3">
-      {/* Active call */}
+      {/* Active call — live indicator */}
       {activeCall && <ActiveCallCard />}
+      {/* Completed call summary — shown after call ends, until dismissed */}
+      {!activeCall && lastCompletedCall && (
+        <CompletedCallCard call={lastCompletedCall} changes={changes} />
+      )}
 
       {/* Pending changes */}
       {pendingChanges.length > 0 && (

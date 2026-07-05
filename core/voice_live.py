@@ -594,10 +594,12 @@ _RECORD_SUPPLIER_UPDATE_DECL: dict = {
             "description": (
                 "Record a supplier update stated by the caller. "
                 "ALWAYS call this tool when the caller states: a new price, a discount, "
-                "an availability change, or a lead-time change. "
-                "BEFORE calling, RESTATE the key detail back to the caller to confirm, e.g. "
-                "'Just to confirm, that's a 20% discount on all items, permanently?' "
-                "then call this tool with the confirmed figures. "
+                "an availability change (e.g. 'can't supply for 2 weeks'), or a lead-time change. "
+                "BEFORE calling, RESTATE EXACTLY what you heard to confirm — e.g. "
+                "'Just to confirm — you won't be able to supply for two weeks from now?' "
+                "ONLY call this tool after the caller explicitly confirms your restatement. "
+                "NEVER invent or assume a value the caller did not clearly state. "
+                "For availability/lead_time updates, omit 'amount' if no numeric amount was stated. "
                 "This creates a manager approval card so the update can be applied to ordering."
             ),
             "parameters": {
@@ -619,7 +621,7 @@ _RECORD_SUPPLIER_UPDATE_DECL: dict = {
                     },
                     "amount": {
                         "type": "number",
-                        "description": "The numeric value exactly as stated by the caller. For '20%' pass 20. For '€4.20/kg' pass 4.20. Do NOT convert.",
+                        "description": "The numeric value exactly as stated by the caller. For '20%' pass 20. For '€4.20/kg' pass 4.20. Do NOT convert. Omit for availability/lead_time updates where no numeric amount was stated.",
                     },
                     "amount_kind": {
                         "type": "string",
@@ -648,7 +650,7 @@ _RECORD_SUPPLIER_UPDATE_DECL: dict = {
                         "description": "The caller's EXACT words. Required. Never paraphrase.",
                     },
                 },
-                "required": ["update_type", "scope", "amount", "amount_kind", "verbatim_quote"],
+                "required": ["update_type", "scope", "verbatim_quote"],
             },
         }
     ],
@@ -958,6 +960,16 @@ async def live_bridge(
         live_model = _FALLBACK_LIVE_MODEL
     if model and model in _ALLOWED_LIVE_MODELS:
         live_model = model
+
+    # Call roles require reliable input transcription (grounding against what the
+    # caller actually said). Force half-cascade unless the caller explicitly passed
+    # an allowlisted model override via the query param.
+    _CALL_ROLES_FOR_MODEL = (
+        "supplier_call", "competitor_call", "onboarding_call",
+        "inbound_supplier_call", "inbound_competitor_call",
+    )
+    if role in _CALL_ROLES_FOR_MODEL and not (model and model in _ALLOWED_LIVE_MODELS):
+        live_model = "gemini-live-2.5-flash"
 
     system_instruction = _SYSTEM_INSTRUCTIONS.get(role, _SYSTEM_INSTRUCTIONS["manager"])
 

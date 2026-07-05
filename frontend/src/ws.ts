@@ -155,7 +155,12 @@ wsClient.on("approval_resolved", (p) => {
 wsClient.on("call_started", (p) =>
   actions.startCall((p as { call: Call }).call),
 );
-wsClient.on("call_ended", () => actions.endCall());
+wsClient.on("call_ended", (p) => {
+  // Pass the completed call (with outcome/summary) so the desk can show
+  // a post-call summary card instead of just clearing to nothing.
+  const completedCall = (p as { call?: Call }).call;
+  actions.endCall(completedCall);
+});
 wsClient.on("call_turn", (p) => {
   const turn = p as { role: "agent" | "counterparty"; text: string };
   actions.appendCallTurn({ role: turn.role, text: turn.text });

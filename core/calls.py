@@ -420,6 +420,27 @@ class CallSubsystem:
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning("call_price ManagerChange creation failed: %s", _exc)
 
+        # Build a human-readable summary for the desk card.  Pull ManagerChange.summary
+        # strings that were created for this call so the desk gets a concise read-out.
+        call_summary = self._build_call_summary(call_id, call)
+        if call_summary:
+            # Merge into outcome so it travels with the call_ended payload.
+            if isinstance(outcome, dict):
+                outcome = dict(outcome, summary=call_summary)
+            else:
+                outcome = {"summary": call_summary}
+            # Persist the updated outcome (summary added) back to the DB.
+            _s = self.db_session_factory()
+            try:
+                _row = _s.get(Call, call_id)
+                if _row is not None:
+                    _row.outcome = outcome
+                    _s.commit()
+            except Exception:  # noqa: BLE001
+                _s.rollback()
+            finally:
+                _s.close()
+
         # Restore the clock to its pre-call state/speed (§6.3).
         restore = self._clock_restore.pop(call_id, None)
         if restore is not None:
@@ -430,6 +451,49 @@ class CallSubsystem:
         # A second call that was queued while this one ran can now start.
         self._start_next_pending()
         return outcome
+
+    def _build_call_summary(self, call_id: int, call: Call) -> str:
+        """Build a concise human-readable summary of what was captured from a call.
+
+        Reads ManagerChange cards created for this call (via details.call_id) and
+        the call transcript to produce a 2–5 line summary for the desk card.
+        """
+        from .models import ManagerChange as _MC  # noqa: PLC0415
+        session = self.db_session_factory()
+        try:
+            changes = (
+                session.query(_MC)
+                .all()
+            )
+            # Filter to changes linked to this call
+            call_changes = [
+                c for c in changes
+                if isinstance(c.details, dict) and c.details.get("call_id") == call_id
+            ]
+            # Also count transcript turns for context
+            transcript = call.transcript or []
+            counterparty_turns = [t for t in transcript if t.get("role") == "counterparty"]
+        finally:
+            session.close()
+
+        parts: List[str] = []
+        if call_changes:
+            parts.append(f"{len(call_changes)} update{'s' if len(call_changes) != 1 else ''} captured:")
+            for c in call_changes[:5]:  # cap at 5
+                parts.append(f"  • {c.summary}")
+        else:
+            parts.append("No specific updates captured from this call.")
+
+        if not counterparty_turns:
+            parts.append("(Counterparty transcript not recorded — check audio/model settings.)")
+        elif len(counterparty_turns) >= 1:
+            # Include first counterparty turn as context
+            first_turn = counterparty_turns[0].get("text", "")
+            if first_turn and len(first_turn) > 8:
+                short = first_turn[:120] + ("…" if len(first_turn) > 120 else "")
+                parts.append(f"Caller opened: \"{short}\"")
+
+        return "\n".join(parts)
 
     def _create_call_price_change(self, call: Call, outcome: Dict[str, Any]) -> None:
         """Create a ManagerChange(kind='call_price') so the agreed price surfaces
@@ -976,13 +1040,39 @@ class CallSubsystem:
                 ing_name = ing.name if ing else f"ingredient #{ingredient_id}"
 
             # Build human-readable summary
-            if term_type == "discount":
+            if term_type == "unavailable":
+                if scope == "all":
+                    summary = f"{sup_name}: no supply of all items"
+                else:
+                    summary = f"{sup_name}: no supply of {ing_name}"
+                if expiry_kind == "date" and expires_at:
+                    days_left = max(1, round((expires_at - now) / 86400))
+                    summary += f" for ~{days_left} days"
+                else:
+                    summary += " for the stated period"
+            elif term_type == "lead_time_override":
+                days = int(value)
+                if scope == "all":
+                    summary = f"{sup_name}: lead time now {days} day{'s' if days != 1 else ''}"
+                else:
+                    summary = f"{sup_name}: lead time for {ing_name} now {days} day{'s' if days != 1 else ''}"
+                if expiry_kind == "date" and expires_at:
+                    days_left = max(1, round((expires_at - now) / 86400))
+                    summary += f" (for ~{days_left} days)"
+            elif term_type == "discount":
                 pct = round(abs(value) * 100, 1)
                 direction = "increase" if value < 0 else "discount"
                 if scope == "all":
                     summary = f"{pct}% {direction} on all items from {sup_name}"
                 else:
                     summary = f"{pct}% {direction} on {ing_name} ({sup_name})"
+                if expiry_kind == "orders":
+                    summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
+                elif expiry_kind == "date" and expires_at:
+                    days_left = max(1, round((expires_at - now) / 86400))
+                    summary += f" (expires in ~{days_left} days)"
+                else:
+                    summary += " (permanent)"
             else:  # price_override
                 # Convert per-gram back to per-kg for display
                 disp_price = value * 1000
@@ -990,14 +1080,13 @@ class CallSubsystem:
                     summary = f"New price on all items from {sup_name}: €{disp_price:.2f}/kg"
                 else:
                     summary = f"New price for {ing_name} ({sup_name}): €{disp_price:.2f}/kg"
-
-            if expiry_kind == "orders":
-                summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
-            elif expiry_kind == "date" and expires_at:
-                days_left = max(1, round((expires_at - now) / 86400))
-                summary += f" (expires in ~{days_left} days)"
-            else:
-                summary += " (permanent)"
+                if expiry_kind == "orders":
+                    summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
+                elif expiry_kind == "date" and expires_at:
+                    days_left = max(1, round((expires_at - now) / 86400))
+                    summary += f" (expires in ~{days_left} days)"
+                else:
+                    summary += " (permanent)"
 
             term = SupplierTerm(
                 supplier_id=call.counterparty_id,
@@ -1067,8 +1156,8 @@ class CallSubsystem:
         update_type: str,
         scope: str,
         ingredient_name: str = "",
-        amount: float,
-        amount_kind: str,
+        amount: float = 0.0,
+        amount_kind: str = "",
         unit: str = "",
         effective: str = "immediate",
         expiry: str = "none",
@@ -1083,13 +1172,15 @@ class CallSubsystem:
         returns a short confirmation for the agent to speak back.
 
         All numeric normalisation is deterministic Python; the LLM reports the raw
-        values and we convert here.
+        values and we convert here.  update_type drives the term_type: availability
+        → unavailable, lead_time → lead_time_override, price/discount → existing path.
         """
         call = self._load(call_id)
         if call is None:
             return {"error": "call not found"}
 
         now = float(self.bus.sim_time)
+        utype = (update_type or "other").strip().lower()
 
         # Resolve ingredient_id
         session = self.db_session_factory()
@@ -1108,13 +1199,35 @@ class CallSubsystem:
         finally:
             session.close()
 
-        # Normalise amount → (term_type, value)
-        term_type, value = self._normalise_term_value(amount, amount_kind, unit)
-
-        # Parse expiry
-        expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
-            expiry, date_text, n, now
-        )
+        # Branch on update_type: availability / lead_time bypass price normalisation
+        if utype == "availability":
+            term_type = "unavailable"
+            value = 0.0
+            # Use the caller's stated duration as the blackout window.
+            # If expiry is already "until_date", use it; otherwise treat date_text/n
+            # as the blackout duration.  Default to 2 weeks when nothing is stated.
+            expiry_hint = expiry if expiry else "until_date"
+            hint_text = date_text or verbatim_quote or "2 weeks"
+            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                expiry_hint, hint_text, n, now
+            )
+            if expiry_kind_str == "none":
+                # Caller gave no usable duration — default 2-week blackout
+                expiry_kind_str = "date"
+                expires_at = now + 14 * 86400.0
+        elif utype == "lead_time":
+            term_type = "lead_time_override"
+            # value = new lead time in days; amount may carry days explicitly
+            value = max(0.0, float(amount) if amount else 1.0)
+            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                expiry, date_text, n, now
+            )
+        else:
+            # price_change / discount / other — original numeric path
+            term_type, value = self._normalise_term_value(amount, amount_kind, unit)
+            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                expiry, date_text, n, now
+            )
 
         # Create SupplierTerm + ManagerChange
         term = self._create_supplier_term(
@@ -1135,7 +1248,17 @@ class CallSubsystem:
             return {"status": "duplicate", "message": "This update was already recorded for this call."}
 
         # Build spoken confirmation
-        if term_type == "discount":
+        if term_type == "unavailable":
+            item_desc = ingredient_name or "all items" if resolved_scope == "ingredient" else "all items"
+            if expiry_kind_str == "date" and expires_at:
+                days = max(1, round((expires_at - now) / 86400))
+                summary = f"unavailable for {item_desc} for approximately {days} days"
+            else:
+                summary = f"unavailable for {item_desc} for the stated period"
+        elif term_type == "lead_time_override":
+            item_desc = ingredient_name or "all items" if resolved_scope == "ingredient" else "all deliveries"
+            summary = f"lead time updated to {value:.0f} day{'s' if value != 1 else ''} for {item_desc}"
+        elif term_type == "discount":
             pct = round(abs(value) * 100, 1)
             direction = "increase" if value < 0 else "discount"
             if resolved_scope == "all":
@@ -1151,9 +1274,9 @@ class CallSubsystem:
 
         if expiry_kind_str == "orders":
             summary += f" for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''}"
-        elif expiry_kind_str == "date":
+        elif expiry_kind_str == "date" and term_type not in ("unavailable",):
             summary += " until the stated date"
-        else:
+        elif term_type not in ("unavailable", "lead_time_override"):
             summary += " permanently"
 
         return {
@@ -1180,18 +1303,36 @@ class CallSubsystem:
                         session, call.counterparty_id, ingredient_name
                     )
 
+                utype = (update.get("update_type") or "other").strip().lower()
                 amount_kind = update.get("amount_kind") or ""
                 amount = float(update.get("amount") or 0.0)
                 unit = update.get("unit") or ""
-                term_type, value = self._normalise_term_value(amount, amount_kind, unit)
-
+                verbatim_quote = update.get("verbatim_quote") or ""
                 expiry_kind_raw = update.get("expiry_kind") or "none"
                 expires_hint = update.get("expires_hint") or ""
-                expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
-                    expiry_kind_raw, expires_hint, None, now
-                )
 
-                verbatim_quote = update.get("verbatim_quote") or ""
+                if utype == "availability":
+                    term_type = "unavailable"
+                    value = 0.0
+                    expiry_hint = expiry_kind_raw if expiry_kind_raw != "none" else "until_date"
+                    hint_text = expires_hint or verbatim_quote or "2 weeks"
+                    expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                        expiry_hint, hint_text, None, now
+                    )
+                    if expiry_kind_str == "none":
+                        expiry_kind_str = "date"
+                        expires_at = now + 14 * 86400.0
+                elif utype == "lead_time":
+                    term_type = "lead_time_override"
+                    value = max(0.0, float(amount) if amount else 1.0)
+                    expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                        expiry_kind_raw, expires_hint, None, now
+                    )
+                else:
+                    term_type, value = self._normalise_term_value(amount, amount_kind, unit)
+                    expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                        expiry_kind_raw, expires_hint, None, now
+                    )
 
                 self._create_supplier_term(
                     call=call,
