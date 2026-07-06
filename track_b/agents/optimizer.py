@@ -230,8 +230,6 @@ class InventoryOptimizer(BaseAgent):
         if self.procurement is None:
             return 0
 
-        horizon_days = max(horizon_days or 14.0, 14.0)
-
         # Fetch the latest DEMAND_FORECAST_HORIZON signal (pull-style).
         horizon_signals = self.bus.live(type=SignalType.DEMAND_FORECAST_HORIZON)
         days_payload = []
@@ -241,7 +239,17 @@ class InventoryOptimizer(BaseAgent):
 
         now = float(self.bus.sim_time)
         now_day = int(now // SECONDS_PER_DAY)
-        n_days = math.ceil(horizon_days)
+
+        # Derive n_days from the actual forecast span so we never project demand
+        # beyond where we have real data (which caused back-half zero-demand rows
+        # and under-sized orders).  If the caller provides an explicit horizon_days,
+        # cap it at the forecast span; with no live forecast fall back gracefully.
+        forecast_span = (max(d.get("day_index", 0) for d in days_payload) + 1) if days_payload else 0
+        if forecast_span > 0:
+            n_days = forecast_span if horizon_days is None else min(math.ceil(float(horizon_days)), forecast_span)
+        else:
+            n_days = math.ceil(float(horizon_days or 14.0))
+        horizon_days = float(n_days)  # normalise for ProcurementPlanRun persistence
 
         # ----------------------------------------------------------------
         # Phase 1: Compute per-day per-ingredient demand and gather supply
@@ -333,6 +341,7 @@ class InventoryOptimizer(BaseAgent):
                         "pack_size": float(c.pack_size or 1.0),
                         "availability": c.availability,
                         "unit": c.unit,
+                        "is_default": int(getattr(c, "is_default", 0) or 0),
                     }
                     for c in catalog
                 ]
@@ -345,7 +354,7 @@ class InventoryOptimizer(BaseAgent):
                     .all()
                 )
                 lead_by_supplier = {s.id: float(s.lead_time_days or 1.0) for s in suppliers}
-                candidate = self._choose_supplier(specs, lead_by_supplier)
+                candidate = self._select_supplier(specs, lead_by_supplier)
                 if candidate is None:
                     continue
 
@@ -369,6 +378,43 @@ class InventoryOptimizer(BaseAgent):
             session.close()
 
         # ----------------------------------------------------------------
+        # A1: Build inbound_by_day — quantities already en-route bucketed by
+        # arrival day so the projection never re-flags covered shortages.
+        # ----------------------------------------------------------------
+        inbound_by_day: Dict[int, Dict[int, float]] = {ing_id: {} for ing_id in ingredient_ids}
+        if ingredient_ids:
+            from sqlalchemy import func as _sa_func  # local import; avoids top-level sqlalchemy dep
+            session = self.db_session_factory()
+            try:
+                in_transit = (
+                    session.query(
+                        PurchaseOrderLine.ingredient_id,
+                        PurchaseOrder.expected_delivery,
+                        _sa_func.sum(PurchaseOrderLine.qty).label("total_qty"),
+                    )
+                    .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
+                    .filter(
+                        PurchaseOrderLine.ingredient_id.in_(ingredient_ids),
+                        PurchaseOrder.status.in_(("proposed", "approved", "placed")),
+                        PurchaseOrder.expected_delivery.isnot(None),
+                    )
+                    .group_by(PurchaseOrderLine.ingredient_id, PurchaseOrder.expected_delivery)
+                    .all()
+                )
+                for ing_id_t, exp_delivery, total_qty in in_transit:
+                    if exp_delivery is None:
+                        continue
+                    arr_day = int(float(exp_delivery) // SECONDS_PER_DAY) - now_day
+                    # Overdue deliveries (arr_day < 0) are treated as arriving today.
+                    arr_day = max(arr_day, 0)
+                    if ing_id_t in inbound_by_day:
+                        inbound_by_day[ing_id_t][arr_day] = (
+                            inbound_by_day[ing_id_t].get(arr_day, 0.0) + float(total_qty or 0.0)
+                        )
+            finally:
+                session.close()
+
+        # ----------------------------------------------------------------
         # Phase 2: Day-by-day stock projection per ingredient
         # ----------------------------------------------------------------
         new_orders: List[Dict] = []
@@ -385,6 +431,13 @@ class InventoryOptimizer(BaseAgent):
 
             for d in range(n_days):
                 delivery_sim_s = float((now_day + d) * SECONDS_PER_DAY + DAY_OPEN_OFFSET)
+                # Day-0 opens at 08:00 but the sim may already be past that; clamp
+                # so delivery is never scheduled in the past (avoids spurious at_risk).
+                if d == 0:
+                    delivery_sim_s = max(delivery_sim_s, now)
+
+                # A1: Credit inbound deliveries arriving today before checking stock.
+                running_stock += inbound_by_day[ing_id].get(d, 0.0)
 
                 # Robust demand floor: max(transient qty, steady-state baseline).
                 day_qty = per_day_demand[ing_id].get(d, 0.0)
@@ -408,6 +461,14 @@ class InventoryOptimizer(BaseAgent):
                         for dd in range(d, cover_end)
                     )
                     needed = max(0.0, demand_to_cover + safety_stock - max(0.0, running_stock))
+
+                    # A1 (sizing): subtract inbound scheduled within the coverage window.
+                    # running_stock already accounts for inbound on days 0..d; subtract
+                    # days d+1..cover_end so the order size reflects the true net shortfall.
+                    inbound_in_window = sum(
+                        inbound_by_day[ing_id].get(dd, 0.0) for dd in range(d + 1, cover_end)
+                    )
+                    needed = max(0.0, needed - inbound_in_window)
 
                     # Perishable ceiling: don't order more than can be consumed before expiry.
                     if shelf_life is not None:
@@ -471,6 +532,9 @@ class InventoryOptimizer(BaseAgent):
             final_new_orders: List[Dict] = []
             kept_ids: set = set()
             superseded_ids: set = set()
+            # Maps kept row_id → the current plan data so we can refresh supplier,
+            # qty, status, etc. on rows preserved by hysteresis (A2 supplier fix).
+            kept_updates: Dict[int, Dict] = {}
 
             for order_data in new_orders:
                 ing_id = order_data["ingredient_id"]
@@ -492,7 +556,23 @@ class InventoryOptimizer(BaseAgent):
                         and abs(new_delivery - float(matched.delivery_date or 0.0)) < SECONDS_PER_DAY
                     ):
                         kept_ids.add(matched.id)
-                        continue  # keep existing row unchanged
+                        # A2/A4: Refresh mutable fields on kept rows so a stale row
+                        # from an old plan run reflects the current MILP supplier,
+                        # recalculated qty, and current timing — not the code from
+                        # when the row was first created.
+                        kept_updates[matched.id] = {
+                            "supplier_id": order_data["supplier_id"],
+                            "qty": order_data["qty"],
+                            "unit": order_data["unit"],
+                            "unit_price": order_data["unit_price"],
+                            "order_date": order_data["order_date"],
+                            "delivery_date": order_data["delivery_date"],
+                            "covers_from": order_data.get("covers_from"),
+                            "covers_until": order_data.get("covers_until"),
+                            "status": order_data["status"],
+                            "reason": order_data["reason"],
+                        }
+                        continue
                     else:
                         superseded_ids.add(matched.id)
 
@@ -522,6 +602,14 @@ class InventoryOptimizer(BaseAgent):
             )
             session.add(run)
             session.flush()
+
+            # Apply refreshed data to kept rows (supplier, qty, status, etc.)
+            for row_id, updates in kept_updates.items():
+                row = session.get(PlannedOrder, row_id)
+                if row:
+                    for field, value in updates.items():
+                        setattr(row, field, value)
+                    row.plan_run_id = run.id
 
             for order_data in final_new_orders:
                 session.add(PlannedOrder(**order_data, plan_run_id=run.id, created_at=now))
@@ -570,6 +658,7 @@ class InventoryOptimizer(BaseAgent):
                     "qty": po.qty,
                     "unit": po.unit,
                     "unit_price": po.unit_price,
+                    "delivery_date": po.delivery_date,  # A4: carry through for _place
                 }
                 for po in due
             ]
@@ -584,22 +673,25 @@ class InventoryOptimizer(BaseAgent):
             if supplier_id is None:
                 continue
 
-            # Skip if there is already an in-flight PO for this ingredient.
+            # A5: Compute in-flight qty and only place the shortfall.
+            # This prevents a small inbound PO from suppressing a much larger need.
+            from sqlalchemy import func as _sa_func
             session2 = self.db_session_factory()
             try:
-                outstanding = (
-                    session2.query(PurchaseOrderLine)
+                inbound_qty_row = (
+                    session2.query(_sa_func.sum(PurchaseOrderLine.qty))
                     .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
                     .filter(
                         PurchaseOrderLine.ingredient_id == ing_id,
                         PurchaseOrder.status.in_(("proposed", "approved", "placed")),
                     )
-                    .first()
+                    .scalar()
                 )
             finally:
                 session2.close()
-
-            if outstanding is not None:
+            inbound_qty = float(inbound_qty_row or 0.0)
+            shortfall = po_data["qty"] - inbound_qty
+            if shortfall <= 0:
                 continue
 
             # Fall back to catalog for unit / price if the PlannedOrder row lacks them.
@@ -632,11 +724,12 @@ class InventoryOptimizer(BaseAgent):
                     supplier_id=supplier_id,
                     lines=[{
                         "ingredient_id": ing_id,
-                        "qty": po_data["qty"],
+                        "qty": shortfall,  # A5: only order the net shortfall
                         "unit": unit,
                         "unit_price": float(unit_price),
                     }],
                     created_by=self.name,
+                    planned_delivery=po_data.get("delivery_date"),  # A4: honour plan date
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -678,19 +771,19 @@ class InventoryOptimizer(BaseAgent):
             par_level = float(level.par_level or 0.0)
             safety_stock = float(level.safety_stock or 0.0)
 
-            # Don't pile on another PO while one is already in flight for this
-            # ingredient (proposed/approved/placed, i.e. not yet delivered).
-            outstanding = (
-                session.query(PurchaseOrderLine)
+            # A5: Sum in-transit qty so we only order the shortfall, not the full
+            # par/forecast target when part of it is already inbound.
+            from sqlalchemy import func as _sa_func
+            inbound_qty_row = (
+                session.query(_sa_func.sum(PurchaseOrderLine.qty))
                 .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
                 .filter(
                     PurchaseOrderLine.ingredient_id == ingredient_id,
                     PurchaseOrder.status.in_(("proposed", "approved", "placed")),
                 )
-                .first()
+                .scalar()
             )
-            if outstanding is not None:
-                return
+            inbound_qty = float(inbound_qty_row or 0.0)
 
             catalog = (
                 session.query(SupplierCatalog)
@@ -720,14 +813,9 @@ class InventoryOptimizer(BaseAgent):
         finally:
             session.close()
 
-        # Prefer the MILP-chosen default supplier; fall back to heuristic scorer.
-        default_specs = [
-            s for s in specs
-            if s.get("is_default") == 1 and s["availability"] != "out"
-        ]
-        candidate = default_specs[0] if default_specs else self._choose_supplier(
-            specs, lead_by_supplier
-        )
+        # A2: Use _select_supplier (MILP default → heuristic fallback) — same as
+        # build_procurement_plan so both paths always agree on who to buy from.
+        candidate = self._select_supplier(specs, lead_by_supplier)
         if candidate is None:
             self.log_event(
                 "reorder_failed",
@@ -757,6 +845,8 @@ class InventoryOptimizer(BaseAgent):
                 if demand_ceiling < needed:
                     needed = max(par_level - on_hand, demand_ceiling)
 
+        # A5: Subtract inbound supply — only order the net shortfall.
+        needed = max(0.0, needed - inbound_qty)
         if needed <= 0:
             return
         pack_size = candidate["pack_size"] or 1.0
@@ -1043,10 +1133,19 @@ class InventoryOptimizer(BaseAgent):
                     shelf_cap = robust_usage * float(ing.shelf_life_days)
                     par_level = min(par_level, shelf_cap)
 
-                # Never lower par below existing value if it would zero out procurement
-                level.safety_stock = round(max(level.safety_stock or 0.0, safety_stock), 4)
-                level.reorder_point = round(max(level.reorder_point or 0.0, reorder_point * 0.5), 4)
-                level.par_level = round(max(level.par_level or 0.0, par_level * 0.5), 4)
+                # A6: EMA update — pars can now decrease as demand subsides instead
+                # of permanently ratcheting to historical peaks.  α=0.3 adapts over
+                # roughly 3 horizon readings while damping single-event spikes.
+                _alpha = 0.3
+                level.safety_stock = round(
+                    max(0.0, float(level.safety_stock or 0.0) * (1 - _alpha) + safety_stock * _alpha), 4
+                )
+                level.reorder_point = round(
+                    max(0.0, float(level.reorder_point or 0.0) * (1 - _alpha) + reorder_point * 0.5 * _alpha), 4
+                )
+                level.par_level = round(
+                    max(0.0, float(level.par_level or 0.0) * (1 - _alpha) + par_level * 0.5 * _alpha), 4
+                )
 
             session.commit()
         except Exception:  # noqa: BLE001
@@ -1059,6 +1158,28 @@ class InventoryOptimizer(BaseAgent):
             "Dynamic pars refreshed from 7-day horizon (robust baseline).",
             {"signal_age": float((self.bus.live(type=SignalType.DEMAND_FORECAST_HORIZON) or [{}])[0].payload.get("generated_at", 0) if horizon_signals else 0)},
         )
+
+    def _select_supplier(
+        self,
+        specs: List[Dict[str, Any]],
+        lead_by_supplier: Dict[int, float],
+    ) -> Optional[Dict[str, Any]]:
+        """Single supplier-selection entry point used by **all** ordering paths.
+
+        Prefers the MILP-chosen default supplier (``is_default == 1`` on
+        ``SupplierCatalog``, written by ``run_sourcing_plan``); falls back to the
+        heuristic scorer only when no default is available or in stock.  Using this
+        consistently across ``build_procurement_plan`` and ``_maybe_reorder`` ensures
+        the forward plan and the reactive reorder path always agree on who to buy from
+        and with which lead time (§18.8, A2).
+        """
+        default_specs = [
+            s for s in specs
+            if s.get("is_default") == 1 and s.get("availability") != "out"
+        ]
+        if default_specs:
+            return default_specs[0]
+        return self._choose_supplier(specs, lead_by_supplier)
 
     @staticmethod
     def _choose_supplier(

@@ -82,8 +82,15 @@ class Procurement:
         supplier_id: int,
         lines: List[Dict[str, Any]],
         created_by: str = "optimizer",
+        planned_delivery: Optional[float] = None,
     ) -> PurchaseOrder:
-        """Create a PO (+ lines); auto-place or route to approval (§18.8)."""
+        """Create a PO (+ lines); auto-place or route to approval (§18.8).
+
+        ``planned_delivery`` — if provided, ``_place`` uses it as the
+        ``expected_delivery`` (clamped to ≥ now) instead of recomputing from
+        ``now + lead_days``.  Prevents the plan's promised delivery date from
+        drifting when the order is actually executed (A4).
+        """
         now = self.sim_time
         total = sum(float(l["qty"]) * float(l["unit_price"] or 0.0) for l in lines)
 
@@ -141,7 +148,7 @@ class Procurement:
                 {"po_id": po_id, "total": total},
             )
         else:
-            self._place(po_id)
+            self._place(po_id, planned_delivery=planned_delivery)
 
         return po
 
@@ -151,7 +158,7 @@ class Procurement:
         """Place a PO that was awaiting approval (called by approval handlers)."""
         self._place(po_id)
 
-    def _place(self, po_id: int) -> None:
+    def _place(self, po_id: int, planned_delivery: Optional[float] = None) -> None:
         now = self.sim_time
         session = self.db_session_factory()
         try:
@@ -160,7 +167,13 @@ class Procurement:
                 return
             supplier = session.get(Supplier, po.supplier_id)
             lead_days = float(supplier.lead_time_days or 1.0) if supplier is not None else 1.0
-            expected_delivery = now + lead_days * 86400.0
+            # A4: Use the plan's promised delivery date when provided so the PO's
+            # expected_delivery matches what the plan showed.  Clamp to ≥ now so the
+            # deadline trigger fires at a valid future time.
+            if planned_delivery is not None:
+                expected_delivery = max(float(planned_delivery), now)
+            else:
+                expected_delivery = now + lead_days * 86400.0
             po.status = "placed"
             po.expected_delivery = expected_delivery
 

@@ -29,8 +29,9 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from core import config
-from core.clock import SECONDS_PER_DAY
+from core.clock import DAY_OPEN_OFFSET, SECONDS_PER_DAY
 from core.models import BatchDefinition, MenuItem, OrderLine
+from core.signals import SignalType
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +118,9 @@ class MockForecaster:
     # -- per-interval tick --------------------------------------------------
 
     def tick(self) -> None:
-        """Emit demand for every active item, then any due batch decisions."""
+        """Emit demand for every active item, horizon signal, then batch decisions."""
         self._emit_demand_forecasts()
+        self._emit_horizon()
         self._emit_due_batch_decisions()
 
     # -- demand -------------------------------------------------------------
@@ -166,6 +168,77 @@ class MockForecaster:
                 ttl=ttl,
                 dedup_key=f"demand:{item_id}",
             )
+
+    # -- 7-day rolling horizon (A7) ----------------------------------------
+
+    def _emit_horizon(self) -> None:
+        """Emit a DEMAND_FORECAST_HORIZON signal covering the next 7 sim-days.
+
+        Mirrors the shape that ``build_procurement_plan`` expects (§B5, A7).
+        Without this, the forward planner is inert under ``DEMO_MODE=track_b``
+        because the real Track-A forecaster does not run in that mode.
+        """
+        now = self.bus.sim_time
+        now_day = int(now // SECONDS_PER_DAY)
+        dow_today = now_day % 7
+        horizon = 7  # days to cover
+
+        session = self.db_session_factory()
+        try:
+            self._ensure_baselines(session)
+            items = (
+                session.query(MenuItem)
+                .filter(MenuItem.active == 1)
+                .order_by(MenuItem.id.asc())
+                .all()
+            )
+            item_ids = [mi.id for mi in items]
+        finally:
+            session.close()
+
+        days: List[Dict] = []
+        item_daily_baseline_median: Dict[str, float] = {}
+
+        for d in range(horizon):
+            dow = (dow_today + d) % 7
+            day_start = float((now_day + d) * SECONDS_PER_DAY)
+            # Total demand for this day across all active dayparts.
+            day_items: List[Dict] = []
+            for item_id in item_ids:
+                # Sum baselines across all dayparts for this day-of-week.
+                day_qty = sum(
+                    self._baseline(item_id, dp_name, dow)
+                    for dp_name, _s, _e in _DAYPARTS
+                )
+                day_items.append({
+                    "menu_item_id": item_id,
+                    "qty": round(day_qty, 2),
+                    "baseline": round(day_qty, 2),
+                })
+                # Accumulate for daily-median summary (used by refresh_dynamic_pars).
+                key = str(item_id)
+                prev = item_daily_baseline_median.get(key, 0.0)
+                item_daily_baseline_median[key] = max(prev, day_qty)
+
+            days.append({
+                "day_index": d,
+                "start": day_start + DAY_OPEN_OFFSET,
+                "end": day_start + SECONDS_PER_DAY,
+                "items": day_items,
+            })
+
+        self.bus.emit(
+            type=SignalType.DEMAND_FORECAST_HORIZON,
+            payload={
+                "horizon_days": horizon,
+                "generated_at": now,
+                "days": days,
+                "item_daily_baseline_median": item_daily_baseline_median,
+            },
+            source=self.name,
+            ttl=float(config.FORECAST_INTERVAL_SIM_S * 2),
+            dedup_key="mock_horizon",
+        )
 
     # -- batch decisions ----------------------------------------------------
 

@@ -43,8 +43,13 @@ class _FakeProcurement:
     def __init__(self):
         self.calls = []
 
-    def create_po(self, supplier_id, lines, created_by="optimizer"):
-        self.calls.append({"supplier_id": supplier_id, "lines": lines, "created_by": created_by})
+    def create_po(self, supplier_id, lines, created_by="optimizer", planned_delivery=None):
+        self.calls.append({
+            "supplier_id": supplier_id,
+            "lines": lines,
+            "created_by": created_by,
+            "planned_delivery": planned_delivery,
+        })
         # Return a SimpleNamespace mimicking a PurchaseOrder so callers don't crash.
         return SimpleNamespace(id=9999, status="placed")
 
@@ -502,3 +507,290 @@ def test_execute_skips_when_po_inflight(bus, session_factory):
 
     assert executed == 0, "Should not create a PO when one is already in flight"
     assert len(proc.calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 9 (A1): In-transit PO eliminates phantom duplicate plan row
+# ---------------------------------------------------------------------------
+
+
+def test_inbound_po_suppresses_duplicate_plan_row(bus, session_factory):
+    """A placed PO already covering demand must NOT re-appear as a PlannedOrder."""
+    # on_hand=200g covers day 0 (200 - 100 = 100g, above safety_stock=50).
+    # Inbound PO of 1000g arriving day 1 covers the remaining 6 days of the 7-day horizon.
+    # → No new plan rows should be generated.
+    ing_id = _seed_ingredient(session_factory, on_hand=200.0, safety_stock=50.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=100.0)
+    sup_id = _seed_supplier(session_factory, ing_id, lead_time_days=2.0, pack_size=10.0, price=1.0)
+
+    bus.sim_time = 0.0
+    # 1 portion/day × 100g = 100 g/day demand.
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=1.0, days=7)
+
+    # Seed an in-transit PO that arrives on day 1 with more than enough to cover days 1–6.
+    # Days 1–6 demand: 6 × 100 = 600 g.  Running stock after day 0 = 100g.
+    # With 1000g inbound on day 1: running_stock = 1100g, never dips below safety_stock.
+    session = session_factory()
+    try:
+        inbound_po = PurchaseOrder(
+            supplier_id=sup_id, status="placed",
+            created_at=0.0, expected_delivery=float(SECONDS_PER_DAY),  # arrives day 1
+            total_cost=1000.0, created_by="test",
+        )
+        session.add(inbound_po)
+        session.flush()
+        session.add(PurchaseOrderLine(
+            po_id=inbound_po.id, ingredient_id=ing_id,
+            qty=1000.0, unit="g", unit_price=1.0, line_total=1000.0,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    count = opt.build_procurement_plan(horizon_days=7.0)
+
+    # The inbound PO covers the entire horizon; no new plan rows needed.
+    assert count == 0, (
+        f"Expected 0 PlannedOrders when in-transit supply covers demand, got {count}"
+    )
+    session = session_factory()
+    try:
+        rows = session.query(PlannedOrder).filter(
+            PlannedOrder.status.in_(["planned", "at_risk"])
+        ).count()
+        assert rows == 0, f"Expected 0 active PlannedOrder rows, found {rows}"
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 10 (A2): build_procurement_plan uses the MILP is_default supplier
+# ---------------------------------------------------------------------------
+
+
+def _seed_supplier_with_default(session_factory, ing_id, lead_time_days=2.0, price=1.0,
+                                 pack_size=10.0, is_default=0):
+    """Seed a supplier + catalog entry with optional is_default flag."""
+    session = session_factory()
+    try:
+        sup = Supplier(
+            name=f"Supplier_default={is_default}", lead_time_days=lead_time_days,
+            reliability_score=0.9, min_order_value=0.0, contact="",
+        )
+        session.add(sup)
+        session.flush()
+        session.add(SupplierCatalog(
+            supplier_id=sup.id, ingredient_id=ing_id,
+            current_price=price, pack_size=pack_size,
+            unit="g", availability="in_stock", updated_at=0.0, is_default=is_default,
+        ))
+        session.commit()
+        return sup.id
+    finally:
+        session.close()
+
+
+def test_build_plan_uses_milp_default_supplier(bus, session_factory):
+    """build_procurement_plan must pick the is_default=1 supplier, not the heuristic winner."""
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0, safety_stock=50.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=100.0)
+
+    # Heuristic-preferred supplier: cheaper price, faster lead — would win on score.
+    _seed_supplier_with_default(session_factory, ing_id, lead_time_days=1.0, price=0.1,
+                                 pack_size=10.0, is_default=0)
+    # MILP-chosen default supplier: slower lead, higher price — but is_default=1.
+    default_sup_id = _seed_supplier_with_default(session_factory, ing_id, lead_time_days=3.0,
+                                                  price=5.0, pack_size=10.0, is_default=1)
+
+    bus.sim_time = 0.0
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=1.0, days=7)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=7.0)
+
+    session = session_factory()
+    try:
+        rows = session.query(PlannedOrder).filter(
+            PlannedOrder.status.in_(["planned", "at_risk"])
+        ).all()
+        assert rows, "Expected at least one PlannedOrder row"
+        for row in rows:
+            assert row.supplier_id == default_sup_id, (
+                f"Plan used supplier {row.supplier_id} but expected MILP default {default_sup_id}"
+            )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 11 (A3): n_days is clamped to forecast span
+# ---------------------------------------------------------------------------
+
+
+def test_n_days_clamped_to_forecast_span(bus, session_factory):
+    """build_procurement_plan must not project beyond the actual forecast data."""
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0, safety_stock=50.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=100.0)
+    _seed_supplier(session_factory, ing_id, lead_time_days=1.0, pack_size=10.0)
+
+    bus.sim_time = 0.0
+    FORECAST_DAYS = 5
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=1.0, days=FORECAST_DAYS)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    # Pass horizon_days=14 (larger than forecast); effective window must be FORECAST_DAYS.
+    opt.build_procurement_plan(horizon_days=14.0)
+
+    session = session_factory()
+    try:
+        run = session.query(ProcurementPlanRun).order_by(ProcurementPlanRun.id.desc()).first()
+        assert run is not None
+        # horizon_days stored on the run should reflect the clamped value.
+        assert run.horizon_days == pytest.approx(float(FORECAST_DAYS)), (
+            f"Expected horizon_days={FORECAST_DAYS}, got {run.horizon_days}"
+        )
+        # No PlannedOrder should have delivery_date beyond FORECAST_DAYS.
+        rows = session.query(PlannedOrder).all()
+        max_day = int(bus.sim_time // SECONDS_PER_DAY) + FORECAST_DAYS
+        for row in rows:
+            if row.delivery_date is not None:
+                arr_day = int(float(row.delivery_date) // SECONDS_PER_DAY)
+                assert arr_day <= max_day + 1, (
+                    f"Delivery day {arr_day} exceeds forecast span {max_day}"
+                )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 12 (A5): execute_due_planned_orders places only the shortfall
+# ---------------------------------------------------------------------------
+
+
+def test_execute_places_shortfall_only(bus, session_factory):
+    """A small in-flight PO must not suppress the full need; only the shortfall is ordered."""
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0)
+    sup_id = _seed_supplier(session_factory, ing_id, lead_time_days=1.0, price=1.0, pack_size=10.0)
+
+    session = session_factory()
+    try:
+        # Existing in-flight PO — small quantity (30g).
+        small_po = PurchaseOrder(
+            supplier_id=sup_id, status="placed",
+            created_at=0.0, expected_delivery=86400.0,
+            total_cost=30.0, created_by="test",
+        )
+        session.add(small_po)
+        session.flush()
+        session.add(PurchaseOrderLine(
+            po_id=small_po.id, ingredient_id=ing_id,
+            qty=30.0, unit="g", unit_price=1.0, line_total=30.0,
+        ))
+
+        # Due planned order — needs 100g total.
+        planned = PlannedOrder(
+            plan_run_id=None,
+            ingredient_id=ing_id, supplier_id=sup_id,
+            qty=100.0, unit="g", unit_price=1.0,
+            order_date=0.0, delivery_date=86400.0,
+            covers_from=86400.0, covers_until=172800.0,
+            status="planned", reason="test", created_at=0.0,
+        )
+        session.add(planned)
+        session.commit()
+        planned_id = planned.id
+    finally:
+        session.close()
+
+    bus.sim_time = 10.0
+    opt, proc = _make_optimizer(bus, session_factory)
+    executed = opt.execute_due_planned_orders()
+
+    assert executed == 1, f"Expected 1 executed order (shortfall), got {executed}"
+    assert len(proc.calls) == 1
+    # Shortfall = 100 - 30 = 70; rounded up to pack_size 10 → 70 (exact multiple).
+    assert proc.calls[0]["lines"][0]["qty"] == pytest.approx(70.0), (
+        f"Expected shortfall qty 70.0, got {proc.calls[0]['lines'][0]['qty']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 13 (A8): Ingredient demand is derived correctly from recipe + yield
+# ---------------------------------------------------------------------------
+
+
+def test_demand_derivation_from_recipe_and_yield(bus, session_factory):
+    """Per-ingredient demand must equal Σ(dish_qty × recipe_qty / yield_factor)."""
+    RECIPE_QTY = 150.0   # g of ingredient per portion
+    YIELD_FACTOR = 0.75  # 75% yield → need 150 / 0.75 = 200 g raw per portion
+    DAILY_DISHES = 4.0   # portions per day
+    LEAD_DAYS = 1.0
+
+    session = session_factory()
+    try:
+        station = Station(name="line")
+        session.add(station)
+        session.flush()
+        ing = Ingredient(name="demand_test_ing", category="produce", base_unit="g",
+                         perishable=0, shelf_life_days=None)
+        session.add(ing)
+        session.flush()
+        ing_id = ing.id
+
+        level = InventoryLevel(
+            ingredient_id=ing_id, par_level=5000.0, reorder_point=1000.0,
+            safety_stock=100.0, yield_factor=YIELD_FACTOR, on_hand_cached=0.0,
+        )
+        session.add(level)
+
+        item = MenuItem(name="YieldDish", category="main", station_id=station.id,
+                        dine_in_price=10.0, online_price=11.0, prep_time_min=5.0,
+                        is_batchable=0, active=1)
+        session.add(item)
+        session.flush()
+        recipe = Recipe(menu_item_id=item.id)
+        session.add(recipe)
+        session.flush()
+        session.add(RecipeLine(recipe_id=recipe.id, ingredient_id=ing_id,
+                                qty=RECIPE_QTY, unit="g", optional=0))
+
+        sup = Supplier(name="DemandSup", lead_time_days=LEAD_DAYS,
+                       reliability_score=0.9, min_order_value=0.0, contact="")
+        session.add(sup)
+        session.flush()
+        session.add(SupplierCatalog(
+            supplier_id=sup.id, ingredient_id=ing_id,
+            current_price=1.0, pack_size=10.0, unit="g",
+            availability="in_stock", updated_at=0.0, is_default=1,
+        ))
+        session.commit()
+        item_id = item.id
+    finally:
+        session.close()
+
+    bus.sim_time = 0.0
+    HORIZON_DAYS = 3
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=DAILY_DISHES, days=HORIZON_DAYS)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=float(HORIZON_DAYS))
+
+    # Expected daily ingredient demand: 4 portions × (150 g / 0.75 yield) = 800 g/day.
+    expected_daily_ing_demand = DAILY_DISHES * (RECIPE_QTY / YIELD_FACTOR)
+
+    session = session_factory()
+    try:
+        rows = session.query(PlannedOrder).filter(
+            PlannedOrder.ingredient_id == ing_id,
+            PlannedOrder.status.in_(["planned", "at_risk"])
+        ).all()
+        assert rows, "Expected at least one PlannedOrder for the ingredient"
+        # The first order must cover ≥ 1 day's demand (safety + demand_to_cover).
+        total_planned = sum(float(r.qty) for r in rows)
+        assert total_planned >= expected_daily_ing_demand - 1.0, (
+            f"Total planned qty {total_planned} should cover at least "
+            f"{expected_daily_ing_demand:.1f} g/day (recipe+yield adjusted)"
+        )
+    finally:
+        session.close()
