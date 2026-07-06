@@ -1196,6 +1196,55 @@ class AppSettings(Base):
 
 
 # ---------------------------------------------------------------------------
+# §19.3 Procurement planning (WS4 forward planner)
+# ---------------------------------------------------------------------------
+
+class ProcurementPlanRun(Base):
+    """Audit header for each forward-plan computation."""
+    __tablename__ = "procurement_plan_runs"
+
+    id = _pk()
+    created_at = mapped_column(Float)      # sim-seconds
+    horizon_days = mapped_column(Float)
+    items_planned = mapped_column(Integer)
+    method = mapped_column(String)         # "projection"
+
+    def __repr__(self):
+        return (f"<ProcurementPlanRun id={self.id} horizon_days={self.horizon_days} "
+                f"items_planned={self.items_planned} method={self.method!r}>")
+
+
+class PlannedOrder(Base):
+    """A forward-scheduled procurement order produced by the planner.
+
+    status: 'planned' | 'at_risk' | 'placed' | 'superseded'
+    'at_risk' means order_date < now (lead time insufficient to cover shortage).
+    'placed' means a real PO was auto-created from this row.
+    'superseded' means a later plan run replaced this row.
+    """
+    __tablename__ = "planned_orders"
+
+    id = _pk()
+    plan_run_id = mapped_column(Integer)            # FK to procurement_plan_runs.id
+    ingredient_id = mapped_column(Integer)
+    supplier_id = mapped_column(Integer, nullable=True)
+    qty = mapped_column(Float)
+    unit = mapped_column(String, nullable=True)
+    unit_price = mapped_column(Float, nullable=True)
+    order_date = mapped_column(Float)               # sim-seconds: when to place the order
+    delivery_date = mapped_column(Float)            # sim-seconds: expected delivery
+    covers_from = mapped_column(Float)              # sim-seconds: demand window start
+    covers_until = mapped_column(Float)             # sim-seconds: demand window end
+    status = mapped_column(String, default="planned")
+    reason = mapped_column(Text, nullable=True)
+    created_at = mapped_column(Float)
+
+    def __repr__(self):
+        return (f"<PlannedOrder id={self.id} ingredient_id={self.ingredient_id} "
+                f"qty={self.qty} status={self.status!r} delivery_date={self.delivery_date}>")
+
+
+# ---------------------------------------------------------------------------
 # Table groupings (used by db.reset_db).
 #
 # These mostly mirror the §19 sections, with one deliberate deviation:
@@ -1227,6 +1276,7 @@ INTELLIGENCE_MODELS = [
     ApprovalRequest, ForecastJob, HorizonForecast, HorizonForecastLine,
     Promotion, UserFact, LLMCallLog, WeatherLog, Call,
     ManagerChange, SourcingRun, SupplierTerm,
+    ProcurementPlanRun, PlannedOrder,
 ]
 
 CONTROL_MODELS = [

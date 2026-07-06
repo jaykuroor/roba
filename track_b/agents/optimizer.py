@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from core import config
 from core.agent_base import BaseAgent
+from core.clock import DAY_OPEN_OFFSET, SECONDS_PER_DAY
 from core.llm import CANNED_NOTE
 from core.models import (
     AppSettings,
@@ -32,6 +33,8 @@ from core.models import (
     MenuItem,
     MenuToggle,
     OrderLine,
+    PlannedOrder,
+    ProcurementPlanRun,
     Promotion,
     PurchaseOrder,
     PurchaseOrderLine,
@@ -152,6 +155,12 @@ class InventoryOptimizer(BaseAgent):
                 return
             payload["ingredient_id"] = ingredient_id
             self._propose_promo(payload)
+        elif signal.type == SignalType.DEMAND_FORECAST_HORIZON.value:
+            # Re-plan when the forecaster emits a fresh horizon (e.g. after a parade event).
+            self.build_procurement_plan()
+        elif signal.type == SignalType.WASTE_EVENT.value:
+            # Sudden spoilage: stock dropped unexpectedly — re-plan immediately.
+            self.build_procurement_plan()
         elif signal.type == SignalType.MENU_TOGGLE_REQUEST.value:
             payload = signal.payload or {}
             menu_item_id = payload.get("menu_item_id") or self._resolve_menu_item_id(
@@ -169,6 +178,9 @@ class InventoryOptimizer(BaseAgent):
 
     def reorder_check(self) -> None:
         """Periodic reorder sweep: ``on_hand ≤ reorder_point`` → PO (§18.8)."""
+        # Execute any planned orders whose order_date is now due.
+        self.execute_due_planned_orders()
+
         session = self.db_session_factory()
         try:
             levels = (
@@ -187,6 +199,9 @@ class InventoryOptimizer(BaseAgent):
             if self._on_hand_above_reorder(ingredient_id):
                 self._reenable(menu_item_id, ingredient_id)
 
+        # Rebuild the forward plan after each reactive sweep.
+        self.build_procurement_plan()
+
     def _on_hand_above_reorder(self, ingredient_id: int) -> bool:
         session = self.db_session_factory()
         try:
@@ -200,6 +215,450 @@ class InventoryOptimizer(BaseAgent):
             return float(level.on_hand_cached or 0.0) > float(level.reorder_point)
         finally:
             session.close()
+
+    # -- forward planner (WS4) -----------------------------------------------
+
+    def build_procurement_plan(self, horizon_days: Optional[float] = None) -> int:
+        """Build a time-phased forward procurement plan.
+
+        Projects running inventory day-by-day using the DEMAND_FORECAST_HORIZON
+        signal, schedules PlannedOrder rows for each ingredient that will dip
+        below safety stock, and applies hysteresis to avoid churn.
+
+        Returns the total count of active planned orders (new + kept).
+        """
+        if self.procurement is None:
+            return 0
+
+        horizon_days = max(horizon_days or 14.0, 14.0)
+
+        # Fetch the latest DEMAND_FORECAST_HORIZON signal (pull-style).
+        horizon_signals = self.bus.live(type=SignalType.DEMAND_FORECAST_HORIZON)
+        days_payload = []
+        if horizon_signals:
+            payload = horizon_signals[0].payload or {}
+            days_payload = payload.get("days") or []
+
+        now = float(self.bus.sim_time)
+        now_day = int(now // SECONDS_PER_DAY)
+        n_days = math.ceil(horizon_days)
+
+        # ----------------------------------------------------------------
+        # Phase 1: Compute per-day per-ingredient demand and gather supply
+        # ----------------------------------------------------------------
+        per_day_demand: Dict[int, Dict[int, float]] = {}   # {ing_id: {day_idx: qty}}
+        per_day_baseline: Dict[int, Dict[int, float]] = {} # {ing_id: {day_idx: baseline}}
+        ingredients_data: Dict[int, Dict] = {}
+
+        session = self.db_session_factory()
+        try:
+            catalog_entries = session.query(SupplierCatalog).all()
+            ingredient_ids = list({c.ingredient_id for c in catalog_entries})
+
+            for ing_id in ingredient_ids:
+                per_day_demand[ing_id] = {}
+                per_day_baseline[ing_id] = {}
+
+            # Precompute recipe qty per (menu_item_id, ingredient_id) for efficiency.
+            recipe_lines = (
+                session.query(RecipeLine, Recipe)
+                .join(Recipe, Recipe.id == RecipeLine.recipe_id)
+                .filter(RecipeLine.ingredient_id.in_(ingredient_ids), RecipeLine.optional == 0)
+                .all()
+            )
+            # {menu_item_id: {ingredient_id: raw_qty}}
+            raw_recipe_qty: Dict[int, Dict[int, float]] = {}
+            for rl, recipe in recipe_lines:
+                mid = recipe.menu_item_id
+                raw_recipe_qty.setdefault(mid, {})[rl.ingredient_id] = (
+                    raw_recipe_qty.get(mid, {}).get(rl.ingredient_id, 0.0)
+                    + float(rl.qty or 0.0)
+                )
+
+            # Yield-factor adjust.
+            yield_factors: Dict[int, float] = {}
+            for lv in session.query(InventoryLevel).filter(
+                InventoryLevel.ingredient_id.in_(ingredient_ids)
+            ):
+                yield_factors[lv.ingredient_id] = max(float(lv.yield_factor or 1.0), 0.0001)
+            recipe_qty: Dict[int, Dict[int, float]] = {}  # {menu_item_id: {ing_id: adj_qty}}
+            for mid, ing_map in raw_recipe_qty.items():
+                recipe_qty[mid] = {}
+                for ing_id, raw_q in ing_map.items():
+                    recipe_qty[mid][ing_id] = raw_q / yield_factors.get(ing_id, 1.0)
+
+            # Accumulate per-day ingredient demand from horizon signal.
+            for day in days_payload:
+                day_idx = int(day.get("day_index") or 0)
+                if day_idx >= n_days:
+                    continue
+                for item_entry in day.get("items") or []:
+                    menu_item_id = item_entry.get("menu_item_id")
+                    if menu_item_id is None:
+                        continue
+                    qty = float(item_entry.get("qty") or 0.0)
+                    baseline = float(item_entry.get("baseline") or 0.0)
+                    mid_recipe = recipe_qty.get(int(menu_item_id)) or {}
+                    for ing_id, ing_qty in mid_recipe.items():
+                        if ing_qty > 0:
+                            per_day_demand[ing_id][day_idx] = (
+                                per_day_demand[ing_id].get(day_idx, 0.0) + qty * ing_qty
+                            )
+                            per_day_baseline[ing_id][day_idx] = (
+                                per_day_baseline[ing_id].get(day_idx, 0.0) + baseline * ing_qty
+                            )
+
+            # Gather inventory levels, supplier info, ingredient metadata.
+            for ing_id in ingredient_ids:
+                level = (
+                    session.query(InventoryLevel)
+                    .filter(InventoryLevel.ingredient_id == ing_id)
+                    .first()
+                )
+                if level is None:
+                    continue
+                ing = session.get(Ingredient, ing_id)
+                if ing is None:
+                    continue
+
+                catalog = (
+                    session.query(SupplierCatalog)
+                    .filter(SupplierCatalog.ingredient_id == ing_id)
+                    .all()
+                )
+                specs = [
+                    {
+                        "supplier_id": c.supplier_id,
+                        "current_price": float(c.current_price or 0.0),
+                        "pack_size": float(c.pack_size or 1.0),
+                        "availability": c.availability,
+                        "unit": c.unit,
+                    }
+                    for c in catalog
+                ]
+                if not specs:
+                    continue
+                sup_ids = [s["supplier_id"] for s in specs]
+                suppliers = (
+                    session.query(Supplier)
+                    .filter(Supplier.id.in_(sup_ids))
+                    .all()
+                )
+                lead_by_supplier = {s.id: float(s.lead_time_days or 1.0) for s in suppliers}
+                candidate = self._choose_supplier(specs, lead_by_supplier)
+                if candidate is None:
+                    continue
+
+                lead_days = float(lead_by_supplier.get(candidate["supplier_id"], 1.0))
+                on_hand = float(level.on_hand_cached or 0.0)
+                safety_stock = float(level.safety_stock or 0.0)
+                shelf_life = (
+                    float(ing.shelf_life_days)
+                    if ing.perishable and ing.shelf_life_days
+                    else None
+                )
+
+                ingredients_data[ing_id] = {
+                    "candidate": candidate,
+                    "lead_days": lead_days,
+                    "on_hand": on_hand,
+                    "safety_stock": safety_stock,
+                    "shelf_life": shelf_life,
+                }
+        finally:
+            session.close()
+
+        # ----------------------------------------------------------------
+        # Phase 2: Day-by-day stock projection per ingredient
+        # ----------------------------------------------------------------
+        new_orders: List[Dict] = []
+
+        for ing_id, data in ingredients_data.items():
+            candidate = data["candidate"]
+            lead_days = data["lead_days"]
+            on_hand = data["on_hand"]
+            safety_stock = data["safety_stock"]
+            shelf_life = data["shelf_life"]
+            pack_size = candidate["pack_size"]
+
+            running_stock = on_hand
+
+            for d in range(n_days):
+                delivery_sim_s = float((now_day + d) * SECONDS_PER_DAY + DAY_OPEN_OFFSET)
+
+                # Robust demand floor: max(transient qty, steady-state baseline).
+                day_qty = per_day_demand[ing_id].get(d, 0.0)
+                day_base = per_day_baseline[ing_id].get(d, 0.0)
+                day_demand = max(day_qty, day_base)
+
+                running_stock -= day_demand
+
+                if running_stock < safety_stock:
+                    order_date = delivery_sim_s - lead_days * SECONDS_PER_DAY
+
+                    # Size: cover demand for lead_days + REORDER_INTERVAL_DAYS + 1 more days.
+                    cover_days = lead_days + config.REORDER_INTERVAL_DAYS + 1
+                    cover_end = min(n_days, d + math.ceil(cover_days))
+
+                    demand_to_cover = sum(
+                        max(
+                            per_day_demand[ing_id].get(dd, 0.0),
+                            per_day_baseline[ing_id].get(dd, 0.0),
+                        )
+                        for dd in range(d, cover_end)
+                    )
+                    needed = max(0.0, demand_to_cover + safety_stock - max(0.0, running_stock))
+
+                    # Perishable ceiling: don't order more than can be consumed before expiry.
+                    if shelf_life is not None:
+                        expiry_end = min(n_days, d + math.ceil(min(shelf_life, cover_days)))
+                        demand_before_expiry = sum(
+                            max(
+                                per_day_demand[ing_id].get(dd, 0.0),
+                                per_day_baseline[ing_id].get(dd, 0.0),
+                            )
+                            for dd in range(d, expiry_end)
+                        )
+                        if 0 < demand_before_expiry < needed:
+                            needed = demand_before_expiry
+
+                    if needed <= 0:
+                        continue
+
+                    qty = math.ceil(needed / pack_size) * pack_size
+                    running_stock += qty  # delivery refills the running stock projection
+
+                    covers_until = float(
+                        (now_day + d + math.ceil(cover_days)) * SECONDS_PER_DAY + DAY_OPEN_OFFSET
+                    )
+                    status = "at_risk" if order_date < now else "planned"
+
+                    new_orders.append({
+                        "ingredient_id": ing_id,
+                        "supplier_id": candidate["supplier_id"],
+                        "qty": qty,
+                        "unit": candidate["unit"],
+                        "unit_price": candidate["current_price"],
+                        "order_date": order_date,
+                        "delivery_date": delivery_sim_s,
+                        "covers_from": delivery_sim_s,
+                        "covers_until": covers_until,
+                        "status": status,
+                        "reason": (
+                            f"Projected stock below safety_stock ({safety_stock:.1f}) "
+                            f"on sim day {now_day + d}"
+                        ),
+                    })
+
+        # ----------------------------------------------------------------
+        # Phase 3: Hysteresis + persist
+        # ----------------------------------------------------------------
+        session = self.db_session_factory()
+        total_active = 0
+        n_new = 0
+        n_kept = 0
+        n_superseded = 0
+        try:
+            existing_rows = (
+                session.query(PlannedOrder)
+                .filter(PlannedOrder.status.in_(["planned", "at_risk"]))
+                .all()
+            )
+            existing_by_ingredient: Dict[int, List] = {}
+            for row in existing_rows:
+                existing_by_ingredient.setdefault(row.ingredient_id, []).append(row)
+
+            final_new_orders: List[Dict] = []
+            kept_ids: set = set()
+            superseded_ids: set = set()
+
+            for order_data in new_orders:
+                ing_id = order_data["ingredient_id"]
+                new_delivery = order_data["delivery_date"]
+                new_qty = order_data["qty"]
+                pack_size = ingredients_data[ing_id]["candidate"]["pack_size"]
+
+                matched = None
+                for ex in existing_by_ingredient.get(ing_id, []):
+                    if ex.id in kept_ids or ex.id in superseded_ids:
+                        continue
+                    if abs((ex.delivery_date or 0.0) - new_delivery) < SECONDS_PER_DAY:
+                        matched = ex
+                        break
+
+                if matched is not None:
+                    if (
+                        abs(new_qty - float(matched.qty or 0.0)) <= pack_size
+                        and abs(new_delivery - float(matched.delivery_date or 0.0)) < SECONDS_PER_DAY
+                    ):
+                        kept_ids.add(matched.id)
+                        continue  # keep existing row unchanged
+                    else:
+                        superseded_ids.add(matched.id)
+
+                final_new_orders.append(order_data)
+
+            # Any existing rows not matched → supersede.
+            for rows in existing_by_ingredient.values():
+                for row in rows:
+                    if row.id not in kept_ids and row.id not in superseded_ids:
+                        superseded_ids.add(row.id)
+
+            for row_id in superseded_ids:
+                row = session.get(PlannedOrder, row_id)
+                if row:
+                    row.status = "superseded"
+
+            n_new = len(final_new_orders)
+            n_kept = len(kept_ids)
+            n_superseded = len(superseded_ids)
+            total_active = n_new + n_kept
+
+            run = ProcurementPlanRun(
+                created_at=now,
+                horizon_days=horizon_days,
+                items_planned=total_active,
+                method="projection",
+            )
+            session.add(run)
+            session.flush()
+
+            for order_data in final_new_orders:
+                session.add(PlannedOrder(**order_data, plan_run_id=run.id, created_at=now))
+
+            session.commit()
+        except Exception:  # noqa: BLE001
+            session.rollback()
+            logger.exception("build_procurement_plan: DB write failed")
+            return 0
+        finally:
+            session.close()
+
+        self.broadcast("procurement_plan_updated", {"items_planned": total_active})
+        logger.info(
+            "Procurement plan: %d active (%d new, %d kept, %d superseded), horizon=%.1f d",
+            total_active, n_new, n_kept, n_superseded, horizon_days,
+        )
+        return total_active
+
+    def execute_due_planned_orders(self) -> int:
+        """Convert planned orders whose order_date <= now into real POs.
+
+        Called at the start of each reorder_check sweep.  Returns the count
+        of orders executed.
+        """
+        if self.procurement is None:
+            return 0
+
+        now = float(self.bus.sim_time)
+        session = self.db_session_factory()
+        try:
+            due = (
+                session.query(PlannedOrder)
+                .filter(
+                    PlannedOrder.status.in_(["planned", "at_risk"]),
+                    PlannedOrder.order_date <= now,
+                )
+                .all()
+            )
+            # Snapshot all data we need before closing the session.
+            due_data = [
+                {
+                    "id": po.id,
+                    "ingredient_id": po.ingredient_id,
+                    "supplier_id": po.supplier_id,
+                    "qty": po.qty,
+                    "unit": po.unit,
+                    "unit_price": po.unit_price,
+                }
+                for po in due
+            ]
+        finally:
+            session.close()
+
+        count = 0
+        for po_data in due_data:
+            ing_id = po_data["ingredient_id"]
+            supplier_id = po_data["supplier_id"]
+
+            if supplier_id is None:
+                continue
+
+            # Skip if there is already an in-flight PO for this ingredient.
+            session2 = self.db_session_factory()
+            try:
+                outstanding = (
+                    session2.query(PurchaseOrderLine)
+                    .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
+                    .filter(
+                        PurchaseOrderLine.ingredient_id == ing_id,
+                        PurchaseOrder.status.in_(("proposed", "approved", "placed")),
+                    )
+                    .first()
+                )
+            finally:
+                session2.close()
+
+            if outstanding is not None:
+                continue
+
+            # Fall back to catalog for unit / price if the PlannedOrder row lacks them.
+            unit = po_data["unit"]
+            unit_price = po_data["unit_price"]
+            if unit is None or unit_price is None:
+                session3 = self.db_session_factory()
+                try:
+                    cat = (
+                        session3.query(SupplierCatalog)
+                        .filter(
+                            SupplierCatalog.supplier_id == supplier_id,
+                            SupplierCatalog.ingredient_id == ing_id,
+                        )
+                        .first()
+                    )
+                    if cat is not None:
+                        unit = unit or cat.unit
+                        unit_price = unit_price or float(cat.current_price or 0.0)
+                finally:
+                    session3.close()
+
+            if unit is None:
+                unit = "g"
+            if unit_price is None:
+                unit_price = 0.0
+
+            try:
+                self.procurement.create_po(
+                    supplier_id=supplier_id,
+                    lines=[{
+                        "ingredient_id": ing_id,
+                        "qty": po_data["qty"],
+                        "unit": unit,
+                        "unit_price": float(unit_price),
+                    }],
+                    created_by=self.name,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "execute_due_planned_orders: create_po failed for ingredient %s", ing_id
+                )
+                continue
+
+            # Mark the PlannedOrder row as placed.
+            session4 = self.db_session_factory()
+            try:
+                row = session4.get(PlannedOrder, po_data["id"])
+                if row:
+                    row.status = "placed"
+                    session4.commit()
+            except Exception:  # noqa: BLE001
+                session4.rollback()
+            finally:
+                session4.close()
+
+            count += 1
+
+        return count
 
     def _maybe_reorder(self, ingredient_id: int) -> None:
         if self.procurement is None:

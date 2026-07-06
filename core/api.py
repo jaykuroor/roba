@@ -2648,6 +2648,77 @@ def run_optimizer_llm(
 
 
 # ===========================================================================
+# Track B: Forward Procurement Plan (WS4)
+# ===========================================================================
+
+
+@app.get("/api/track-b/procurement/plan")
+def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Return all active (planned / at_risk) PlannedOrder rows with names."""
+    from .clock import SECONDS_PER_DAY as _SPD
+
+    orders = (
+        db_session.query(models.PlannedOrder)
+        .filter(models.PlannedOrder.status.in_(["planned", "at_risk"]))
+        .order_by(models.PlannedOrder.order_date)
+        .all()
+    )
+
+    latest_run = (
+        db_session.query(models.ProcurementPlanRun)
+        .order_by(models.ProcurementPlanRun.id.desc())
+        .first()
+    )
+
+    def _day_label(sim_s: float) -> str:
+        day = int(sim_s // _SPD)
+        dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day % 7]
+        return f"Day {day} ({dow})"
+
+    result = []
+    for o in orders:
+        ing = db_session.get(models.Ingredient, o.ingredient_id)
+        sup = db_session.get(models.Supplier, o.supplier_id) if o.supplier_id else None
+        order_label = (
+            "Now (at-risk)" if o.status == "at_risk" else _day_label(float(o.order_date or 0.0))
+        )
+        result.append({
+            "id": o.id,
+            "ingredient_id": o.ingredient_id,
+            "ingredient_name": ing.name if ing else str(o.ingredient_id),
+            "supplier_id": o.supplier_id,
+            "supplier_name": sup.name if sup else "Unknown",
+            "qty": o.qty,
+            "unit": o.unit or (ing.base_unit if ing else "g"),
+            "unit_price": o.unit_price,
+            "order_date": o.order_date,
+            "order_date_label": order_label,
+            "delivery_date": o.delivery_date,
+            "delivery_date_label": _day_label(float(o.delivery_date or 0.0)),
+            "covers_from": o.covers_from,
+            "covers_until": o.covers_until,
+            "status": o.status,
+            "reason": o.reason or "",
+        })
+
+    return {
+        "plan_run_id": latest_run.id if latest_run else None,
+        "generated_at": float(latest_run.created_at) if latest_run else 0.0,
+        "items": result,
+    }
+
+
+@app.post("/api/track-b/procurement/plan/run")
+def run_procurement_plan() -> Dict[str, Any]:
+    """Manually trigger a procurement plan rebuild."""
+    optimizer = (ctx.tracks.get("track_b") or {}).get("optimizer")
+    if optimizer is None:
+        raise HTTPException(status_code=503, detail="Optimizer not active")
+    count = optimizer.build_procurement_plan()
+    return {"ok": True, "items_planned": count}
+
+
+# ===========================================================================
 # Scenarios (§20)
 # ===========================================================================
 
