@@ -1257,7 +1257,12 @@ class DemandForecaster(BaseAgent):
         return result_dict
 
     def emit_rolling_horizon(self) -> None:
-        """Compute and emit the 7-day rolling demand horizon signal for procurement."""
+        """Compute and emit the 7-day rolling demand horizon signal for procurement.
+
+        B2: persist=True so the UI can always show the latest horizon results without
+        an explicit user action.  A light retention pass keeps only the newest 50
+        auto-emit rows so the table stays bounded.
+        """
         now = float(self.bus.sim_time)
         try:
             self.forecast_interval(
@@ -1265,12 +1270,35 @@ class DemandForecaster(BaseAgent):
                 now + 7 * SECONDS_PER_DAY,
                 trigger_reason="horizon_emit",
                 granularity="week",
-                persist=False,       # just the signal, no DB row
+                persist=True,        # B2: persist every roll; UI reads latest
                 requested_by="system",
                 source="horizon_emit",
             )
+            self._prune_horizon_emits(keep=50)
         except Exception:  # noqa: BLE001 — non-critical path
             self.log_event("forecast", "emit_rolling_horizon failed", {"error": "see logs"})
+
+    def _prune_horizon_emits(self, keep: int = 50) -> None:
+        """Delete the oldest source='horizon_emit' HorizonForecast rows beyond *keep*."""
+        session = self.db_session_factory()
+        try:
+            rows = (
+                session.query(HorizonForecast)
+                .filter(HorizonForecast.source == "horizon_emit")
+                .order_by(HorizonForecast.generated_at.desc())
+                .all()
+            )
+            for old in rows[keep:]:
+                session.query(HorizonForecastLine).filter(
+                    HorizonForecastLine.horizon_id == old.id
+                ).delete(synchronize_session=False)
+                session.delete(old)
+            if rows[keep:]:
+                session.commit()
+        except Exception:  # noqa: BLE001
+            session.rollback()
+        finally:
+            session.close()
 
     def _emit_horizon_signal(
         self,

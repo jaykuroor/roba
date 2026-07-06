@@ -107,6 +107,20 @@ export interface HorizonForecastItem {
   confidence?: number;
 }
 
+/** One cell (item × daypart × day_index) from a persisted HorizonForecast. */
+export interface HorizonForecastLine {
+  id: number;
+  horizon_id: number;
+  menu_item_id: number;
+  item_name: string;
+  daypart: string;
+  day_index: number;
+  window?: { start: number; end: number };
+  qty: number;
+  baseline: number;
+  confidence?: number | null;
+}
+
 export interface HorizonDay {
   day_index: number;
   start: number;

@@ -15,10 +15,11 @@ from types import SimpleNamespace
 import pytest
 
 from core import config
-from core.clock import SECONDS_PER_DAY
+from core.clock import DAY_OPEN_OFFSET, SECONDS_PER_DAY
 from core.models import (
     Ingredient,
     InventoryLevel,
+    InventoryLot,
     PlannedOrder,
     ProcurementPlanRun,
     PurchaseOrder,
@@ -791,6 +792,138 @@ def test_demand_derivation_from_recipe_and_yield(bus, session_factory):
         assert total_planned >= expected_daily_ing_demand - 1.0, (
             f"Total planned qty {total_planned} should cover at least "
             f"{expected_daily_ing_demand:.1f} g/day (recipe+yield adjusted)"
+        )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 14 (A9): Expiry-aware stock projection — lot expiry triggers early order
+# ---------------------------------------------------------------------------
+
+
+def test_expiry_aware_projection_triggers_early_order(bus, session_factory):
+    """A9: when the on-hand lot expires mid-horizon the planner must detect the
+    resulting gap and schedule an order to arrive before (or at) expiry day,
+    rather than waiting until scalar stock crosses safety_stock.
+
+    Scenario (mirrors live Basil audit finding):
+      on_hand = 500 g in a single lot expiring at day 2
+      demand  = 150 g / day  (7-day horizon)
+      safety  = 50 g,  lead = 1 day,  pack = 100 g
+
+    Scalar model: 500 → 350 → 200 → 50 (d=2, exactly = safety) → shortage at d=3
+      → delivery at d=4  (misses the post-expiry gap)
+    FIFO model  : lot [200 g, exp_day=2] is evicted when d=2 → stock=0 < safety
+      → order placed at d=2, delivery at d=2  (bridges the expiry gap correctly)
+    """
+    SHELF_LIFE = 4          # days
+    LOT_QTY = 500.0         # g — large enough that old scalar model stays silent until d=3
+    LOT_EXPIRY_DAY = 2      # lot expires at start of day 2 (exp_day=2, evicted when d≥2)
+    DAILY_DEMAND = 150.0    # g/day (recipe_qty per dish × 1 dish/day)
+    SAFETY = 50.0
+    LEAD = 1.0              # day
+    PACK = 100.0
+
+    # --- seed -----------------------------------------------------------------
+    session = session_factory()
+    try:
+        station = Station(name="line_a9")
+        session.add(station)
+        session.flush()
+
+        ing = Ingredient(
+            name="perishable_a9", category="produce", base_unit="g",
+            perishable=1, shelf_life_days=float(SHELF_LIFE),
+        )
+        session.add(ing)
+        session.flush()
+        ing_id = ing.id
+
+        session.add(InventoryLevel(
+            ingredient_id=ing_id,
+            par_level=1000.0,
+            reorder_point=100.0,
+            safety_stock=SAFETY,
+            yield_factor=1.0,
+            on_hand_cached=LOT_QTY,
+        ))
+
+        # The single on-hand lot — expires at day 2 (exp_day = LOT_EXPIRY_DAY).
+        session.add(InventoryLot(
+            ingredient_id=ing_id,
+            qty_on_hand=LOT_QTY,
+            unit="g",
+            purchase_price=1.0,
+            purchase_date=0.0,
+            received_date=0.0,
+            expiry_date=float(LOT_EXPIRY_DAY * SECONDS_PER_DAY),
+            supplier_id=None,
+            storage_location=None,
+            status="active",
+        ))
+
+        item = MenuItem(
+            name="A9Dish", category="main", station_id=station.id,
+            dine_in_price=10.0, online_price=11.0,
+            prep_time_min=5.0, is_batchable=0, active=1,
+        )
+        session.add(item)
+        session.flush()
+        recipe = Recipe(menu_item_id=item.id)
+        session.add(recipe)
+        session.flush()
+        # 1 dish/day × DAILY_DEMAND g of ingredient per dish = DAILY_DEMAND g/day demand.
+        session.add(RecipeLine(
+            recipe_id=recipe.id, ingredient_id=ing_id,
+            qty=DAILY_DEMAND, unit="g", optional=0,
+        ))
+
+        sup = Supplier(
+            name="A9Supplier", lead_time_days=LEAD,
+            reliability_score=0.9, min_order_value=0.0, contact="",
+        )
+        session.add(sup)
+        session.flush()
+        session.add(SupplierCatalog(
+            supplier_id=sup.id, ingredient_id=ing_id,
+            current_price=1.0, pack_size=PACK,
+            unit="g", availability="in_stock", updated_at=0.0, is_default=1,
+        ))
+        session.commit()
+        item_id = item.id
+    finally:
+        session.close()
+
+    bus.sim_time = 0.0
+    # Emit 1 dish/day for 7 days; ingredient demand = 1 × DAILY_DEMAND = 150 g/day.
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=1.0, days=7)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    count = opt.build_procurement_plan(horizon_days=7.0)
+
+    assert count >= 1, (
+        f"Expected ≥1 PlannedOrder for expiry-gapped ingredient, got {count}"
+    )
+
+    session = session_factory()
+    try:
+        rows = session.query(PlannedOrder).filter(
+            PlannedOrder.ingredient_id == ing_id,
+            PlannedOrder.status.in_(["planned", "at_risk"]),
+        ).all()
+        assert rows, "No active PlannedOrder rows for the ingredient"
+
+        min_delivery = min(float(r.delivery_date) for r in rows)
+        # Lot expires at start of day 2; FIFO detects shortage there → earliest
+        # delivery at day 2 (= LOT_EXPIRY_DAY * SECONDS_PER_DAY + DAY_OPEN_OFFSET).
+        # Scalar model misses the gap until day 3 → delivery at day 4.
+        expiry_bridge_sim_s = float(LOT_EXPIRY_DAY * SECONDS_PER_DAY + DAY_OPEN_OFFSET)
+        assert min_delivery <= expiry_bridge_sim_s, (
+            f"Expiry-aware FIFO planner must schedule delivery by day {LOT_EXPIRY_DAY} "
+            f"({expiry_bridge_sim_s:.0f} s); earliest delivery is {min_delivery:.0f} s "
+            f"(≈ day {min_delivery / SECONDS_PER_DAY:.1f}). "
+            "Scalar model ran instead of lot-based FIFO."
         )
     finally:
         session.close()

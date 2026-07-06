@@ -367,12 +367,33 @@ class InventoryOptimizer(BaseAgent):
                     else None
                 )
 
+                # A9: Gather dated lots for expiry-aware projection.  Each lot is
+                # stored as [qty, exp_day_offset] where exp_day_offset is days from
+                # now_day until the lot expires (999999 = never expires).
+                lots_raw = (
+                    session.query(InventoryLot.qty_on_hand, InventoryLot.expiry_date)
+                    .filter(
+                        InventoryLot.ingredient_id == ing_id,
+                        InventoryLot.status == "active",
+                        InventoryLot.qty_on_hand > 0,
+                    )
+                    .all()
+                )
+                lot_data: List[List[float]] = []
+                for lot_qty, lot_expiry in lots_raw:
+                    if lot_expiry is not None:
+                        exp_day = int(float(lot_expiry) // SECONDS_PER_DAY) - now_day
+                    else:
+                        exp_day = 999999  # never expires
+                    lot_data.append([float(lot_qty or 0.0), float(exp_day)])
+
                 ingredients_data[ing_id] = {
                     "candidate": candidate,
                     "lead_days": lead_days,
                     "on_hand": on_hand,
                     "safety_stock": safety_stock,
                     "shelf_life": shelf_life,
+                    "lots": lot_data,
                 }
         finally:
             session.close()
@@ -419,6 +440,8 @@ class InventoryOptimizer(BaseAgent):
         # ----------------------------------------------------------------
         new_orders: List[Dict] = []
 
+        _LOT_NEVER_EXPIRES = 999999.0  # sentinel exp_day for non-perishable lots
+
         for ing_id, data in ingredients_data.items():
             candidate = data["candidate"]
             lead_days = data["lead_days"]
@@ -427,7 +450,14 @@ class InventoryOptimizer(BaseAgent):
             shelf_life = data["shelf_life"]
             pack_size = candidate["pack_size"]
 
-            running_stock = on_hand
+            # A9: Seed the projection with the ingredient's real dated lots
+            # (qty, exp_day_offset) so stock that expires mid-horizon isn't
+            # counted as available coverage.  If lots are absent (edge-case),
+            # fall back to on_hand as a non-expiring lump to stay safe.
+            lots_proj: List[List[float]] = (
+                [list(l) for l in data.get("lots", [])]
+                or [[on_hand, _LOT_NEVER_EXPIRES]]
+            )
 
             for d in range(n_days):
                 delivery_sim_s = float((now_day + d) * SECONDS_PER_DAY + DAY_OPEN_OFFSET)
@@ -436,15 +466,35 @@ class InventoryOptimizer(BaseAgent):
                 if d == 0:
                     delivery_sim_s = max(delivery_sim_s, now)
 
-                # A1: Credit inbound deliveries arriving today before checking stock.
-                running_stock += inbound_by_day[ing_id].get(d, 0.0)
+                # A1+A9: Credit inbound deliveries arriving today as a fresh lot
+                # (expiry anchored to the ingredient's shelf life from arrival day).
+                inbound_today = inbound_by_day[ing_id].get(d, 0.0)
+                if inbound_today > 0:
+                    inbound_exp = d + (shelf_life if shelf_life is not None else _LOT_NEVER_EXPIRES)
+                    lots_proj.append([inbound_today, inbound_exp])
+
+                # A9: Expire lots that spoil on or before today (exp_day <= d).
+                lots_proj = [l for l in lots_proj if l[1] > d]
+
+                # Sort soonest-expiry first for FIFO consumption.
+                lots_proj.sort(key=lambda l: l[1])
 
                 # Robust demand floor: max(transient qty, steady-state baseline).
                 day_qty = per_day_demand[ing_id].get(d, 0.0)
                 day_base = per_day_baseline[ing_id].get(d, 0.0)
                 day_demand = max(day_qty, day_base)
 
-                running_stock -= day_demand
+                # Consume demand FIFO from soonest-expiry lot.
+                rem_demand = day_demand
+                for lot in lots_proj:
+                    take = min(lot[0], rem_demand)
+                    lot[0] -= take
+                    rem_demand -= take
+                    if rem_demand <= 0.0:
+                        break
+                lots_proj = [l for l in lots_proj if l[0] > 1e-9]
+
+                running_stock = sum(l[0] for l in lots_proj)
 
                 if running_stock < safety_stock:
                     order_date = delivery_sim_s - lead_days * SECONDS_PER_DAY
@@ -487,7 +537,11 @@ class InventoryOptimizer(BaseAgent):
                         continue
 
                     qty = math.ceil(needed / pack_size) * pack_size
-                    running_stock += qty  # delivery refills the running stock projection
+                    # A9: Add the planned delivery as a fresh lot so subsequent
+                    # days see the replenishment and don't double-plan.
+                    order_exp = d + (shelf_life if shelf_life is not None else _LOT_NEVER_EXPIRES)
+                    lots_proj.append([qty, order_exp])
+                    running_stock += qty
 
                     covers_until = float(
                         (now_day + d + math.ceil(cover_days)) * SECONDS_PER_DAY + DAY_OPEN_OFFSET

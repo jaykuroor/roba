@@ -1517,6 +1517,37 @@ def track_a_list_horizons(limit: int = 20, db_session: Any = Depends(db.get_db))
     return {"horizons": rows, "count": len(rows)}
 
 
+@app.get("/api/track-a/forecast/horizon/{horizon_id}")
+def track_a_get_horizon(horizon_id: int, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Return a HorizonForecast header plus all its line rows (with item names)."""
+    hf = db_session.get(models.HorizonForecast, horizon_id)
+    if hf is None:
+        return {"error": "not_found"}
+    lines = (
+        db_session.query(models.HorizonForecastLine)
+        .filter(models.HorizonForecastLine.horizon_id == horizon_id)
+        .order_by(models.HorizonForecastLine.day_index, models.HorizonForecastLine.daypart)
+        .all()
+    )
+    item_ids = {int(l.menu_item_id) for l in lines if l.menu_item_id}
+    items_map = {
+        int(i.id): i
+        for i in db_session.query(models.MenuItem).filter(models.MenuItem.id.in_(item_ids)).all()
+    } if item_ids else {}
+    return {
+        "horizon": _row_to_dict(hf),
+        "lines": [
+            {
+                **_row_to_dict(ln),
+                "item_name": items_map[int(ln.menu_item_id)].name
+                if ln.menu_item_id and int(ln.menu_item_id) in items_map
+                else str(ln.menu_item_id),
+            }
+            for ln in lines
+        ],
+    }
+
+
 @app.post("/api/track-a/forecast/auto-mode")
 def track_a_forecast_auto_mode(body: TrackAForecastAutoBody) -> Dict[str, Any]:
     forecaster = _track_a_agent("forecaster")
