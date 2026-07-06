@@ -2,8 +2,8 @@
 //
 // Three stacked sections:
 //   Planned   — supplier cards grouped by (order_date, delivery_date) pair
-//   Ordered   — active POs (approved/placed), collapsible per-PO receipt
-//   Delivered — log rows, each with a chevron receipt dropdown
+//   Ordered   — supplier cards (same UI as Planned) grouped by (order→delivery) pair
+//   Delivered — one row per supplier, expandable to per-item lines with delivery date
 //
 // Consumes `manager_change`, `signal_emitted(SUPPLIER_PRICE_UPDATE)`, and
 // `procurement_plan_updated` WS events to refresh.
@@ -18,11 +18,13 @@ import {
   Loader2,
   Package,
   RefreshCw,
+  Truck,
 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 import { useProcurementPlanVersion } from "../store";
 import { wsClient } from "../ws";
 import type { SignalEnvelope } from "../types";
+import { formatQty } from "../utils/units";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -65,6 +67,8 @@ interface PlanItem {
   covers_until: number;
   status: "planned" | "at_risk" | "placed" | "superseded";
   reason: string;
+  delivery_charge: number;
+  delivery_charge_share: number;
 }
 
 interface PlanResponse {
@@ -114,24 +118,42 @@ function groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]> {
   return map;
 }
 
-// ─── SupplierPlanCard ─────────────────────────────────────────────────────────
+// ─── Shared supplier card ─────────────────────────────────────────────────────
 //
-// One card per supplier in the forward plan.  Inside, items are sub-grouped by
-// shared (order_date_label, delivery_date_label) pair so the date arrow appears
-// once per group rather than repeating on every row.
+// Used by both Planned and Ordered sections.  Items are sub-grouped by
+// (order_date_label, delivery_date_label) pair so the date arrow appears once
+// per group.  Delivery charge shown as a footer line when > 0.
 
-function SupplierPlanCard({
+interface SupplierCardItem {
+  id: number;
+  ingredient_name: string;
+  qty: number;
+  unit: string;
+  unit_price: number | null;
+  order_date_label: string;
+  delivery_date_label: string;
+  status_badge?: React.ReactNode;
+  at_risk?: boolean;
+  cost?: number | null;  // pre-computed line_total; falls back to unit_price*qty
+}
+
+function SupplierCard({
   supplierName,
   items,
+  deliveryCharge = 0,
+  defaultOpen = true,
 }: {
   supplierName: string;
-  items: PlanItem[];
+  items: SupplierCardItem[];
+  deliveryCharge?: number;
+  defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(true);
-  const total = items.reduce(
-    (sum, i) => sum + (i.unit_price ?? 0) * i.qty,
+  const [open, setOpen] = useState(defaultOpen);
+  const goodsTotal = items.reduce(
+    (sum, i) => sum + (i.cost != null ? i.cost : (i.unit_price ?? 0) * i.qty),
     0
   );
+  const total = goodsTotal + deliveryCharge;
   const byDatePair = groupBy(
     items,
     (i) => `${i.order_date_label}|${i.delivery_date_label}`
@@ -175,38 +197,55 @@ function SupplierPlanCard({
                   <span>{first.delivery_date_label}</span>
                 </div>
                 {/* Items */}
-                {dateItems.map((item) => (
-                  <div
-                    key={item.id}
-                    className="flex items-center justify-between"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="text-sm text-text truncate">
-                        {item.ingredient_name}
-                      </span>
-                      <span className="text-xs text-text/50 tabular-nums whitespace-nowrap">
-                        {item.qty} {item.unit}
-                      </span>
-                      {item.status === "at_risk" && (
-                        <span
-                          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-warning/20 text-warning whitespace-nowrap"
-                          title="Lead time too short to guarantee delivery before shortage"
-                        >
-                          <AlertTriangle size={10} />
-                          at-risk
+                {dateItems.map((item) => {
+                  const itemCost =
+                    item.cost != null
+                      ? item.cost
+                      : (item.unit_price ?? 0) * item.qty;
+                  return (
+                    <div
+                      key={item.id}
+                      className="flex items-center justify-between"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-sm text-text truncate">
+                          {item.ingredient_name}
                         </span>
-                      )}
-                    </div>
-                    {item.unit_price != null && (
+                        <span className="text-xs text-text/50 tabular-nums whitespace-nowrap">
+                          {formatQty(item.qty, item.unit)}
+                        </span>
+                        {item.status_badge}
+                        {item.at_risk && !item.status_badge && (
+                          <span
+                            className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-warning/20 text-warning whitespace-nowrap"
+                            title="Lead time too short to guarantee delivery before shortage"
+                          >
+                            <AlertTriangle size={10} />
+                            at-risk
+                          </span>
+                        )}
+                      </div>
                       <span className="shrink-0 text-xs text-text/50 tabular-nums ml-3">
-                        €{(item.unit_price * item.qty).toFixed(2)}
+                        €{itemCost.toFixed(2)}
                       </span>
-                    )}
-                  </div>
-                ))}
+                    </div>
+                  );
+                })}
               </div>
             );
           })}
+          {/* Delivery charge footer */}
+          {deliveryCharge > 0 && (
+            <div className="px-3 py-2 flex items-center justify-between">
+              <div className="flex items-center gap-1.5 text-xs text-text/40">
+                <Truck size={11} />
+                <span>Delivery</span>
+              </div>
+              <span className="text-xs text-text/40 tabular-nums">
+                €{deliveryCharge.toFixed(2)}
+              </span>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -250,81 +289,37 @@ function PlanSection({
         <p className="text-sm text-text/30">{emptyMsg ?? "None."}</p>
       ) : (
         <div className="space-y-2">
-          {Array.from(bySupplier.entries()).map(([supplier, supplierItems]) => (
-            <SupplierPlanCard
-              key={supplier}
-              supplierName={supplier}
-              items={supplierItems}
-            />
-          ))}
+          {Array.from(bySupplier.entries()).map(([supplier, supplierItems]) => {
+            const dc = supplierItems[0]?.delivery_charge ?? 0;
+            const cardItems: SupplierCardItem[] = supplierItems.map((i) => ({
+              id: i.id,
+              ingredient_name: i.ingredient_name,
+              qty: i.qty,
+              unit: i.unit,
+              unit_price: i.unit_price,
+              order_date_label: i.order_date_label,
+              delivery_date_label: i.delivery_date_label,
+              at_risk: i.status === "at_risk",
+            }));
+            return (
+              <SupplierCard
+                key={supplier}
+                supplierName={supplier}
+                items={cardItems}
+                deliveryCharge={dc}
+                defaultOpen={true}
+              />
+            );
+          })}
         </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Active PO card (Ordered section) ────────────────────────────────────────
-//
-// Collapsible receipt; collapsed by default since these are already placed.
-
-function ActivePoCard({ po }: { po: PurchaseOrder }) {
-  const [open, setOpen] = useState(false);
-  const orderLabel = dayLabel(po.created_at);
-  const deliveryLabel = dayLabel(po.expected_delivery);
-
-  return (
-    <div className="rounded-xl border border-muted/50 bg-surface/70 overflow-hidden">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center justify-between px-3 py-2.5 hover:bg-muted/20 text-left"
-      >
-        <div className="flex items-center gap-2 min-w-0">
-          <Package size={13} className="text-text/40 shrink-0" />
-          <span className="text-sm font-semibold text-text truncate">
-            {po.supplier_name}
-          </span>
-          {statusBadge(po.status)}
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="text-right">
-            <div className="text-xs text-text/50 tabular-nums">
-              {po.total_cost != null ? `€${po.total_cost.toFixed(2)}` : ""}
-            </div>
-            <div className="text-[10px] text-text/40">
-              {orderLabel} → {deliveryLabel}
-            </div>
-          </div>
-          {open ? (
-            <ChevronUp size={14} className="text-text/40" />
-          ) : (
-            <ChevronDown size={14} className="text-text/40" />
-          )}
-        </div>
-      </button>
-
-      {open && po.lines && po.lines.length > 0 && (
-        <table className="w-full text-xs border-t border-muted/30">
-          <tbody>
-            {po.lines.map((ln) => (
-              <tr key={ln.id} className="border-t border-muted/20 first:border-0">
-                <td className="px-3 py-1 text-text/70">{ln.ingredient_name}</td>
-                <td className="px-3 py-1 text-right tabular-nums text-text/80 font-medium">
-                  {ln.qty_display}
-                </td>
-                <td className="px-3 py-1 text-right text-text/40">
-                  {ln.line_total != null ? `€${ln.line_total.toFixed(2)}` : ""}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
       )}
     </div>
   );
 }
 
 // ─── Ordered section ──────────────────────────────────────────────────────────
+//
+// Groups committed POs by supplier — identical card UI to Planned.
 
 function OrderedSection({
   orders,
@@ -333,33 +328,111 @@ function OrderedSection({
   orders: PurchaseOrder[];
   loading: boolean;
 }) {
+  const bySupplier = groupBy(orders, (po) => po.supplier_name);
+  const totalOrders = orders.length;
+
   return (
     <div className="space-y-2">
       <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-text/40">
-        Ordered ({orders.length})
+        Ordered ({totalOrders})
         {loading && <Loader2 size={11} className="animate-spin" />}
       </h3>
-      {orders.length === 0 && !loading ? (
+      {totalOrders === 0 && !loading ? (
         <p className="text-sm text-text/30">No in-flight orders.</p>
       ) : (
         <div className="space-y-2">
-          {orders.map((po) => (
-            <ActivePoCard key={po.id} po={po} />
-          ))}
+          {Array.from(bySupplier.entries()).map(([supplier, supplierPos]) => {
+            // Flatten all lines from all POs for this supplier into card items.
+            const cardItems: SupplierCardItem[] = supplierPos.flatMap((po) =>
+              (po.lines ?? []).map((ln) => ({
+                id: ln.id,
+                ingredient_name: ln.ingredient_name,
+                qty: ln.qty,
+                unit: ln.unit,
+                unit_price: ln.unit_price,
+                order_date_label: dayLabel(po.created_at),
+                delivery_date_label: dayLabel(po.expected_delivery),
+                status_badge: statusBadge(po.status),
+                cost: ln.line_total,
+              }))
+            );
+            // Delivery charge = total_cost minus goods total (what create_po added)
+            const goodsSum = supplierPos.reduce(
+              (s, po) =>
+                s +
+                (po.lines ?? []).reduce(
+                  (ls, ln) => ls + (ln.line_total ?? 0),
+                  0
+                ),
+              0
+            );
+            const supplierTotal = supplierPos.reduce(
+              (s, po) => s + (po.total_cost ?? 0),
+              0
+            );
+            const impliedDelivery = Math.max(0, supplierTotal - goodsSum);
+            return (
+              <SupplierCard
+                key={supplier}
+                supplierName={supplier}
+                items={cardItems}
+                deliveryCharge={impliedDelivery}
+                defaultOpen={true}
+              />
+            );
+          })}
         </div>
       )}
     </div>
   );
 }
 
-// ─── Delivered history row ────────────────────────────────────────────────────
+// ─── Delivered history section ────────────────────────────────────────────────
 //
-// One compact line per delivered PO; chevron expands the full receipt.
+// One compact row per supplier across all delivered POs on the page.
+// Expanding shows every line item with individual cost and delivery date.
 
-function DeliveredPoRow({ po }: { po: PurchaseOrder }) {
+interface SupplierDeliveredGroup {
+  supplier_name: string;
+  total: number;
+  items: Array<{
+    id: number;
+    ingredient_name: string;
+    qty: number;
+    unit: string;
+    qty_display: string;
+    line_total: number | null;
+    delivery_label: string;
+  }>;
+}
+
+function aggregateBySupplier(orders: PurchaseOrder[]): SupplierDeliveredGroup[] {
+  const map = new Map<string, SupplierDeliveredGroup>();
+  for (const po of orders) {
+    const name = po.supplier_name;
+    if (!map.has(name)) {
+      map.set(name, { supplier_name: name, total: 0, items: [] });
+    }
+    const grp = map.get(name)!;
+    grp.total += po.total_cost ?? 0;
+    const delivLabel = dayLabel(po.expected_delivery);
+    for (const ln of po.lines ?? []) {
+      grp.items.push({
+        id: ln.id,
+        ingredient_name: ln.ingredient_name,
+        qty: ln.qty,
+        unit: ln.unit,
+        qty_display: ln.qty_display,
+        line_total: ln.line_total,
+        delivery_label: delivLabel,
+      });
+    }
+  }
+  return Array.from(map.values());
+}
+
+function SupplierDeliveredRow({ group }: { group: SupplierDeliveredGroup }) {
   const [open, setOpen] = useState(false);
-  const orderLabel = dayLabel(po.created_at);
-  const deliveryLabel = dayLabel(po.expected_delivery);
 
   return (
     <div className="rounded-lg border border-muted/40 bg-surface/50 overflow-hidden">
@@ -369,16 +442,14 @@ function DeliveredPoRow({ po }: { po: PurchaseOrder }) {
         className="flex w-full items-center justify-between px-3 py-1.5 hover:bg-muted/20 text-left"
       >
         <div className="flex items-center gap-2 min-w-0">
+          <Package size={12} className="text-text/30 shrink-0" />
           <span className="text-xs font-medium text-text truncate">
-            {po.supplier_name}
-          </span>
-          <span className="text-[10px] text-text/40 whitespace-nowrap">
-            {orderLabel} → {deliveryLabel}
+            {group.supplier_name}
           </span>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <span className="text-xs text-text/50 tabular-nums">
-            {po.total_cost != null ? `€${po.total_cost.toFixed(2)}` : ""}
+            €{group.total.toFixed(2)}
           </span>
           {open ? (
             <ChevronUp size={12} className="text-text/30" />
@@ -388,17 +459,23 @@ function DeliveredPoRow({ po }: { po: PurchaseOrder }) {
         </div>
       </button>
 
-      {open && po.lines && po.lines.length > 0 && (
+      {open && group.items.length > 0 && (
         <table className="w-full text-xs border-t border-muted/30">
           <tbody>
-            {po.lines.map((ln) => (
-              <tr key={ln.id} className="border-t border-muted/20 first:border-0">
-                <td className="px-3 py-1 text-text/70">{ln.ingredient_name}</td>
-                <td className="px-3 py-1 text-right tabular-nums text-text/60">
-                  {ln.qty_display}
+            {group.items.map((item, idx) => (
+              <tr
+                key={`${item.id}-${idx}`}
+                className="border-t border-muted/20 first:border-0"
+              >
+                <td className="px-3 py-1 text-text/70">{item.ingredient_name}</td>
+                <td className="px-3 py-1 text-right tabular-nums text-text/60 whitespace-nowrap">
+                  {formatQty(item.qty, item.unit)}
                 </td>
-                <td className="px-3 py-1 text-right text-text/40">
-                  {ln.line_total != null ? `€${ln.line_total.toFixed(2)}` : ""}
+                <td className="px-3 py-1 text-right text-text/40 whitespace-nowrap">
+                  {item.line_total != null ? `€${item.line_total.toFixed(2)}` : ""}
+                </td>
+                <td className="px-3 py-1 text-right text-text/30 whitespace-nowrap text-[10px]">
+                  {item.delivery_label}
                 </td>
               </tr>
             ))}
@@ -408,8 +485,6 @@ function DeliveredPoRow({ po }: { po: PurchaseOrder }) {
     </div>
   );
 }
-
-// ─── Delivered section ────────────────────────────────────────────────────────
 
 function DeliveredSection({
   orders,
@@ -426,18 +501,20 @@ function DeliveredSection({
   onPrev: () => void;
   onNext: () => void;
 }) {
+  const groups = aggregateBySupplier(orders);
+
   return (
     <div className="space-y-2">
       <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-text/40">
         Delivered history
         {loading && <Loader2 size={11} className="animate-spin" />}
       </h3>
-      {orders.length === 0 && !loading ? (
+      {groups.length === 0 && !loading ? (
         <p className="text-sm text-text/30">No delivery history yet.</p>
       ) : (
         <div className="space-y-1">
-          {orders.map((po) => (
-            <DeliveredPoRow key={po.id} po={po} />
+          {groups.map((grp) => (
+            <SupplierDeliveredRow key={grp.supplier_name} group={grp} />
           ))}
         </div>
       )}
@@ -513,7 +590,6 @@ export function ProcurementPanel() {
     }
   }, []);
 
-  // Re-fetch plan when procurementPlanVersion bumps (WS event) or on mount.
   useEffect(() => {
     void fetchPlan();
   }, [fetchPlan, procurementPlanVersion]);
@@ -576,10 +652,10 @@ export function ProcurementPanel() {
         replanning={replanning}
       />
 
-      {/* Ordered (approved/placed) */}
+      {/* Ordered (approved/placed) — same supplier card UI as Planned */}
       <OrderedSection orders={ordered} loading={loading} />
 
-      {/* Delivered — compact log with receipt dropdowns */}
+      {/* Delivered — compact supplier rows with per-item receipt dropdowns */}
       <DeliveredSection
         orders={delivered}
         loading={loading}

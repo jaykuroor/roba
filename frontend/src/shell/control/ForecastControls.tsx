@@ -1,9 +1,15 @@
 import { useState, useEffect } from "react";
-import { RefreshCw, Zap, TrendingUp } from "lucide-react";
+import { RefreshCw, Zap, TrendingUp, Clock, ChevronRight } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../../api";
 import { SectionHeading } from "./shared";
 import { ForecastCard } from "../../voice/ForecastCard";
-import type { IntervalForecastResult, HorizonForecast } from "../../track_a/types";
+import type {
+  IntervalForecastResult,
+  HorizonForecast,
+  HorizonForecastLine,
+  HorizonForecastItem,
+  HorizonDay,
+} from "../../track_a/types";
 
 function ActionButton({
   label, description, icon, onClick, busy,
@@ -34,24 +40,154 @@ function ActionButton({
 
 type RangePreset = "week" | "day" | "daypart" | "custom";
 
-function HorizonHistoryRow({ row }: { row: HorizonForecast }) {
+// ─── horizon detail adapter ───────────────────────────────────────────────────
+// Converts a HorizonForecast header + HorizonForecastLines → IntervalForecastResult
+// so ForecastCard can render both complex (daypart) and simple (multi-day) forecasts.
+
+function horizonDetailToResult(
+  horizon: HorizonForecast,
+  lines: HorizonForecastLine[]
+): IntervalForecastResult {
+  // Per-item totals
+  const itemTotals = new Map<number, { name: string; qty: number; baseline: number; confidence: number; count: number }>();
+  for (const ln of lines) {
+    const prev = itemTotals.get(ln.menu_item_id) ?? { name: ln.item_name, qty: 0, baseline: 0, confidence: 0, count: 0 };
+    itemTotals.set(ln.menu_item_id, {
+      name: ln.item_name,
+      qty: prev.qty + ln.qty,
+      baseline: prev.baseline + ln.baseline,
+      confidence: prev.confidence + (ln.confidence ?? 0.8),
+      count: prev.count + 1,
+    });
+  }
+  const items: HorizonForecastItem[] = Array.from(itemTotals.entries()).map(([id, v]) => ({
+    menu_item_id: id,
+    name: v.name,
+    qty: Math.round(v.qty),
+    baseline: Math.round(v.baseline),
+    confidence: v.count > 0 ? v.confidence / v.count : undefined,
+  }));
+
+  // Per-day totals for by_day
+  const dayMap = new Map<number, { qty: number; baseline: number; start: number; end: number; itemMap: Map<number, HorizonForecastItem> }>();
+  for (const ln of lines) {
+    const prev = dayMap.get(ln.day_index) ?? {
+      qty: 0, baseline: 0,
+      start: ln.window?.start ?? 0,
+      end: ln.window?.end ?? 0,
+      itemMap: new Map(),
+    };
+    prev.qty += ln.qty;
+    prev.baseline += ln.baseline;
+    if (ln.window) {
+      prev.start = Math.min(prev.start, ln.window.start);
+      prev.end = Math.max(prev.end, ln.window.end);
+    }
+    const prevItem = prev.itemMap.get(ln.menu_item_id);
+    prev.itemMap.set(ln.menu_item_id, {
+      menu_item_id: ln.menu_item_id,
+      name: ln.item_name,
+      qty: (prevItem?.qty ?? 0) + ln.qty,
+      baseline: (prevItem?.baseline ?? 0) + ln.baseline,
+    });
+    dayMap.set(ln.day_index, prev);
+  }
+  const by_day: HorizonDay[] = Array.from(dayMap.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([dayIdx, v]) => ({
+      day_index: dayIdx,
+      start: v.start,
+      end: v.end,
+      qty: Math.round(v.qty),
+      baseline: Math.round(v.baseline),
+      items: Array.from(v.itemMap.values()).map((i) => ({
+        ...i,
+        qty: Math.round(i.qty),
+        baseline: Math.round(i.baseline),
+      })),
+    }));
+
+  // Per-daypart for by_daypart
+  const dpMap = new Map<string, { qty: number; baseline: number }>();
+  for (const ln of lines) {
+    const prev = dpMap.get(ln.daypart) ?? { qty: 0, baseline: 0 };
+    dpMap.set(ln.daypart, { qty: prev.qty + ln.qty, baseline: prev.baseline + ln.baseline });
+  }
+  const by_daypart: Record<string, { qty: number; baseline: number }> = {};
+  for (const [dp, v] of dpMap.entries()) {
+    by_daypart[dp] = { qty: Math.round(v.qty), baseline: Math.round(v.baseline) };
+  }
+
+  return {
+    status: "ok",
+    horizon_id: horizon.id,
+    granularity: horizon.granularity,
+    start: horizon.start,
+    end: horizon.end,
+    total_qty: Math.round(horizon.total_qty ?? 0),
+    items,
+    by_day,
+    by_daypart,
+    generated_at: horizon.generated_at,
+    trigger_reason: horizon.trigger_reason,
+  };
+}
+
+// ─── Clickable history row ────────────────────────────────────────────────────
+
+function HorizonHistoryRow({
+  row,
+  onSelect,
+  selected,
+}: {
+  row: HorizonForecast;
+  onSelect: (h: HorizonForecast) => void;
+  selected: boolean;
+}) {
   const label = row.label ?? row.granularity ?? "forecast";
   const total = row.total_qty ?? 0;
+  const dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const startDay = Math.floor(row.start / 86400);
+
   return (
-    <div className="flex items-center justify-between text-xs py-1 border-b border-muted/30 last:border-0">
-      <span className="text-text/60 truncate flex-1">{label}</span>
-      <span className="text-text font-medium tabular-nums ml-2">{Math.round(total).toLocaleString()} portions</span>
-    </div>
+    <button
+      type="button"
+      onClick={() => onSelect(row)}
+      className={
+        "w-full flex items-center justify-between text-xs py-1.5 px-2 rounded-md border-b border-muted/30 last:border-0 text-left transition-colors " +
+        (selected
+          ? "bg-accent/10 text-accent"
+          : "hover:bg-muted/30 text-text/60")
+      }
+    >
+      <div className="flex items-center gap-2 min-w-0">
+        <Clock size={10} className="shrink-0 text-text/30" />
+        <span className="truncate flex-1">{label}</span>
+        <span className="text-text/30 text-[10px] whitespace-nowrap">
+          Day {startDay} ({dow[startDay % 7]})
+        </span>
+      </div>
+      <div className="flex items-center gap-1.5 shrink-0 ml-2">
+        <span className="font-medium tabular-nums">{Math.round(total).toLocaleString()}</span>
+        <ChevronRight size={10} className="text-text/30" />
+      </div>
+    </button>
   );
 }
+
+// ─── IntervalForecastPanel ────────────────────────────────────────────────────
 
 export function IntervalForecastPanel() {
   const [range, setRange] = useState<RangePreset>("week");
   const [dayOffset, setDayOffset] = useState(0);
   const [daypart, setDaypart] = useState("dinner");
+  const [startTime, setStartTime] = useState("11:00");
+  const [endTime, setEndTime] = useState("15:00");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<IntervalForecastResult | null>(null);
   const [horizons, setHorizons] = useState<HorizonForecast[]>([]);
+  const [selectedHorizonId, setSelectedHorizonId] = useState<number | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
 
   // Fetch saved horizon headers on mount
   useEffect(() => {
@@ -62,9 +198,14 @@ export function IntervalForecastPanel() {
 
   async function generate() {
     setBusy(true);
+    setSelectedHorizonId(null);
     try {
       const body: Record<string, unknown> = { range, day_offset: dayOffset };
       if (range === "daypart") body.daypart = daypart;
+      if (range === "custom") {
+        body.start_time = startTime;
+        body.end_time = endTime;
+      }
       const data = await apiPost("/api/track-a/forecast/horizon", body);
       const r = data as IntervalForecastResult;
       setResult(r);
@@ -76,6 +217,29 @@ export function IntervalForecastPanel() {
       console.error(e);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleSelectHorizon(h: HorizonForecast) {
+    if (!h.id) return;
+    if (selectedHorizonId === h.id) {
+      // Toggle off
+      setSelectedHorizonId(null);
+      setResult(null);
+      return;
+    }
+    setSelectedHorizonId(h.id);
+    setLoadingDetail(true);
+    try {
+      const res = await apiGet<{ horizon: HorizonForecast; lines: HorizonForecastLine[] }>(
+        `/api/track-a/forecast/horizon/${h.id}`
+      );
+      const adapted = horizonDetailToResult(res.horizon ?? h, res.lines ?? []);
+      setResult(adapted);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoadingDetail(false);
     }
   }
 
@@ -107,34 +271,65 @@ export function IntervalForecastPanel() {
 
       {/* Contextual inputs */}
       {range !== "week" && (
-        <div className="flex items-center gap-3">
-          <div className="flex-1">
-            <label className="text-xs text-text/40 block mb-1">Day offset</label>
-            <select
-              value={dayOffset}
-              onChange={(e) => setDayOffset(Number(e.target.value))}
-              className="w-full rounded-md bg-muted/50 border border-muted px-2 py-1.5 text-sm text-text focus:outline-none focus:ring-1 focus:ring-accent"
-            >
-              <option value={0}>Today</option>
-              <option value={1}>Tomorrow</option>
-              <option value={2}>Day +2</option>
-              <option value={3}>Day +3</option>
-              <option value={6}>Day +6</option>
-            </select>
-          </div>
-          {range === "daypart" && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-3">
             <div className="flex-1">
-              <label className="text-xs text-text/40 block mb-1">Daypart</label>
+              <label className="text-xs text-text/40 block mb-1">Day offset</label>
               <select
-                value={daypart}
-                onChange={(e) => setDaypart(e.target.value)}
+                value={dayOffset}
+                onChange={(e) => setDayOffset(Number(e.target.value))}
                 className="w-full rounded-md bg-muted/50 border border-muted px-2 py-1.5 text-sm text-text focus:outline-none focus:ring-1 focus:ring-accent"
               >
-                {["breakfast", "lunch", "afternoon", "dinner", "late"].map((dp) => (
-                  <option key={dp} value={dp}>{dp.charAt(0).toUpperCase() + dp.slice(1)}</option>
-                ))}
+                <option value={0}>Today</option>
+                <option value={1}>Tomorrow</option>
+                <option value={2}>Day +2</option>
+                <option value={3}>Day +3</option>
+                <option value={6}>Day +6</option>
               </select>
             </div>
+            {range === "daypart" && (
+              <div className="flex-1">
+                <label className="text-xs text-text/40 block mb-1">Daypart</label>
+                <select
+                  value={daypart}
+                  onChange={(e) => setDaypart(e.target.value)}
+                  className="w-full rounded-md bg-muted/50 border border-muted px-2 py-1.5 text-sm text-text focus:outline-none focus:ring-1 focus:ring-accent"
+                >
+                  {["breakfast", "lunch", "afternoon", "dinner", "late"].map((dp) => (
+                    <option key={dp} value={dp}>{dp.charAt(0).toUpperCase() + dp.slice(1)}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+
+          {/* Custom: start + end time pickers */}
+          {range === "custom" && (
+            <>
+              <div className="flex items-center gap-3">
+                <div className="flex-1">
+                  <label className="text-xs text-text/40 block mb-1">Start time</label>
+                  <input
+                    type="time"
+                    value={startTime}
+                    onChange={(e) => setStartTime(e.target.value)}
+                    className="w-full rounded-md bg-muted/50 border border-muted px-2 py-1.5 text-sm text-text focus:outline-none focus:ring-1 focus:ring-accent"
+                  />
+                </div>
+                <div className="flex-1">
+                  <label className="text-xs text-text/40 block mb-1">End time</label>
+                  <input
+                    type="time"
+                    value={endTime}
+                    onChange={(e) => setEndTime(e.target.value)}
+                    className="w-full rounded-md bg-muted/50 border border-muted px-2 py-1.5 text-sm text-text focus:outline-none focus:ring-1 focus:ring-accent"
+                  />
+                </div>
+              </div>
+              <p className="text-[10px] text-text/30">
+                Outside operating hours (08:00–23:00) will show "no demand expected."
+              </p>
+            </>
           )}
         </div>
       )}
@@ -150,17 +345,34 @@ export function IntervalForecastPanel() {
       </button>
 
       {/* Result card */}
-      {result && (
-        <ForecastCard forecast={result} onDismiss={() => setResult(null)} />
+      {(result || loadingDetail) && (
+        <>
+          {loadingDetail && (
+            <div className="text-xs text-text/40 text-center py-2">Loading forecast detail…</div>
+          )}
+          {result && !loadingDetail && (
+            <ForecastCard
+              forecast={result}
+              onDismiss={() => { setResult(null); setSelectedHorizonId(null); }}
+            />
+          )}
+        </>
       )}
 
-      {/* Saved history */}
+      {/* Saved history — click to view full detail */}
       {horizons.length > 0 && (
         <div className="space-y-1">
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-text/30">Recent forecasts</p>
-          <div className="rounded-lg border border-muted bg-surface/50 p-3">
-            {horizons.slice(0, 6).map((h, i) => (
-              <HorizonHistoryRow key={h.id ?? i} row={h} />
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-text/30">
+            Recent forecasts — click to view
+          </p>
+          <div className="rounded-lg border border-muted bg-surface/50 px-2 py-1">
+            {horizons.slice(0, 8).map((h, i) => (
+              <HorizonHistoryRow
+                key={h.id ?? i}
+                row={h}
+                onSelect={handleSelectHorizon}
+                selected={selectedHorizonId === h.id}
+              />
             ))}
           </div>
         </div>

@@ -83,6 +83,7 @@ class Procurement:
         lines: List[Dict[str, Any]],
         created_by: str = "optimizer",
         planned_delivery: Optional[float] = None,
+        delivery_charge: float = 0.0,
     ) -> PurchaseOrder:
         """Create a PO (+ lines); auto-place or route to approval (§18.8).
 
@@ -90,9 +91,13 @@ class Procurement:
         ``expected_delivery`` (clamped to ≥ now) instead of recomputing from
         ``now + lead_days``.  Prevents the plan's promised delivery date from
         drifting when the order is actually executed (A4).
+
+        ``delivery_charge`` — fixed delivery fee for this supplier order; added
+        to ``total_cost`` so PO totals reflect true landed cost.
         """
         now = self.sim_time
-        total = sum(float(l["qty"]) * float(l["unit_price"] or 0.0) for l in lines)
+        goods_total = sum(float(l["qty"]) * float(l["unit_price"] or 0.0) for l in lines)
+        total = goods_total + float(delivery_charge or 0.0)
 
         session = self.db_session_factory()
         try:
