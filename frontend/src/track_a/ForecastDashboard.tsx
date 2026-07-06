@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, useEffect, useCallback, type ReactNode } from "react";
 import { IntervalForecastPanel } from "../shell/control/ForecastControls";
 import {
   Bar,
@@ -23,7 +23,7 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
-import { apiDelete, apiPost } from "../api";
+import { apiDelete, apiGet, apiPost } from "../api";
 import {
   formatBaseline,
   formatQty,
@@ -31,7 +31,7 @@ import {
   itemName,
   latestForecasts,
 } from "./helpers";
-import type { EventLog, Forecast, ForecastAdjustment, ForecastJob, ForecastTrace, TrackASnapshot } from "./types";
+import type { EventLog, Forecast, ForecastAdjustment, ForecastJob, ForecastTrace, HorizonForecast, HorizonForecastLine, TrackASnapshot } from "./types";
 import { EmptyState, Pill, TrackAShell } from "./ui";
 import { useTrackAData } from "./useTrackAData";
 
@@ -67,11 +67,146 @@ type LedgerAdjustment = Pick<
   id?: number;
 };
 
+// ─── Interval tab type ───────────────────────────────────────────────────────
+
+type ForecastTab = "daypart" | "today" | "week" | "custom";
+
+const TAB_LABELS: Record<ForecastTab, string> = {
+  daypart: "Daypart",
+  today: "Today",
+  week: "This Week",
+  custom: "Custom",
+};
+
+// ─── HorizonLinesView — Today / This Week content ─────────────────────────────
+//
+// Fetches HorizonForecastLine rows for the latest horizon and renders a
+// per-day demand breakdown table.
+
+function HorizonLinesView({ tab, horizon }: { tab: "today" | "week"; horizon: HorizonForecast | undefined }) {
+  const [lines, setLines] = useState<HorizonForecastLine[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const fetchLines = useCallback(async (id: number) => {
+    setLoading(true);
+    try {
+      const res = await apiGet<{ lines: HorizonForecastLine[] }>(
+        `/api/track-a/forecast/horizon/${id}`
+      );
+      setLines(res.lines ?? []);
+    } catch {
+      /* ignore */
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (horizon?.id != null) void fetchLines(horizon.id);
+    else setLines([]);
+  }, [horizon?.id, fetchLines]);
+
+  if (!horizon) {
+    return (
+      <p className="text-sm text-text/40 py-4">
+        No horizon forecast available yet. The system will generate one automatically or use the Custom tab to generate one now.
+      </p>
+    );
+  }
+
+  // Filter by day_index: today = day 0, week = days 0-6
+  const maxDay = tab === "today" ? 0 : 6;
+  const filtered = lines.filter((l) => l.day_index <= maxDay);
+
+  // Group by day_index
+  const byDay = new Map<number, HorizonForecastLine[]>();
+  for (const line of filtered) {
+    if (!byDay.has(line.day_index)) byDay.set(line.day_index, []);
+    byDay.get(line.day_index)!.push(line);
+  }
+
+  // Aggregate per-day per-item (sum across dayparts)
+  const byDayItem = new Map<string, { qty: number; baseline: number; confidence: number; count: number }>();
+  for (const line of filtered) {
+    const key = `${line.day_index}|${line.menu_item_id}`;
+    const prev = byDayItem.get(key) ?? { qty: 0, baseline: 0, confidence: 0, count: 0 };
+    byDayItem.set(key, {
+      qty: prev.qty + line.qty,
+      baseline: prev.baseline + line.baseline,
+      confidence: prev.confidence + (line.confidence ?? 0.8),
+      count: prev.count + 1,
+    });
+  }
+
+  // Unique (day_index, menu_item_id) pairs — stable order
+  const rows: Array<{ dayIndex: number; itemId: number; itemName: string; qty: number; baseline: number; confidence: number }> = [];
+  const seen = new Set<string>();
+  for (const line of filtered) {
+    const key = `${line.day_index}|${line.menu_item_id}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      const agg = byDayItem.get(key)!;
+      rows.push({
+        dayIndex: line.day_index,
+        itemId: line.menu_item_id,
+        itemName: line.item_name,
+        qty: Math.round(agg.qty),
+        baseline: Math.round(agg.baseline),
+        confidence: Math.round((agg.confidence / agg.count) * 100),
+      });
+    }
+  }
+
+  const dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+  return (
+    <div className="space-y-4">
+      <p className="text-xs text-text/40">
+        Latest horizon: {horizon.label ?? horizon.granularity} — total {Math.round(horizon.total_qty ?? 0).toLocaleString()} portions
+        {loading && " · loading…"}
+      </p>
+      {rows.length === 0 && !loading ? (
+        <p className="text-sm text-text/40">No lines for this range yet.</p>
+      ) : (
+        <div className="overflow-hidden rounded-md border border-muted">
+          <table className="w-full text-sm border-collapse">
+            <thead className="bg-primary/70 text-xs uppercase tracking-wide text-text/50">
+              <tr>
+                <th className="px-3 py-2">Day</th>
+                <th className="px-3 py-2">Item</th>
+                <th className="px-3 py-2 text-right">Forecast</th>
+                <th className="px-3 py-2 text-right">Baseline</th>
+                <th className="px-3 py-2 text-right">Confidence</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={`${row.dayIndex}-${row.itemId}`} className="border-t border-muted/60 hover:bg-primary/20">
+                  <td className="px-3 py-2 text-text/50 whitespace-nowrap">
+                    {row.dayIndex === 0 ? "Today" : `Day +${row.dayIndex} (${dow[(row.dayIndex) % 7]})`}
+                  </td>
+                  <td className="px-3 py-2 font-medium">{row.itemName}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-accent font-semibold">{row.qty}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-text/60">{row.baseline}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-text/50">{row.confidence}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── ForecastDashboard ───────────────────────────────────────────────────────
+
 export function ForecastDashboard() {
   const { data, loading, error, refresh } = useTrackAData();
   const [busyAction, setBusyAction] = useState<"run" | "finalize" | null>(null);
   const [deletingConstraintId, setDeletingConstraintId] = useState<string | null>(null);
   const [selectedItemId, setSelectedItemId] = useState<number | null>(null);
+  const [forecastTab, setForecastTab] = useState<ForecastTab>("daypart");
 
   async function runForecast() {
     setBusyAction("run");
@@ -177,136 +312,171 @@ export function ForecastDashboard() {
         </div>
       }
     >
-      {forecasts.length === 0 ? (
-        <EmptyState label="No forecasts yet. Start the sim or run a manual forecast." />
-      ) : (
-        <div className="space-y-4">
-          <div className="grid gap-3 md:grid-cols-4">
-            <Metric label="Production plates" value={formatQty(totalForecast)} icon={<Gauge size={17} />} />
-            <Metric label="Latent demand" value={formatQty(latentTotal)} icon={<GitBranch size={17} />} />
-            <Metric label="Constrained items" value={formatQty(constrained)} icon={<Eye size={17} />} />
-            <Metric label="Active constraints" value={formatQty(constraints.length)} icon={<ShieldCheck size={17} />} />
-          </div>
+      {/* ─── Interval selector ─────────────────────────────────────────────── */}
+      <div className="flex gap-1 rounded-lg bg-muted/30 p-1 w-fit mb-4">
+        {(["daypart", "today", "week", "custom"] as ForecastTab[]).map((t) => (
+          <button
+            key={t}
+            type="button"
+            onClick={() => setForecastTab(t)}
+            className={
+              "rounded-md px-3 py-1.5 text-xs font-medium transition-colors " +
+              (forecastTab === t
+                ? "bg-accent text-white"
+                : "bg-transparent text-text/60 hover:bg-muted/50")
+            }
+          >
+            {TAB_LABELS[t]}
+          </button>
+        ))}
+      </div>
 
-          <ActiveConstraintsStrip
-            constraints={constraints}
-            deletingId={deletingConstraintId}
-            onDelete={deleteConstraint}
-          />
+      {/* ─── Daypart view — full Pipeline-A content ───────────────────────── */}
+      {forecastTab === "daypart" && (
+        <>
+          {forecasts.length === 0 ? (
+            <EmptyState label="No forecasts yet. Start the sim or run a manual forecast." />
+          ) : (
+            <div className="space-y-4">
+              <div className="grid gap-3 md:grid-cols-4">
+                <Metric label="Production plates" value={formatQty(totalForecast)} icon={<Gauge size={17} />} />
+                <Metric label="Latent demand" value={formatQty(latentTotal)} icon={<GitBranch size={17} />} />
+                <Metric label="Constrained items" value={formatQty(constrained)} icon={<Eye size={17} />} />
+                <Metric label="Active constraints" value={formatQty(constraints.length)} icon={<ShieldCheck size={17} />} />
+              </div>
 
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-start">
-            <div className="h-[348px] rounded-md border border-[#16426e] bg-[#101d39] p-3">
-              <ResponsiveContainer width="100%" height={320}>
-                <BarChart data={chartData}>
-                  <CartesianGrid stroke="#173760" vertical={false} />
-                  <XAxis dataKey="name" stroke="#dce6f7" tick={{ fontSize: 11 }} />
-                  <YAxis
-                    allowDecimals={false}
-                    stroke="#dce6f7"
-                    tick={{ fontSize: 11 }}
-                  />
-                  <Tooltip
-                    cursor={{ fill: "rgba(124,92,255,0.12)" }}
-                    contentStyle={{
-                      background: "#10182f",
-                      border: "1px solid #244b7c",
-                      borderRadius: 6,
-                      color: "#f4f7fb",
-                    }}
-                  />
-                  <Legend />
-                  <Bar dataKey="baseline" fill="#1f6f9f" radius={[4, 4, 0, 0]} />
-                  <Bar dataKey="latent" fill="#f4c95d" radius={[4, 4, 0, 0]} />
-                  <Bar dataKey="forecast" fill="#ef476f" radius={[4, 4, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
+              <ActiveConstraintsStrip
+                constraints={constraints}
+                deletingId={deletingConstraintId}
+                onDelete={deleteConstraint}
+              />
+
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-start">
+                <div className="h-[348px] rounded-md border border-[#16426e] bg-[#101d39] p-3">
+                  <ResponsiveContainer width="100%" height={320}>
+                    <BarChart data={chartData}>
+                      <CartesianGrid stroke="#173760" vertical={false} />
+                      <XAxis dataKey="name" stroke="#dce6f7" tick={{ fontSize: 11 }} />
+                      <YAxis
+                        allowDecimals={false}
+                        stroke="#dce6f7"
+                        tick={{ fontSize: 11 }}
+                      />
+                      <Tooltip
+                        cursor={{ fill: "rgba(124,92,255,0.12)" }}
+                        contentStyle={{
+                          background: "#10182f",
+                          border: "1px solid #244b7c",
+                          borderRadius: 6,
+                          color: "#f4f7fb",
+                        }}
+                      />
+                      <Legend />
+                      <Bar dataKey="baseline" fill="#1f6f9f" radius={[4, 4, 0, 0]} />
+                      <Bar dataKey="latent" fill="#f4c95d" radius={[4, 4, 0, 0]} />
+                      <Bar dataKey="forecast" fill="#ef476f" radius={[4, 4, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <SelectedForecastPanel
+                  data={data}
+                  forecast={selectedForecast}
+                  reason={selectedReason}
+                  trace={selectedTrace}
+                />
+              </div>
             </div>
+          )}
 
-            <SelectedForecastPanel
-              data={data}
-              forecast={selectedForecast}
-              reason={selectedReason}
-              trace={selectedTrace}
-            />
+          <div className="mt-4 overflow-hidden rounded-md border border-muted">
+            <table className="w-full min-w-[980px] border-collapse text-left text-sm">
+              <thead className="bg-primary/70 text-xs uppercase tracking-wide text-text/50">
+                <tr>
+                  <th className="px-3 py-2">Item</th>
+                  <th className="px-3 py-2">Window</th>
+                  <th className="px-3 py-2">Generated</th>
+                  <th className="px-3 py-2">Baseline</th>
+                  <th className="px-3 py-2">Forecast</th>
+                  <th className="px-3 py-2">Multipliers</th>
+                  <th className="px-3 py-2">Sources</th>
+                  <th className="px-3 py-2">Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {forecasts.map((forecast) => {
+                  const reason = reasoningByForecast.get(forecast.id);
+                  const selected = selectedForecast?.menu_item_id === forecast.menu_item_id;
+                  return (
+                    <tr
+                      key={forecast.id}
+                      className={`cursor-pointer border-t border-muted/70 align-top hover:bg-primary/35 ${
+                        selected ? "bg-accent/10" : ""
+                      }`}
+                      onClick={() => setSelectedItemId(forecast.menu_item_id)}
+                    >
+                      <td className="px-3 py-3 font-medium">{itemName(data, forecast.menu_item_id)}</td>
+                      <td className="px-3 py-3 text-text/65">
+                        {forecast.daypart} - {formatSimTime(forecast.window.start)}
+                      </td>
+                      <td className="px-3 py-3 text-text/65">{formatSimTime(forecast.generated_at)}</td>
+                      <td className="px-3 py-3">{formatBaseline(forecast.baseline_qty)}</td>
+                      <td className="px-3 py-3 text-lg font-semibold text-accent">{formatQty(forecast.forecast_qty)}</td>
+                      <td className="px-3 py-3">
+                        <div className="flex max-w-xl flex-wrap gap-1.5">
+                          {Object.entries(forecast.multipliers ?? {}).map(([key, value]) => (
+                            <Pill key={key} tone={value > 1 ? "good" : value < 1 ? "warn" : "neutral"}>
+                              {key.replace("_", " ")} x{Number(value).toFixed(2)}
+                            </Pill>
+                          ))}
+                          <Pill tone="accent">
+                            <Sparkles size={12} className="mr-1" />
+                            {Math.round(forecast.confidence * 100)}%
+                          </Pill>
+                        </div>
+                      </td>
+                      <td className="px-3 py-3">
+                        <SourceBadges sources={sourceBadgesForForecast(data, forecast, reason)} />
+                      </td>
+                      <td className="max-w-md px-3 py-3 text-xs leading-5 text-text/65">
+                        {reasonSummary(reason, forecast)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
-        </div>
+
+          <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+            <AdjustmentLedgerPanel adjustments={selectedAdjustments} />
+            <AgentActivityPanel data={data} />
+          </div>
+
+          <DishDrillDownControls
+            data={data}
+            forecasts={forecasts}
+            reasoningByForecast={reasoningByForecast}
+            selectedItemId={selectedForecast?.menu_item_id ?? null}
+            onSelect={setSelectedItemId}
+          />
+        </>
       )}
 
-      <div className="mt-4 overflow-hidden rounded-md border border-muted">
-        <table className="w-full min-w-[980px] border-collapse text-left text-sm">
-          <thead className="bg-primary/70 text-xs uppercase tracking-wide text-text/50">
-            <tr>
-              <th className="px-3 py-2">Item</th>
-              <th className="px-3 py-2">Window</th>
-              <th className="px-3 py-2">Generated</th>
-              <th className="px-3 py-2">Baseline</th>
-              <th className="px-3 py-2">Forecast</th>
-              <th className="px-3 py-2">Multipliers</th>
-              <th className="px-3 py-2">Sources</th>
-              <th className="px-3 py-2">Reason</th>
-            </tr>
-          </thead>
-          <tbody>
-            {forecasts.map((forecast) => {
-              const reason = reasoningByForecast.get(forecast.id);
-              const selected = selectedForecast?.menu_item_id === forecast.menu_item_id;
-              return (
-                <tr
-                  key={forecast.id}
-                  className={`cursor-pointer border-t border-muted/70 align-top hover:bg-primary/35 ${
-                    selected ? "bg-accent/10" : ""
-                  }`}
-                  onClick={() => setSelectedItemId(forecast.menu_item_id)}
-                >
-                  <td className="px-3 py-3 font-medium">{itemName(data, forecast.menu_item_id)}</td>
-                  <td className="px-3 py-3 text-text/65">
-                    {forecast.daypart} - {formatSimTime(forecast.window.start)}
-                  </td>
-                  <td className="px-3 py-3 text-text/65">{formatSimTime(forecast.generated_at)}</td>
-                  <td className="px-3 py-3">{formatBaseline(forecast.baseline_qty)}</td>
-                  <td className="px-3 py-3 text-lg font-semibold text-accent">{formatQty(forecast.forecast_qty)}</td>
-                  <td className="px-3 py-3">
-                    <div className="flex max-w-xl flex-wrap gap-1.5">
-                      {Object.entries(forecast.multipliers ?? {}).map(([key, value]) => (
-                        <Pill key={key} tone={value > 1 ? "good" : value < 1 ? "warn" : "neutral"}>
-                          {key.replace("_", " ")} x{Number(value).toFixed(2)}
-                        </Pill>
-                      ))}
-                      <Pill tone="accent">
-                        <Sparkles size={12} className="mr-1" />
-                        {Math.round(forecast.confidence * 100)}%
-                      </Pill>
-                    </div>
-                  </td>
-                  <td className="px-3 py-3">
-                    <SourceBadges sources={sourceBadgesForForecast(data, forecast, reason)} />
-                  </td>
-                  <td className="max-w-md px-3 py-3 text-xs leading-5 text-text/65">
-                    {reasonSummary(reason, forecast)}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      {/* ─── Today / This Week — latest horizon lines ─────────────────────── */}
+      {(forecastTab === "today" || forecastTab === "week") && (
+        <HorizonLinesView
+          tab={forecastTab}
+          horizon={data.horizon_forecasts?.[0]}
+        />
+      )}
 
-      <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <AdjustmentLedgerPanel adjustments={selectedAdjustments} />
-        <AgentActivityPanel data={data} />
-      </div>
-
-      <DishDrillDownControls
-        data={data}
-        forecasts={forecasts}
-        reasoningByForecast={reasoningByForecast}
-        selectedItemId={selectedForecast?.menu_item_id ?? null}
-        onSelect={setSelectedItemId}
-      />
-
-      <div className="mt-6 rounded-xl border border-muted bg-surface/50 p-5">
-        <IntervalForecastPanel />
-      </div>
+      {/* ─── Custom — generate + log of prior forecasts ───────────────────── */}
+      {forecastTab === "custom" && (
+        <div className="rounded-xl border border-muted bg-surface/50 p-5">
+          <IntervalForecastPanel />
+        </div>
+      )}
     </TrackAShell>
   );
 }

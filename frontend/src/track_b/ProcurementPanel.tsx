@@ -1,15 +1,24 @@
 // ProcurementPanel — planned → ordered → delivered history.
 //
-// Three stacked sections (planned on top):
-//   Planned   — forward procurement plan from /api/track-b/procurement/plan
-//   Ordered   — approved / placed POs awaiting delivery
-//   Delivered — delivered POs, paginated
+// Three stacked sections:
+//   Planned   — supplier cards grouped by (order_date, delivery_date) pair
+//   Ordered   — active POs (approved/placed), collapsible per-PO receipt
+//   Delivered — log rows, each with a chevron receipt dropdown
 //
 // Consumes `manager_change`, `signal_emitted(SUPPLIER_PRICE_UPDATE)`, and
 // `procurement_plan_updated` WS events to refresh.
 
 import { useEffect, useState, useCallback } from "react";
-import { AlertTriangle, ChevronLeft, ChevronRight, Loader2, Package, RefreshCw } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  ChevronDown,
+  Loader2,
+  Package,
+  RefreshCw,
+} from "lucide-react";
 import { apiGet, apiPost } from "../api";
 import { useProcurementPlanVersion } from "../store";
 import { wsClient } from "../ws";
@@ -66,13 +75,12 @@ interface PlanResponse {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function simTimeLabel(t: number | null | undefined): string {
-  if (t == null) return "—";
-  const s = Math.round(t);
-  if (s < 3600) return `${s}s`;
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+/** Convert a sim-time seconds value to "Day N (Dow)" — mirrors server _day_label. */
+function dayLabel(simS: number | null | undefined): string {
+  if (simS == null) return "—";
+  const day = Math.floor(simS / 86400);
+  const dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day % 7];
+  return `Day ${day} (${dow})`;
 }
 
 function statusBadge(status: string) {
@@ -95,27 +103,207 @@ function statusBadge(status: string) {
   );
 }
 
-// ─── PO card ─────────────────────────────────────────────────────────────────
+/** Group items by a string key, preserving insertion order. */
+function groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]> {
+  const map = new Map<string, T[]>();
+  for (const item of items) {
+    const k = key(item);
+    if (!map.has(k)) map.set(k, []);
+    map.get(k)!.push(item);
+  }
+  return map;
+}
 
-function PoCard({ po }: { po: PurchaseOrder }) {
+// ─── SupplierPlanCard ─────────────────────────────────────────────────────────
+//
+// One card per supplier in the forward plan.  Inside, items are sub-grouped by
+// shared (order_date_label, delivery_date_label) pair so the date arrow appears
+// once per group rather than repeating on every row.
+
+function SupplierPlanCard({
+  supplierName,
+  items,
+}: {
+  supplierName: string;
+  items: PlanItem[];
+}) {
+  const [open, setOpen] = useState(true);
+  const total = items.reduce(
+    (sum, i) => sum + (i.unit_price ?? 0) * i.qty,
+    0
+  );
+  const byDatePair = groupBy(
+    items,
+    (i) => `${i.order_date_label}|${i.delivery_date_label}`
+  );
+
   return (
-    <div className="rounded-lg border border-muted/50 bg-surface/60 overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-2">
+    <div className="rounded-xl border border-muted/50 bg-surface/70 overflow-hidden">
+      {/* Card header */}
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between px-3 py-2.5 hover:bg-muted/20 text-left"
+      >
         <div className="flex items-center gap-2">
           <Package size={13} className="text-text/40 shrink-0" />
-          <span className="text-sm font-medium text-text">{po.supplier_name}</span>
-          {statusBadge(po.status)}
+          <span className="text-sm font-semibold text-text">{supplierName}</span>
         </div>
-        <div className="text-xs text-text/50 tabular-nums">
-          {po.total_cost != null ? `€${po.total_cost.toFixed(2)}` : ""}
-          {po.expected_delivery != null && (
-            <span className="ml-2 text-text/40">
-              ETA {simTimeLabel(po.expected_delivery)}
-            </span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-text/50 tabular-nums">
+            €{total.toFixed(2)}
+          </span>
+          {open ? (
+            <ChevronUp size={14} className="text-text/40" />
+          ) : (
+            <ChevronDown size={14} className="text-text/40" />
           )}
         </div>
-      </div>
-      {po.lines && po.lines.length > 0 && (
+      </button>
+
+      {/* Card body — one sub-block per date pair */}
+      {open && (
+        <div className="border-t border-muted/30 divide-y divide-muted/20">
+          {Array.from(byDatePair.entries()).map(([dateKey, dateItems]) => {
+            const first = dateItems[0];
+            return (
+              <div key={dateKey} className="px-3 py-2 space-y-1">
+                {/* Date header */}
+                <div className="flex items-center gap-1 text-xs text-text/50">
+                  <span>{first.order_date_label}</span>
+                  <span className="text-text/30">→</span>
+                  <span>{first.delivery_date_label}</span>
+                </div>
+                {/* Items */}
+                {dateItems.map((item) => (
+                  <div
+                    key={item.id}
+                    className="flex items-center justify-between"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-sm text-text truncate">
+                        {item.ingredient_name}
+                      </span>
+                      <span className="text-xs text-text/50 tabular-nums whitespace-nowrap">
+                        {item.qty} {item.unit}
+                      </span>
+                      {item.status === "at_risk" && (
+                        <span
+                          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-warning/20 text-warning whitespace-nowrap"
+                          title="Lead time too short to guarantee delivery before shortage"
+                        >
+                          <AlertTriangle size={10} />
+                          at-risk
+                        </span>
+                      )}
+                    </div>
+                    {item.unit_price != null && (
+                      <span className="shrink-0 text-xs text-text/50 tabular-nums ml-3">
+                        €{(item.unit_price * item.qty).toFixed(2)}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Plan section ─────────────────────────────────────────────────────────────
+
+function PlanSection({
+  items,
+  loading,
+  emptyMsg,
+  onReplan,
+  replanning,
+}: {
+  items: PlanItem[];
+  loading: boolean;
+  emptyMsg?: string;
+  onReplan: () => void;
+  replanning: boolean;
+}) {
+  const bySupplier = groupBy(items, (i) => i.supplier_name);
+
+  return (
+    <div className="space-y-2">
+      <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-text/40">
+        Planned ({items.length})
+        {loading && <Loader2 size={11} className="animate-spin" />}
+        <button
+          type="button"
+          onClick={onReplan}
+          disabled={replanning}
+          className="ml-auto flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium bg-muted text-text/60 hover:bg-muted/70 disabled:opacity-50"
+          title="Generate a new procurement plan"
+        >
+          <RefreshCw size={10} className={replanning ? "animate-spin" : undefined} />
+          Re-plan
+        </button>
+      </h3>
+      {items.length === 0 && !loading ? (
+        <p className="text-sm text-text/30">{emptyMsg ?? "None."}</p>
+      ) : (
+        <div className="space-y-2">
+          {Array.from(bySupplier.entries()).map(([supplier, supplierItems]) => (
+            <SupplierPlanCard
+              key={supplier}
+              supplierName={supplier}
+              items={supplierItems}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Active PO card (Ordered section) ────────────────────────────────────────
+//
+// Collapsible receipt; collapsed by default since these are already placed.
+
+function ActivePoCard({ po }: { po: PurchaseOrder }) {
+  const [open, setOpen] = useState(false);
+  const orderLabel = dayLabel(po.created_at);
+  const deliveryLabel = dayLabel(po.expected_delivery);
+
+  return (
+    <div className="rounded-xl border border-muted/50 bg-surface/70 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between px-3 py-2.5 hover:bg-muted/20 text-left"
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <Package size={13} className="text-text/40 shrink-0" />
+          <span className="text-sm font-semibold text-text truncate">
+            {po.supplier_name}
+          </span>
+          {statusBadge(po.status)}
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <div className="text-right">
+            <div className="text-xs text-text/50 tabular-nums">
+              {po.total_cost != null ? `€${po.total_cost.toFixed(2)}` : ""}
+            </div>
+            <div className="text-[10px] text-text/40">
+              {orderLabel} → {deliveryLabel}
+            </div>
+          </div>
+          {open ? (
+            <ChevronUp size={14} className="text-text/40" />
+          ) : (
+            <ChevronDown size={14} className="text-text/40" />
+          )}
+        </div>
+      </button>
+
+      {open && po.lines && po.lines.length > 0 && (
         <table className="w-full text-xs border-t border-muted/30">
           <tbody>
             {po.lines.map((ln) => (
@@ -136,117 +324,140 @@ function PoCard({ po }: { po: PurchaseOrder }) {
   );
 }
 
-// ─── Section component ────────────────────────────────────────────────────────
+// ─── Ordered section ──────────────────────────────────────────────────────────
 
-function PoSection({
-  label,
+function OrderedSection({
   orders,
-  emptyMsg,
   loading,
-  footer,
 }: {
-  label: string;
   orders: PurchaseOrder[];
-  emptyMsg?: string;
-  loading?: boolean;
-  footer?: React.ReactNode;
+  loading: boolean;
 }) {
   return (
     <div className="space-y-2">
       <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-text/40">
-        {label}
+        Ordered ({orders.length})
         {loading && <Loader2 size={11} className="animate-spin" />}
       </h3>
       {orders.length === 0 && !loading ? (
-        <p className="text-sm text-text/30">{emptyMsg ?? "None."}</p>
+        <p className="text-sm text-text/30">No in-flight orders.</p>
       ) : (
-        orders.map((po) => <PoCard key={po.id} po={po} />)
+        <div className="space-y-2">
+          {orders.map((po) => (
+            <ActivePoCard key={po.id} po={po} />
+          ))}
+        </div>
       )}
-      {footer}
     </div>
   );
 }
 
-// ─── Plan item row ────────────────────────────────────────────────────────────
+// ─── Delivered history row ────────────────────────────────────────────────────
+//
+// One compact line per delivered PO; chevron expands the full receipt.
 
-function PlanItemRow({ item }: { item: PlanItem }) {
+function DeliveredPoRow({ po }: { po: PurchaseOrder }) {
+  const [open, setOpen] = useState(false);
+  const orderLabel = dayLabel(po.created_at);
+  const deliveryLabel = dayLabel(po.expected_delivery);
+
   return (
-    <div className="rounded-lg border border-muted/50 bg-surface/60 overflow-hidden px-3 py-2">
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-medium text-text">{item.ingredient_name}</span>
-            <span className="text-xs text-text/60 tabular-nums">
-              {item.qty} {item.unit}
-            </span>
-            {item.status === "at_risk" && (
-              <span
-                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-warning/20 text-warning"
-                title="Lead time too short to guarantee delivery before shortage"
-              >
-                <AlertTriangle size={10} />
-                at-risk
-              </span>
-            )}
-          </div>
-          <div className="mt-0.5 text-xs text-text/50">{item.supplier_name}</div>
-          <div className="mt-1 flex items-center gap-1 text-xs text-text/60">
-            <span>Order: {item.order_date_label}</span>
-            <span className="text-text/30">→</span>
-            <span>Deliver: {item.delivery_date_label}</span>
-          </div>
-          {item.reason && (
-            <div className="mt-0.5 truncate text-xs text-text/40">{item.reason}</div>
+    <div className="rounded-lg border border-muted/40 bg-surface/50 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between px-3 py-1.5 hover:bg-muted/20 text-left"
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs font-medium text-text truncate">
+            {po.supplier_name}
+          </span>
+          <span className="text-[10px] text-text/40 whitespace-nowrap">
+            {orderLabel} → {deliveryLabel}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-xs text-text/50 tabular-nums">
+            {po.total_cost != null ? `€${po.total_cost.toFixed(2)}` : ""}
+          </span>
+          {open ? (
+            <ChevronUp size={12} className="text-text/30" />
+          ) : (
+            <ChevronDown size={12} className="text-text/30" />
           )}
         </div>
-        {item.unit_price != null && (
-          <div className="shrink-0 text-xs tabular-nums text-text/50">
-            €{(item.unit_price * item.qty).toFixed(2)}
-          </div>
-        )}
-      </div>
+      </button>
+
+      {open && po.lines && po.lines.length > 0 && (
+        <table className="w-full text-xs border-t border-muted/30">
+          <tbody>
+            {po.lines.map((ln) => (
+              <tr key={ln.id} className="border-t border-muted/20 first:border-0">
+                <td className="px-3 py-1 text-text/70">{ln.ingredient_name}</td>
+                <td className="px-3 py-1 text-right tabular-nums text-text/60">
+                  {ln.qty_display}
+                </td>
+                <td className="px-3 py-1 text-right text-text/40">
+                  {ln.line_total != null ? `€${ln.line_total.toFixed(2)}` : ""}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }
 
-// ─── Plan section ─────────────────────────────────────────────────────────────
+// ─── Delivered section ────────────────────────────────────────────────────────
 
-function PlanSection({
-  items,
+function DeliveredSection({
+  orders,
   loading,
-  emptyMsg,
-  onReplan,
-  replanning,
+  page,
+  hasMore,
+  onPrev,
+  onNext,
 }: {
-  items: PlanItem[];
+  orders: PurchaseOrder[];
   loading: boolean;
-  emptyMsg?: string;
-  onReplan: () => void;
-  replanning: boolean;
+  page: number;
+  hasMore: boolean;
+  onPrev: () => void;
+  onNext: () => void;
 }) {
   return (
     <div className="space-y-2">
       <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-text/40">
-        Planned ({items.length})
+        Delivered history
         {loading && <Loader2 size={11} className="animate-spin" />}
-        <button
-          type="button"
-          onClick={onReplan}
-          disabled={replanning}
-          className="ml-auto flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium bg-muted text-text/60 hover:bg-muted/70 disabled:opacity-50"
-          title="Generate a new procurement plan"
-        >
-          <RefreshCw size={10} className={replanning ? "animate-spin" : undefined} />
-          Re-plan
-        </button>
       </h3>
-      {items.length === 0 && !loading ? (
-        <p className="text-sm text-text/30">{emptyMsg ?? "None."}</p>
+      {orders.length === 0 && !loading ? (
+        <p className="text-sm text-text/30">No delivery history yet.</p>
       ) : (
-        <div className="space-y-1.5">
-          {items.map((item) => (
-            <PlanItemRow key={item.id} item={item} />
+        <div className="space-y-1">
+          {orders.map((po) => (
+            <DeliveredPoRow key={po.id} po={po} />
           ))}
+        </div>
+      )}
+      {(page > 0 || hasMore) && (
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            onClick={onPrev}
+            disabled={page === 0}
+            className="rounded p-1 text-text/50 hover:text-text disabled:opacity-30"
+          >
+            <ChevronLeft size={14} />
+          </button>
+          <span className="text-xs text-text/40">Page {page + 1}</span>
+          <button
+            onClick={onNext}
+            disabled={!hasMore}
+            className="rounded p-1 text-text/50 hover:text-text disabled:opacity-30"
+          >
+            <ChevronRight size={14} />
+          </button>
         </div>
       )}
     </div>
@@ -356,7 +567,7 @@ export function ProcurementPanel() {
         {loading && <Loader2 size={14} className="animate-spin text-text/40" />}
       </div>
 
-      {/* Planned */}
+      {/* Planned — supplier cards */}
       <PlanSection
         items={planItems}
         loading={planLoading}
@@ -366,38 +577,16 @@ export function ProcurementPanel() {
       />
 
       {/* Ordered (approved/placed) */}
-      <PoSection
-        label={`Ordered (${ordered.length})`}
-        orders={ordered}
-        emptyMsg="No in-flight orders."
-      />
+      <OrderedSection orders={ordered} loading={loading} />
 
-      {/* Delivered — paginated */}
-      <PoSection
-        label="Delivered history"
+      {/* Delivered — compact log with receipt dropdowns */}
+      <DeliveredSection
         orders={delivered}
-        emptyMsg="No delivery history yet."
-        footer={
-          (deliveredPage > 0 || deliveredHasMore) && (
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <button
-                onClick={() => setDeliveredPage((p) => Math.max(0, p - 1))}
-                disabled={deliveredPage === 0}
-                className="rounded p-1 text-text/50 hover:text-text disabled:opacity-30"
-              >
-                <ChevronLeft size={14} />
-              </button>
-              <span className="text-xs text-text/40">Page {deliveredPage + 1}</span>
-              <button
-                onClick={() => setDeliveredPage((p) => p + 1)}
-                disabled={!deliveredHasMore}
-                className="rounded p-1 text-text/50 hover:text-text disabled:opacity-30"
-              >
-                <ChevronRight size={14} />
-              </button>
-            </div>
-          )
-        }
+        loading={loading}
+        page={deliveredPage}
+        hasMore={deliveredHasMore}
+        onPrev={() => setDeliveredPage((p) => Math.max(0, p - 1))}
+        onNext={() => setDeliveredPage((p) => p + 1)}
       />
     </div>
   );

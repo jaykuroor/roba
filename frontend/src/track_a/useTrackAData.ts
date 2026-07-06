@@ -7,6 +7,7 @@ const REFRESH_EVENTS = [
   "signal_emitted",
   "forecast_updated",
   "forecast_job_updated",
+  "horizon_forecast_updated",
   "approval_created",
   "approval_resolved",
   "batch_decided",
