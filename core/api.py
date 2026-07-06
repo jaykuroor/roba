@@ -1223,9 +1223,16 @@ def read_purchase_orders(
     if limit is not None:
         query = query.limit(limit)
     orders = query.all()
+    # Pre-load supplier names for all orders in one query.
+    sup_ids = {po.supplier_id for po in orders if po.supplier_id}
+    sup_names: Dict[int, str] = {}
+    if sup_ids:
+        for s in db_session.query(models.Supplier).filter(models.Supplier.id.in_(sup_ids)).all():
+            sup_names[s.id] = s.name
     result = []
     for po in orders:
         row = _row_to_dict(po)
+        row["supplier_name"] = sup_names.get(po.supplier_id, str(po.supplier_id))
         if include_lines:
             lines = (
                 db_session.query(models.PurchaseOrderLine)
@@ -1236,8 +1243,6 @@ def read_purchase_orders(
             ings = {int(i.id): i for i in db_session.query(models.Ingredient).filter(
                 models.Ingredient.id.in_(ing_ids)
             ).all()} if ing_ids else {}
-            sup = db_session.get(models.Supplier, po.supplier_id)
-            row["supplier_name"] = sup.name if sup else str(po.supplier_id)
             row["lines"] = []
             for ln in lines:
                 ing = ings.get(int(ln.ingredient_id or 0))
@@ -1487,8 +1492,30 @@ def track_a_forecast_horizon(body: Dict[str, Any]) -> Dict[str, Any]:
         fs = day_idx * _SECONDS_PER_DAY + 8 * 3600
         fe = day_idx * _SECONDS_PER_DAY + 23 * 3600
     elif range_key == "custom":
-        fs = float(body.get("start") or now)
-        fe = float(body.get("end") or now + _SECONDS_PER_DAY)
+        # Accept either explicit start/end sim-seconds OR day_offset + HH:MM time strings.
+        if body.get("start_time") or body.get("end_time"):
+            # Derive sim-seconds from day_offset + wall-clock time strings ("HH:MM").
+            day_idx = _math.floor(day_base / _SECONDS_PER_DAY)
+            day_base_s = float(day_idx * _SECONDS_PER_DAY)
+
+            def _hhmm_to_s(t: str, fallback_s: float) -> float:
+                """Convert "HH:MM" to seconds-of-day; return fallback_s on failure."""
+                try:
+                    parts = str(t).split(":")
+                    return float(int(parts[0]) * 3600 + int(parts[1]) * 60)
+                except Exception:  # noqa: BLE001
+                    return fallback_s
+
+            start_s = _hhmm_to_s(body.get("start_time", ""), 8 * 3600)
+            end_s = _hhmm_to_s(body.get("end_time", ""), 23 * 3600)
+            fs = day_base_s + start_s
+            fe = day_base_s + end_s
+            if fe <= fs:
+                # Swap if user entered end before start
+                fs, fe = fe, fs + _SECONDS_PER_DAY
+        else:
+            fs = float(body.get("start") or now)
+            fe = float(body.get("end") or now + _SECONDS_PER_DAY)
     else:
         fs = float(body.get("start") or now)
         fe = float(body.get("end") or now + 7 * _SECONDS_PER_DAY)
@@ -2685,7 +2712,12 @@ def run_optimizer_llm(
 
 @app.get("/api/track-b/procurement/plan")
 def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
-    """Return all active (planned / at_risk) PlannedOrder rows with names."""
+    """Return all active (planned / at_risk) PlannedOrder rows with names.
+
+    Each item includes delivery_charge_share (supplier delivery fee split evenly
+    across items in the same supplier+delivery-day group) so the UI can show true
+    landed cost per supplier group.
+    """
     from .clock import SECONDS_PER_DAY as _SPD
 
     orders = (
@@ -2706,13 +2738,31 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
         dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day % 7]
         return f"Day {day} ({dow})"
 
+    # Pre-load all referenced suppliers to compute delivery_charge_share.
+    sup_ids = {o.supplier_id for o in orders if o.supplier_id}
+    supplier_map: Dict[int, Any] = {}
+    if sup_ids:
+        for s in db_session.query(models.Supplier).filter(models.Supplier.id.in_(sup_ids)).all():
+            supplier_map[s.id] = s
+
+    # Count items per (supplier_id, delivery_day) group to split delivery charge.
+    from collections import Counter as _Counter
+    group_counts: Dict[tuple, int] = _Counter(
+        (o.supplier_id, int(float(o.delivery_date or 0.0) // _SPD))
+        for o in orders
+        if o.supplier_id
+    )
+
     result = []
     for o in orders:
         ing = db_session.get(models.Ingredient, o.ingredient_id)
-        sup = db_session.get(models.Supplier, o.supplier_id) if o.supplier_id else None
+        sup = supplier_map.get(o.supplier_id) if o.supplier_id else None
         order_label = (
             "Now (at-risk)" if o.status == "at_risk" else _day_label(float(o.order_date or 0.0))
         )
+        delivery_day_idx = int(float(o.delivery_date or 0.0) // _SPD)
+        n_in_group = group_counts.get((o.supplier_id, delivery_day_idx), 1)
+        dc = float(sup.delivery_charge or 0.0) if sup else 0.0
         result.append({
             "id": o.id,
             "ingredient_id": o.ingredient_id,
@@ -2730,6 +2780,8 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
             "covers_until": o.covers_until,
             "status": o.status,
             "reason": o.reason or "",
+            "delivery_charge": dc,
+            "delivery_charge_share": round(dc / max(1, n_in_group), 4),
         })
 
     return {

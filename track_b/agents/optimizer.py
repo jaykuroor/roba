@@ -566,6 +566,173 @@ class InventoryOptimizer(BaseAgent):
                     })
 
         # ----------------------------------------------------------------
+        # Phase 2.5: MOV consolidation + delivery-charge attachment
+        #
+        # The per-ingredient projection above creates orders greedily; some
+        # supplier-day groups may individually fall below a supplier's
+        # min_order_value.  This pass:
+        #   1. Loads each supplier's min_order_value, delivery_charge,
+        #      pack_size-per-ingredient, and shelf_life-per-ingredient.
+        #   2. Groups new_orders by (supplier_id, delivery_day_index).
+        #   3. Merges a sub-MOV group with the nearest same-supplier group,
+        #      guarded by perishable shelf-life (don't pull a perishable order
+        #      so far forward that it expires before the original need date).
+        #   4. If the surviving group is still < MOV, pads the ingredient with
+        #      the longest shelf life in pack_size increments until MOV is met
+        #      (never pads a short-shelf perishable).
+        #   5. Attaches delivery_charge per order so cost totals are accurate.
+        # ----------------------------------------------------------------
+        if new_orders:
+            session = self.db_session_factory()
+            try:
+                # Build supplier metadata map {supplier_id: {min_order_value, delivery_charge}}
+                sup_ids_needed = {o["supplier_id"] for o in new_orders if o["supplier_id"]}
+                sups = (
+                    session.query(Supplier)
+                    .filter(Supplier.id.in_(sup_ids_needed))
+                    .all()
+                )
+                sup_meta: Dict[int, Dict] = {
+                    s.id: {
+                        "mov": float(s.min_order_value or 0.0),
+                        "delivery_charge": float(s.delivery_charge or 0.0),
+                    }
+                    for s in sups
+                }
+                # Pack sizes per (supplier_id, ingredient_id) for padding
+                cat_rows = (
+                    session.query(SupplierCatalog)
+                    .filter(SupplierCatalog.supplier_id.in_(sup_ids_needed))
+                    .all()
+                )
+                pack_by: Dict[tuple, float] = {
+                    (c.supplier_id, c.ingredient_id): float(c.pack_size or 1.0)
+                    for c in cat_rows
+                }
+            finally:
+                session.close()
+
+            now_day_i = int(now // SECONDS_PER_DAY)
+
+            def _delivery_day(o: Dict) -> int:
+                return int(float(o["delivery_date"]) // SECONDS_PER_DAY)
+
+            def _goods_value(orders: List[Dict]) -> float:
+                return sum(float(o["unit_price"] or 0.0) * float(o["qty"]) for o in orders)
+
+            # Group by (supplier_id, delivery_day)
+            from collections import defaultdict as _dd
+            groups: Dict[tuple, List[Dict]] = _dd(list)
+            for o in new_orders:
+                groups[(o["supplier_id"], _delivery_day(o))].append(o)
+
+            # Sort groups by (supplier_id, delivery_day) for nearest-group search
+            sorted_keys = sorted(groups.keys(), key=lambda k: (k[0], k[1]))
+
+            # --- Merge sub-MOV groups ---
+            for key in list(sorted_keys):
+                if key not in groups:
+                    continue
+                sup_id, day = key
+                meta = sup_meta.get(sup_id, {})
+                mov = meta.get("mov", 0.0)
+                if mov <= 0:
+                    continue
+                grp = groups[key]
+                if _goods_value(grp) >= mov:
+                    continue
+
+                # Find nearest other group for same supplier (earlier preferred, then later)
+                candidates = [
+                    (abs(k[1] - day), k[1] - day, k)
+                    for k in sorted_keys
+                    if k != key and k[0] == sup_id and k in groups
+                ]
+                if not candidates:
+                    continue
+                candidates.sort()
+                _, day_delta, target_key = candidates[0]
+
+                # Shelf-life guard: if we're merging LATER into EARLIER (day_delta < 0 means
+                # target is before us), check each perishable item in grp would still arrive
+                # before it expires from the earlier delivery date.
+                target_day = target_key[1]
+                safe_to_merge = True
+                if target_day < day:  # merging forward (earlier delivery)
+                    earliest_order_shift = day - target_day  # days earlier we'd order
+                    for o in grp:
+                        ing_sl = ingredients_data.get(o["ingredient_id"], {}).get("shelf_life")
+                        if ing_sl is not None:
+                            # The lot would arrive earliest_order_shift days sooner and need
+                            # to survive until the original need day + cover window.
+                            # Reject if shelf_life < earliest_order_shift + 1 day buffer.
+                            if ing_sl < earliest_order_shift + 1:
+                                safe_to_merge = False
+                                break
+
+                if not safe_to_merge:
+                    continue
+
+                # Merge: absorb grp into target group, remove this group
+                groups[target_key].extend(grp)
+                del groups[key]
+
+            # --- Pad groups still below MOV ---
+            for key, grp in groups.items():
+                sup_id, day = key
+                meta = sup_meta.get(sup_id, {})
+                mov = meta.get("mov", 0.0)
+                if mov <= 0:
+                    continue
+                val = _goods_value(grp)
+                if val >= mov:
+                    continue
+
+                # Find best candidate to pad: longest shelf life, not short-shelf perishable
+                pad_candidates = []
+                for o in grp:
+                    ing_sl = ingredients_data.get(o["ingredient_id"], {}).get("shelf_life")
+                    unit_price = float(o["unit_price"] or 0.0)
+                    if unit_price <= 0:
+                        continue
+                    # Prefer non-perishable or long-shelf items; reject shelf < 2 days
+                    if ing_sl is not None and ing_sl < 2:
+                        continue
+                    pad_candidates.append((
+                        -(ing_sl if ing_sl is not None else 99999),  # sort: longer shelf first
+                        o["ingredient_id"],
+                        o,
+                    ))
+
+                if not pad_candidates:
+                    continue  # can't pad safely; leave under MOV (will be flagged in plan)
+
+                pad_candidates.sort()
+                best_o = pad_candidates[0][2]
+                ps = pack_by.get((sup_id, best_o["ingredient_id"]), float(best_o.get("qty") or 1.0))
+                if ps <= 0:
+                    ps = 1.0
+                unit_p = float(best_o["unit_price"] or 0.0)
+                if unit_p <= 0:
+                    continue
+
+                deficit = mov - val
+                extra_packs = math.ceil(deficit / (ps * unit_p))
+                best_o["qty"] = float(best_o["qty"]) + extra_packs * ps
+                best_o["reason"] = best_o.get("reason", "") + " [qty padded to meet MOV]"
+
+            # Reattach delivery_charge to each order (split evenly across items in the group)
+            for (sup_id, _day), grp in groups.items():
+                dc = sup_meta.get(sup_id, {}).get("delivery_charge", 0.0)
+                n = max(1, len(grp))
+                for o in grp:
+                    o["delivery_charge"] = dc
+                    o["delivery_charge_share"] = round(dc / n, 4)
+
+            # Flatten back to new_orders preserving insertion order as best we can
+            new_orders = [o for grp in groups.values() for o in grp]
+
+        # ----------------------------------------------------------------
         # Phase 3: Hysteresis + persist
         # ----------------------------------------------------------------
         session = self.db_session_factory()
@@ -688,11 +855,18 @@ class InventoryOptimizer(BaseAgent):
 
         Called at the start of each reorder_check sweep.  Returns the count
         of orders executed.
+
+        Groups due orders by (supplier_id, delivery_day) so that all items
+        going to the same supplier on the same day form a single PO.  The
+        supplier's delivery_charge is added once per PO so total_cost reflects
+        true landed cost.
         """
         if self.procurement is None:
             return 0
 
         now = float(self.bus.sim_time)
+        from sqlalchemy import func as _sa_func
+
         session = self.db_session_factory()
         try:
             due = (
@@ -716,92 +890,119 @@ class InventoryOptimizer(BaseAgent):
                 }
                 for po in due
             ]
+            # Load delivery charges for all relevant suppliers in one query.
+            sup_ids = {d["supplier_id"] for d in due_data if d["supplier_id"]}
+            delivery_charges: Dict[int, float] = {}
+            if sup_ids:
+                for sup in session.query(Supplier).filter(Supplier.id.in_(sup_ids)).all():
+                    delivery_charges[sup.id] = float(sup.delivery_charge or 0.0)
         finally:
             session.close()
 
-        count = 0
+        # Group by (supplier_id, delivery_day) to batch into one PO per supplier-day.
+        from collections import defaultdict as _dd
+        groups: Dict[tuple, List[Dict]] = _dd(list)
         for po_data in due_data:
-            ing_id = po_data["ingredient_id"]
-            supplier_id = po_data["supplier_id"]
-
-            if supplier_id is None:
+            if po_data["supplier_id"] is None:
                 continue
+            delivery_day = int(float(po_data["delivery_date"] or 0.0) // SECONDS_PER_DAY)
+            groups[(po_data["supplier_id"], delivery_day)].append(po_data)
 
-            # A5: Compute in-flight qty and only place the shortfall.
-            # This prevents a small inbound PO from suppressing a much larger need.
-            from sqlalchemy import func as _sa_func
-            session2 = self.db_session_factory()
-            try:
-                inbound_qty_row = (
-                    session2.query(_sa_func.sum(PurchaseOrderLine.qty))
-                    .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
-                    .filter(
-                        PurchaseOrderLine.ingredient_id == ing_id,
-                        PurchaseOrder.status.in_(("proposed", "approved", "placed")),
-                    )
-                    .scalar()
-                )
-            finally:
-                session2.close()
-            inbound_qty = float(inbound_qty_row or 0.0)
-            shortfall = po_data["qty"] - inbound_qty
-            if shortfall <= 0:
-                continue
-
-            # Fall back to catalog for unit / price if the PlannedOrder row lacks them.
-            unit = po_data["unit"]
-            unit_price = po_data["unit_price"]
-            if unit is None or unit_price is None:
-                session3 = self.db_session_factory()
+        count = 0
+        for (supplier_id, _delivery_day), group in groups.items():
+            # A5: For each ingredient, compute in-flight qty and only place the shortfall.
+            lines = []
+            placed_ids = []
+            for po_data in group:
+                ing_id = po_data["ingredient_id"]
+                session2 = self.db_session_factory()
                 try:
-                    cat = (
-                        session3.query(SupplierCatalog)
+                    inbound_qty_row = (
+                        session2.query(_sa_func.sum(PurchaseOrderLine.qty))
+                        .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
                         .filter(
-                            SupplierCatalog.supplier_id == supplier_id,
-                            SupplierCatalog.ingredient_id == ing_id,
+                            PurchaseOrderLine.ingredient_id == ing_id,
+                            PurchaseOrder.status.in_(("proposed", "approved", "placed")),
                         )
-                        .first()
+                        .scalar()
                     )
-                    if cat is not None:
-                        unit = unit or cat.unit
-                        unit_price = unit_price or float(cat.current_price or 0.0)
                 finally:
-                    session3.close()
+                    session2.close()
+                inbound_qty = float(inbound_qty_row or 0.0)
+                shortfall = float(po_data["qty"] or 0.0) - inbound_qty
+                if shortfall <= 0:
+                    continue
 
-            if unit is None:
-                unit = "g"
-            if unit_price is None:
-                unit_price = 0.0
+                # Fall back to catalog for unit / price if the PlannedOrder row lacks them.
+                unit = po_data["unit"]
+                unit_price = po_data["unit_price"]
+                if unit is None or unit_price is None:
+                    session3 = self.db_session_factory()
+                    try:
+                        cat = (
+                            session3.query(SupplierCatalog)
+                            .filter(
+                                SupplierCatalog.supplier_id == supplier_id,
+                                SupplierCatalog.ingredient_id == ing_id,
+                            )
+                            .first()
+                        )
+                        if cat is not None:
+                            unit = unit or cat.unit
+                            unit_price = unit_price or float(cat.current_price or 0.0)
+                    finally:
+                        session3.close()
+
+                if unit is None:
+                    unit = "g"
+                if unit_price is None:
+                    unit_price = 0.0
+
+                lines.append({
+                    "ingredient_id": ing_id,
+                    "qty": shortfall,  # A5: only order the net shortfall
+                    "unit": unit,
+                    "unit_price": float(unit_price),
+                })
+                placed_ids.append(po_data["id"])
+
+            if not lines:
+                continue
+
+            # Use the earliest delivery_date in the group as the planned delivery.
+            planned_delivery = min(
+                float(d["delivery_date"] or 0.0) for d in group
+            )
+            dc = delivery_charges.get(supplier_id, 0.0)
 
             try:
                 self.procurement.create_po(
                     supplier_id=supplier_id,
-                    lines=[{
-                        "ingredient_id": ing_id,
-                        "qty": shortfall,  # A5: only order the net shortfall
-                        "unit": unit,
-                        "unit_price": float(unit_price),
-                    }],
+                    lines=lines,
                     created_by=self.name,
-                    planned_delivery=po_data.get("delivery_date"),  # A4: honour plan date
+                    planned_delivery=planned_delivery,  # A4: honour plan date
+                    delivery_charge=dc,                 # include delivery fee in total_cost
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "execute_due_planned_orders: create_po failed for ingredient %s", ing_id
+                    "execute_due_planned_orders: create_po failed for supplier %s", supplier_id
                 )
                 continue
 
-            # Mark the PlannedOrder row as placed.
-            session4 = self.db_session_factory()
-            try:
-                row = session4.get(PlannedOrder, po_data["id"])
-                if row:
-                    row.status = "placed"
-                    session4.commit()
-            except Exception:  # noqa: BLE001
-                session4.rollback()
-            finally:
-                session4.close()
+            count += len(lines)
+
+            # Mark all PlannedOrder rows in the group as placed.
+            for row_id in placed_ids:
+                session4 = self.db_session_factory()
+                try:
+                    row = session4.get(PlannedOrder, row_id)
+                    if row:
+                        row.status = "placed"
+                        session4.commit()
+                except Exception:  # noqa: BLE001
+                    session4.rollback()
+                finally:
+                    session4.close()
 
             count += 1
 
