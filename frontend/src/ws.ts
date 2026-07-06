@@ -169,3 +169,7 @@ wsClient.on("manager_change", () => {
   // Bump version so components refetch the changes list from the API.
   actions.bumpManagerChangeVersion();
 });
+// Bump a counter when the procurement plan is rebuilt so panels can refetch.
+wsClient.on("procurement_plan_updated", () => {
+  actions.bumpProcurementPlanVersion();
+});

@@ -24,6 +24,9 @@ export interface StoreState {
   managerChangeVersion: number;
   /** Latest manager changes loaded by components; set on refetch. */
   managerChanges: ManagerChange[];
+  /** Incremented each time a procurement_plan_updated WS event arrives; components
+   * use this to trigger a refetch of the procurement plan. */
+  procurementPlanVersion: number;
 }
 
 const initialState: StoreState = {
@@ -36,6 +39,7 @@ const initialState: StoreState = {
   wsConnected: false,
   managerChangeVersion: 0,
   managerChanges: [],
+  procurementPlanVersion: 0,
 };
 
 type Listener = () => void;
@@ -142,6 +146,10 @@ export const actions = {
   setManagerChanges(changes: ManagerChange[]): void {
     setState({ managerChanges: changes });
   },
+
+  bumpProcurementPlanVersion(): void {
+    setState({ procurementPlanVersion: state.procurementPlanVersion + 1 });
+  },
 };
 
 export const store = { getState, setState, subscribe };
@@ -190,4 +198,8 @@ export function useManagerChangeVersion(): number {
 
 export function useManagerChanges(): ManagerChange[] {
   return useSelector((s) => s.managerChanges);
+}
+
+export function useProcurementPlanVersion(): number {
+  return useSelector((s) => s.procurementPlanVersion);
 }

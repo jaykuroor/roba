@@ -1,15 +1,10 @@
 import type { ReactNode } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
-  AlertTriangle,
   Bell,
-  CheckCircle2,
-  Mic,
   Pause,
-  PhoneOff,
   Play,
   RotateCcw,
-  Send,
   Square,
   StepForward,
   Wifi,
@@ -18,9 +13,7 @@ import {
 import { apiGet, apiPatch, apiPost } from "../api";
 import {
   actions,
-  useActiveCall,
   useApprovals,
-  useCallTurns,
   useSimState,
   useWsConnected,
 } from "../store";
@@ -32,8 +25,6 @@ import type {
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8];
 const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-// Voice extraction can include a real LLM call; keep this above provider timeout.
-const VOICE_TIMEOUT_MS = 45000;
 
 // ---------------------------------------------------------------------------
 // Display helpers (pure formatting of server state — not business logic)
@@ -53,204 +44,6 @@ function formatSimTime(sim: SimState | null): string {
   const tod = sim.time_of_day ?? secondsToHHMM(t % 86400);
   const dow = DOW[(sim.day_of_week ?? day % 7) % 7];
   return `Day ${day} · ${dow} · ${tod}`;
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(() => reject(new Error(message)), ms);
-    promise.then(
-      (value) => {
-        window.clearTimeout(timer);
-        resolve(value);
-      },
-      (err: unknown) => {
-        window.clearTimeout(timer);
-        reject(err);
-      },
-    );
-  });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-type VoiceExtraction = {
-  intent?: string;
-  entity_type?: string;
-  entity_ref?: string | number | null;
-  attribute?: string;
-  value?: unknown;
-  effective_window?: { start?: number; end?: number } | null;
-  confidence?: number;
-};
-
-type VoiceResponse = {
-  extracted?: VoiceExtraction;
-  routes?: Array<{
-    route_id: string;
-    signal_type: string;
-    target_modules: string[];
-    status: string;
-    signal_id?: string | null;
-  }>;
-  resulting_writes?: string[];
-  signal_id?: string | null;
-  error?: string;
-};
-
-function voiceResponse(result: unknown): VoiceResponse | null {
-  if (!isRecord(result)) return null;
-  return result as VoiceResponse;
-}
-
-function voiceActionLabel(extracted: VoiceExtraction | undefined): string {
-  if (!extracted) return "Awaiting interpretation";
-  const attribute = String(extracted.attribute ?? "");
-  const value = extracted.value;
-  const action = isRecord(value) ? String(value.action ?? "") : String(value ?? "");
-  if (attribute === "production_unavailable" || action === "halt_production") {
-    return "Production locked to zero";
-  }
-  if (attribute === "overstock" || action === "reduce_forecast") {
-    return "Forecast locked to zero";
-  }
-  if (extracted.intent === "add_event") return "Demand event added";
-  if (extracted.intent === "set_operational_constraint") return "Operational constraint stored";
-  return String(extracted.intent ?? "Stored");
-}
-
-function voiceTargetLabel(extracted: VoiceExtraction | undefined): string {
-  const target = extracted?.entity_ref;
-  return target == null || target === "" ? "restaurant operation" : String(target);
-}
-
-function voiceWindowLabel(window: VoiceExtraction["effective_window"]): string {
-  if (!window || window.start == null || window.end == null) return "No active window";
-  return `${secondsToHHMM(window.start)}–${secondsToHHMM(window.end)}`;
-}
-
-function VoiceResultCard({ result }: { result: unknown }) {
-  const response = voiceResponse(result);
-  if (!response) return null;
-  if (response.error) {
-    return (
-      <div className="flex min-h-7 items-center gap-2 rounded-md border border-danger/40 bg-danger/10 px-2 py-1 text-xs text-danger">
-        <div className="flex items-center gap-1.5 font-medium">
-          <AlertTriangle size={14} />
-          Voice request failed
-        </div>
-        <div className="truncate text-danger/80">{response.error}</div>
-      </div>
-    );
-  }
-
-  const extracted = response.extracted;
-  const confidence = Math.round(Number(extracted?.confidence ?? 0) * 100);
-  const writes = response.resulting_writes ?? [];
-  const routes = response.routes ?? [];
-  const intent = extracted?.intent ? String(extracted.intent).replaceAll("_", " ") : null;
-
-  return (
-    <div className="flex min-h-8 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-accent/30 bg-primary/70 px-2 py-1 text-xs">
-      <div className="flex min-w-0 items-center gap-1.5 font-medium text-text">
-        <CheckCircle2 size={14} className="shrink-0 text-success" />
-        <span className="truncate">{voiceActionLabel(extracted)}</span>
-      </div>
-      {intent && (
-        <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-semibold uppercase text-white">
-          {intent}
-        </span>
-      )}
-      <span className="truncate text-text/65">
-        {voiceTargetLabel(extracted)} · {voiceWindowLabel(extracted?.effective_window)}
-      </span>
-      <span className="text-text/45">{confidence}%</span>
-      {routes.length > 0 && (
-        <span className="truncate text-text/55">
-          {routes.map((route) => route.signal_type).join(", ")}
-        </span>
-      )}
-      <span className="truncate text-text/45">{writes.length ? writes.join(", ") : "stored"}</span>
-      {response.signal_id && (
-        <span className="hidden truncate text-[10px] text-text/35 xl:inline">{response.signal_id}</span>
-      )}
-      <details className="relative ml-auto text-text/45">
-        <summary className="cursor-pointer text-[10px] uppercase">Details</summary>
-        <pre className="absolute right-0 z-40 mt-1 max-h-44 w-[min(34rem,80vw)] overflow-auto rounded-md border border-muted bg-surface p-2 text-[10px] shadow-xl">
-          {JSON.stringify(result, null, 2)}
-        </pre>
-      </details>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Web Speech API mic button (text fallback is always available alongside it)
-// ---------------------------------------------------------------------------
-
-type RecognitionLike = {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
-  onerror: (() => void) | null;
-  onend: (() => void) | null;
-};
-
-function getRecognitionCtor(): (new () => RecognitionLike) | null {
-  const w = window as unknown as {
-    SpeechRecognition?: new () => RecognitionLike;
-    webkitSpeechRecognition?: new () => RecognitionLike;
-  };
-  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
-}
-
-function MicButton({ onResult }: { onResult: (text: string) => void }) {
-  const [listening, setListening] = useState(false);
-  const recognitionRef = useRef<RecognitionLike | null>(null);
-  const supported = getRecognitionCtor() !== null;
-
-  function toggle() {
-    const Ctor = getRecognitionCtor();
-    if (!Ctor) return;
-    if (listening) {
-      recognitionRef.current?.stop();
-      return;
-    }
-    const recognition = new Ctor();
-    recognition.lang = "en-US";
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      const text = event.results?.[0]?.[0]?.transcript ?? "";
-      if (text) onResult(text);
-    };
-    recognition.onerror = () => setListening(false);
-    recognition.onend = () => setListening(false);
-    recognitionRef.current = recognition;
-    recognition.start();
-    setListening(true);
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={toggle}
-      disabled={!supported}
-      title={supported ? "Speak" : "Speech recognition unavailable"}
-      className={
-        "flex items-center justify-center rounded-md px-2 py-1.5 " +
-        (listening
-          ? "bg-accent text-white"
-          : "bg-muted text-text hover:bg-muted/70 disabled:opacity-40")
-      }
-    >
-      <Mic size={16} />
-    </button>
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -361,157 +154,6 @@ function StatusPill({
       <span className={`h-2 w-2 rounded-full ${cfg.dot}`} />
       <span className={cfg.textCls}>{cfg.label}</span>
     </span>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Voice console (normal + ROLEPLAY mode during a call)
-// ---------------------------------------------------------------------------
-
-function VoiceConsole() {
-  const activeCall = useActiveCall();
-  const callTurns = useCallTurns();
-  const [text, setText] = useState("");
-  const [result, setResult] = useState<unknown>(null);
-  const [busy, setBusy] = useState(false);
-  const transcriptEndRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [callTurns.length]);
-
-  // -- ROLEPLAY mode (00 §8, §23) -------------------------------------------
-  if (activeCall) {
-    const counterparty =
-      activeCall.counterparty_type === "supplier" ? "Supplier" : "Competitor";
-
-    async function sendTurn() {
-      const value = text.trim();
-      if (!value || !activeCall) return;
-      setText("");
-      try {
-        await apiPost(`/api/calls/${activeCall.id}/turn`, {
-          role: "counterparty",
-          text: value,
-        });
-      } catch {
-        /* surfaced via missing turn in the transcript */
-      }
-    }
-
-    async function hangUp() {
-      if (!activeCall) return;
-      try {
-        await apiPost(`/api/calls/${activeCall.id}/end`);
-      } catch {
-        /* call_ended WS event also clears the active call */
-      }
-    }
-
-    return (
-      <div className="flex min-w-[22rem] flex-col gap-1 rounded-md border border-accent bg-surface p-2">
-        <div className="flex items-center justify-between">
-          <span className="text-sm font-semibold text-accent">
-            You are playing: {counterparty}
-            {activeCall.counterparty_id != null
-              ? ` #${activeCall.counterparty_id}`
-              : ""}
-          </span>
-          <button
-            type="button"
-            onClick={hangUp}
-            className="flex items-center gap-1 rounded-md bg-danger px-2 py-1 text-xs font-medium text-white"
-          >
-            <PhoneOff size={14} /> Hang up
-          </button>
-        </div>
-        <div className="h-20 overflow-auto rounded bg-primary/60 p-2 text-xs">
-          {callTurns.length === 0 ? (
-            <span className="text-text/40">Waiting for the agent…</span>
-          ) : (
-            callTurns.map((turn, i) => (
-              <div key={i} className="mb-1">
-                <span
-                  className={
-                    turn.role === "agent"
-                      ? "font-semibold text-accent"
-                      : "font-semibold text-success"
-                  }
-                >
-                  {turn.role === "agent" ? "Agent" : counterparty}:
-                </span>{" "}
-                <span className="text-text/80">{turn.text}</span>
-              </div>
-            ))
-          )}
-          <div ref={transcriptEndRef} />
-        </div>
-        <div className="flex items-center gap-1">
-          <input
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void sendTurn();
-            }}
-            placeholder={`Reply as ${counterparty}…`}
-            className="flex-1 rounded-md border border-muted bg-primary px-2 py-1 text-sm text-text outline-none focus:border-accent"
-          />
-          <MicButton onResult={(t) => setText(t)} />
-          <button
-            type="button"
-            onClick={() => void sendTurn()}
-            className="flex items-center justify-center rounded-md bg-accent px-2 py-1.5 text-white"
-            aria-label="Send reply"
-          >
-            <Send size={16} />
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  // -- normal voice intake (00 §11) -----------------------------------------
-  async function submit() {
-    const value = text.trim();
-    if (!value || busy) return;
-    setBusy(true);
-    try {
-      const res = await withTimeout(
-        apiPost<unknown>("/api/voice/transcript", { text: value }),
-        VOICE_TIMEOUT_MS,
-        "Voice request timed out",
-      );
-      setResult(res);
-    } catch (err) {
-      setResult({ error: err instanceof Error ? err.message : "Voice request failed" });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="flex min-w-[22rem] max-w-[42rem] flex-1 flex-col gap-1">
-      <div className="flex items-start gap-1">
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={1}
-          placeholder={`e.g. "There's a parade on our street this Monday"`}
-          className="h-8 flex-1 resize-none rounded-md border border-muted bg-primary px-2 py-1 text-sm text-text outline-none focus:border-accent"
-        />
-        <MicButton onResult={(t) => setText(t)} />
-        <button
-          type="button"
-          onClick={() => void submit()}
-          disabled={busy}
-          className="flex items-center justify-center rounded-md bg-accent px-2 py-1.5 text-white disabled:opacity-50"
-          aria-label="Submit voice transcript"
-        >
-          <Send size={16} />
-        </button>
-      </div>
-      {result != null && <VoiceResultCard result={result} />}
-    </div>
   );
 }
 
@@ -687,12 +329,6 @@ export function ControlBar({
             </span>
             <StatusPill status={status} pendingAction={pendingAction} />
           </Section>
-
-          <div className="min-w-[22rem] flex-1">
-            <Section label="Voice console">
-              <VoiceConsole />
-            </Section>
-          </div>
 
           <Section label="Velocity">
             <VelocitySlider />
