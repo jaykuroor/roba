@@ -51,7 +51,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from .config import GEMINI_LIVE_MODEL
+from .config import GEMINI_LIVE_CALL_MODEL, GEMINI_LIVE_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ _ALLOWED_LIVE_MODELS = {
 }
 
 # Hardcoded fallback — used when GEMINI_LIVE_MODEL env var contains an invalid name.
-_FALLBACK_LIVE_MODEL = "gemini-live-2.5-flash"
+_FALLBACK_LIVE_MODEL = "gemini-live-2.5-flash-native-audio"
 
 _DISCONNECT_EXC_NAMES = {
     "WebSocketDisconnect",
@@ -574,7 +574,35 @@ _TOOLS: list[dict[str, Any]] = [
                     },
                     "required": ["question"],
                 },
-            }
+            },
+            {
+                "name": "register_demand_event",
+                "description": (
+                    "Log an upcoming event or demand change that will affect customer volume. "
+                    "Use whenever the manager mentions: a parade, festival, concert, sports match, fair, "
+                    "road closure, bad weather, or ANY other event or condition that will raise or lower "
+                    "the number of customers. Capture the manager's EXACT words in 'note' — do NOT "
+                    "compute dates or multipliers yourself. The system resolves timing and impact automatically."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "note": {
+                            "type": "string",
+                            "description": (
+                                "The manager's verbatim statement about the event or demand change. "
+                                "Include all timing words (e.g. 'next week Monday through Wednesday', "
+                                "'tonight from 6pm', 'this weekend'). Quote exactly — do not paraphrase."
+                            ),
+                        },
+                        "mode": {
+                            "type": "string",
+                            "description": "'confirm' (default) shows a confirmation card; 'auto' applies immediately.",
+                        },
+                    },
+                    "required": ["note"],
+                },
+            },
         ]
     },
 ]
@@ -775,6 +803,12 @@ a dish is named. Only omit it for whole-menu / "all dishes" queries.
 User: "How much will we lose if Marco is on leave this week?"
 → consult_reasoner(question="How much revenue will we lose this week if Marco is on leave?", context="Need revenue-at-risk from Marco's sole-covered dishes based on current forecasts.")
 → "Marco solely covers the Pizza station. At ~84 Margherita portions forecast this week (€9 each), that's roughly €756 at risk. Recommend covering his station or calling in a substitute."
+
+User: "There's going to be a parade next week Monday through Wednesday."
+→ register_demand_event(note="parade next week Monday through Wednesday")
+→ [confirm mode] "I'll log a demand event for the parade — approximately 1.6× normal demand Mon–Wed next week. A confirmation card is on screen."
+→ [after confirm] "Done. The parade demand event is logged. The forecaster will boost those three days."
+→ [auto mode] "Logged parade demand event: Mon–Wed next week at ~1.6× demand."
 """
 
 _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
@@ -834,6 +868,10 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "purpose='intel', target='pizza')\n"
         "    'call GreenFarm and push on price' → request_outbound_call(counterparty_type='supplier', "
         "purpose='negotiate', target='GreenFarm', note='push hard on price')\n"
+        "• Demand event → register_demand_event(note=<verbatim manager statement>, mode='confirm')\n"
+        "  ↳ Use for ANY mention of events, parades, festivals, concerts, sports matches, fairs, "
+        "road closures, bad weather, or ANYTHING that would affect customer demand. "
+        "Pass the manager's EXACT words in 'note' — do NOT compute dates or multipliers yourself.\n"
         "• Complex trade-off → consult_reasoner(question=..., context=...)\n\n"
         "BATCH STATUS VOCABULARY: 'decided'=awaiting approval; 'approved'=ready to cook; "
         "'ready'=cooked; 'skipped'=decided to skip.\n\n"
@@ -961,15 +999,14 @@ async def live_bridge(
     if model and model in _ALLOWED_LIVE_MODELS:
         live_model = model
 
-    # Call roles require reliable input transcription (grounding against what the
-    # caller actually said). Force half-cascade unless the caller explicitly passed
-    # an allowlisted model override via the query param.
+    # Call roles require the configured call model (defaults to native-audio) unless
+    # the caller explicitly passed an allowlisted model override via the query param.
     _CALL_ROLES_FOR_MODEL = (
         "supplier_call", "competitor_call", "onboarding_call",
         "inbound_supplier_call", "inbound_competitor_call",
     )
     if role in _CALL_ROLES_FOR_MODEL and not (model and model in _ALLOWED_LIVE_MODELS):
-        live_model = "gemini-live-2.5-flash"
+        live_model = GEMINI_LIVE_CALL_MODEL
 
     system_instruction = _SYSTEM_INSTRUCTIONS.get(role, _SYSTEM_INSTRUCTIONS["manager"])
 
@@ -1143,16 +1180,38 @@ async def live_bridge(
             continue
         except Exception as exc:  # noqa: BLE001
             if first_connect:
-                logger.warning("Vertex AI Live connect failed: %s", exc)
-                await _safe_send_json(websocket, {"type": "unavailable", "reason": str(exc)})
-                return
-            fail_streak += 1
-            logger.warning("Vertex AI Live resume connect failed: %s (streak=%d)", exc, fail_streak)
-            if fail_streak >= _MAX_RESUME_FAILS:
-                await _safe_send_json(websocket, {"type": "error", "message": f"Voice session could not resume: {exc}"})
-                return
-            await asyncio.sleep(_RESUME_BACKOFF_S[min(fail_streak - 1, len(_RESUME_BACKOFF_S) - 1)])
-            continue
+                _exc_str = str(exc)
+                _is_model_err = (
+                    getattr(exc, "code", None) == 1008
+                    or "not found" in _exc_str.lower()
+                    or "1008" in _exc_str
+                )
+                if _is_model_err and live_model != _FALLBACK_LIVE_MODEL:
+                    logger.warning(
+                        "Live connect with %r failed, retrying with fallback %r: %s",
+                        live_model, _FALLBACK_LIVE_MODEL, exc,
+                    )
+                    live_model = _FALLBACK_LIVE_MODEL
+                    connect_ctx = client.aio.live.connect(model=live_model, config=live_config)
+                    try:
+                        async with asyncio.timeout(_CONNECT_TIMEOUT_S):
+                            session = await connect_ctx.__aenter__()
+                    except Exception as _exc2:  # noqa: BLE001
+                        logger.warning("Vertex AI Live connect failed with fallback: %s", _exc2)
+                        await _safe_send_json(websocket, {"type": "unavailable", "reason": str(_exc2)})
+                        return
+                else:
+                    logger.warning("Vertex AI Live connect failed: %s", exc)
+                    await _safe_send_json(websocket, {"type": "unavailable", "reason": str(exc)})
+                    return
+            else:
+                fail_streak += 1
+                logger.warning("Vertex AI Live resume connect failed: %s (streak=%d)", exc, fail_streak)
+                if fail_streak >= _MAX_RESUME_FAILS:
+                    await _safe_send_json(websocket, {"type": "error", "message": f"Voice session could not resume: {exc}"})
+                    return
+                await asyncio.sleep(_RESUME_BACKOFF_S[min(fail_streak - 1, len(_RESUME_BACKOFF_S) - 1)])
+                continue
 
         # Connected (or resumed with prior context).
         if first_connect:
@@ -2032,6 +2091,15 @@ async def _execute_tool(
                     context=args.get("context"),
                 )
             return {"error": "VoiceActions not available"}
+
+        if name == "register_demand_event":
+            if va:
+                return await asyncio.to_thread(
+                    va.register_demand_event,
+                    note=str(args.get("note") or ""),
+                    mode=str(args.get("mode") or "confirm"),
+                )
+            return {"error": "VoiceActions unavailable"}
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("voice_live tool %s failed: %s", name, exc)

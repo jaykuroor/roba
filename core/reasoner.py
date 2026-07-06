@@ -210,3 +210,144 @@ def suggest_batch_changes(
     except Exception as exc:  # noqa: BLE001
         logger.warning("suggest_batch_changes failed: %s", exc)
         return {"proposals": [], "schedule_assessment": str(exc), "source": "error"}
+
+
+_DEMAND_EVENT_SYSTEM = """\
+You are the demand-signal synthesizer for a restaurant operations AI. The restaurant manager has made a spoken statement about an upcoming event or demand change. Your job is to convert this into a precise demand forecast signal for the planning system.
+
+TODAY: Day {sim_day} ({weekday_name}). Days are numbered from 0; day-of-week: 0=Monday, 1=Tuesday, ..., 6=Sunday.
+
+Your output specifies a time window as DAY OFFSETS FROM TODAY (not absolute dates):
+  - day_from: integer >= 0 (0 = today, 1 = tomorrow, 7 = next Monday if today is Monday, etc.)
+  - day_to: integer >= day_from (inclusive, for a multi-day event)
+  - start_hour: optional integer 0-23 (hour the event starts; omit = whole day from open)
+  - end_hour: optional integer 0-23 (hour the event ends; omit = whole day till close)
+
+DEMAND MULTIPLIER RULES:
+  - "parade", "festival", "marathon", "street fair", "concert nearby", "major event": 1.5-1.8x
+  - "huge event", "stadium event nearby", "crowd of 5000+": 1.8-2.0x
+  - "quiet week", "bad weather", "road closure reducing access": 0.6-0.8x
+  - "slight uptick", "small local event": 1.2-1.4x
+  - Specify demand_multiplier (float) OR expected_attendance (integer); not both.
+
+EXAMPLES:
+1. "There's going to be a parade next week from Monday to Wednesday" (today = Friday, day 4):
+   -> day_from=3 (next Monday = 3 days away), day_to=5 (next Wednesday), demand_multiplier=1.6, event_ref="parade-next-week", event_kind="parade"
+
+2. "There's a concert tonight from 6pm to 10pm" (today = any day):
+   -> day_from=0, day_to=0, start_hour=18, end_hour=22, demand_multiplier=1.4, event_ref="concert-tonight", event_kind="concert"
+
+3. "It's going to be a slow week, road closures" (today = Monday):
+   -> day_from=0, day_to=6, demand_multiplier=0.7, event_ref="road-closure-week", event_kind="access_disruption"
+
+4. "Big football match Saturday" (today = Wednesday):
+   -> day_from=3, day_to=3, demand_multiplier=1.7, event_ref="football-saturday", event_kind="sports_event"
+
+5. "We're expecting about 800 people at the park fair this weekend" (today = Thursday):
+   -> day_from=2, day_to=3, expected_attendance=800, event_ref="park-fair-weekend", event_kind="fair"
+
+RULES:
+- ALWAYS use day offsets (day_from, day_to), never absolute dates or sim-seconds.
+- "next week" when today is Mon-Fri means the following Mon-Sun (7-13 days away for Mon, etc.). Compute correctly from weekday_name.
+- "this weekend" = nearest Saturday and Sunday.
+- "tomorrow" = day_from=1, day_to=1.
+- If the statement is ambiguous, pick the most reasonable interpretation and set confidence < 0.7.
+- If there is no clear event (e.g. "what's the weather"), return an error field instead.
+- event_ref should be a short kebab-case slug (no spaces).
+"""
+
+_DEMAND_EVENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "event_ref": {"type": "string"},
+        "event_kind": {"type": "string"},
+        "day_from": {"type": "integer"},
+        "day_to": {"type": "integer"},
+        "start_hour": {"type": "integer"},
+        "end_hour": {"type": "integer"},
+        "demand_multiplier": {"type": "number"},
+        "expected_attendance": {"type": "number"},
+        "affected_categories": {"type": "array", "items": {"type": "string"}},
+        "affected_menu_item_ids": {"type": "array", "items": {"type": "integer"}},
+        "confidence": {"type": "number"},
+        "raw_text": {"type": "string"},
+        "error": {"type": "string"},
+    },
+    "required": ["event_ref", "event_kind", "day_from", "day_to", "confidence", "raw_text"],
+}
+
+
+def synthesize_demand_event(
+    raw_text: str,
+    sim_day: int,
+    weekday_name: str,
+    sim_context: dict,
+    timeout_s: float = 20.0,
+) -> dict:
+    """Convert a manager's spoken event statement into a demand forecast signal.
+
+    Returns a dict matching _DEMAND_EVENT_SCHEMA, or {"error": "...", "raw_text": raw_text}
+    on failure. Designed to be called via asyncio.to_thread from async code.
+    """
+    try:
+        from .vertex import build_genai_client, vertex_available
+        from .config import GEMINI_REASONER_MODEL
+
+        if not vertex_available():
+            logger.info("synthesize_demand_event: Vertex AI unavailable, skipping")
+            return {"error": "synthesis unavailable (Vertex AI not configured)", "raw_text": raw_text}
+
+        client = build_genai_client()
+        system = _DEMAND_EVENT_SYSTEM.format(sim_day=sim_day, weekday_name=weekday_name)
+        context_str = json.dumps(sim_context, default=str) if sim_context else "{}"
+        prompt = (
+            f"Manager statement: {raw_text!r}\n\n"
+            f"Current ops snapshot (compact): {context_str}\n\n"
+            "Convert the manager's statement into a demand event signal. "
+            "Return JSON matching the required schema."
+        )
+
+        import concurrent.futures
+
+        def _call():
+            return client.models.generate_content(
+                model=GEMINI_REASONER_MODEL,
+                contents=prompt,
+                config={
+                    "system_instruction": system,
+                    "temperature": 0.15,
+                    "response_mime_type": "application/json",
+                    "response_schema": _DEMAND_EVENT_SCHEMA,
+                },
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(_call)
+            try:
+                resp = future.result(timeout=timeout_s)
+            except concurrent.futures.TimeoutError:
+                logger.warning("synthesize_demand_event: LLM timed out")
+                return {"error": "synthesis timed out", "raw_text": raw_text}
+
+        if not resp or not resp.text:
+            return {"error": "empty response from synthesizer", "raw_text": raw_text}
+
+        try:
+            data = json.loads(resp.text)
+        except json.JSONDecodeError:
+            logger.warning("synthesize_demand_event: non-JSON response: %s", resp.text[:200])
+            return {"error": "could not parse synthesizer response", "raw_text": raw_text}
+
+        # Validate day offsets
+        day_from = data.get("day_from", 0)
+        day_to = data.get("day_to", 0)
+        if not isinstance(day_from, int) or day_from < 0:
+            data["day_from"] = 0
+        if not isinstance(day_to, int) or day_to < data.get("day_from", 0):
+            data["day_to"] = data.get("day_from", 0)
+        data.setdefault("raw_text", raw_text)
+        return data
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("synthesize_demand_event failed: %s", exc)
+        return {"error": "synthesis unavailable", "raw_text": raw_text}

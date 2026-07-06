@@ -16,6 +16,7 @@ for _key, _value in dotenv_values(".env").items():
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GEMINI_MODEL",
         "GEMINI_LIVE_MODEL",
+        "GEMINI_LIVE_CALL_MODEL",
         "LLM_FORECAST_AUTO_MODE",
     } and _key not in os.environ and _value:
         os.environ[_key] = _value
@@ -57,7 +58,7 @@ VELOCITY_CLAMP = (0.6, 1.6)
 SUGGESTION_INTERVAL_SIM_S = 54000          # ~1 sim-day
 LLM_MULTIPLIER_CLAMP = (0.0, 2.0)
 LLM_EXTREME_MULTIPLIERS = (0.0, 2.0)
-LLM_FORECAST_AUTO_MODE = os.getenv("LLM_FORECAST_AUTO_MODE", "0").lower() in {
+LLM_FORECAST_AUTO_MODE = os.getenv("LLM_FORECAST_AUTO_MODE", "1").lower() in {
     "1", "true", "yes", "on"
 }
 COLD_TEMP_C = 12.0
@@ -143,6 +144,7 @@ PROMO_SLOW_MOVER_PCT = int(os.getenv("PROMO_SLOW_MOVER_PCT", "15"))
 
 # Vertex AI Live API (Stream B5)
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio")
+GEMINI_LIVE_CALL_MODEL = os.getenv("GEMINI_LIVE_CALL_MODEL", "gemini-live-2.5-flash-native-audio")
 
 # Availability OOS mode: "threshold" (disabled when on_hand ≤ safety_stock/reorder_point)
 #                        "zero"      (disabled only when on_hand ≤ 0)

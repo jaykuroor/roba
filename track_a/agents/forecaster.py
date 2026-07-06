@@ -2196,7 +2196,12 @@ class DemandForecaster(BaseAgent):
         daypart: str,
         window: Dict[str, float],
     ) -> Dict[str, Any]:
-        if self.llm is None:
+        try:
+            from core.vertex import build_genai_client, vertex_available  # noqa: PLC0415
+            from core.config import GEMINI_REASONER_MODEL  # noqa: PLC0415
+        except Exception:  # noqa: BLE001
+            return {}
+        if not vertex_available():
             return {}
         material_context = self._material_forecast_context(prepared, live)
         context = {
@@ -2228,29 +2233,24 @@ class DemandForecaster(BaseAgent):
             "live_signals": [self._signal_context(sig) for sig in live],
             "memory": self._memory_context(session),
         }
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the final forecast decision layer for a restaurant simulation. "
-                    "The deterministic model is usually accurate and should be treated as the "
-                    "default expert recommendation. Your main job is to return the final forecast "
-                    "in the required JSON format. For each item, copy "
-                    "deterministic_recommendation.forecast_qty unless there is explicit evidence "
-                    "from active constraints, voice instructions, menu/stockout/staff signals, "
-                    "events, competitor/review signals, weather, recent velocity, or memory that "
-                    "requires a change. Do not recalculate baseline math. Do not double-count "
-                    "multipliers already present in deterministic_recommendation. Hard feasibility "
-                    "zeros from voice, menu disable, stockout, or staff coverage are guardrails: "
-                    "the final_qty must remain 0. If changing a non-zero forecast, keep the change "
-                    "bounded and evidence-bound. Return JSON only with item_final_forecasts, "
-                    "global_notes, memory_updates, and confidence. item_final_forecasts must contain "
-                    "{menu_item_id, final_qty, confidence, decision, changed, reason, evidence}. "
-                    "Use decision='accept_deterministic' when copying the recommendation."
-                ),
-            },
-            {"role": "user", "content": str(context)},
-        ]
+        system_instruction = (
+            "You are the final forecast decision layer for a restaurant simulation. "
+            "The deterministic model is usually accurate and should be treated as the "
+            "default expert recommendation. Your main job is to return the final forecast "
+            "in the required JSON format. For each item, copy "
+            "deterministic_recommendation.forecast_qty unless there is explicit evidence "
+            "from active constraints, voice instructions, menu/stockout/staff signals, "
+            "events, competitor/review signals, weather, recent velocity, or memory that "
+            "requires a change. Do not recalculate baseline math. Do not double-count "
+            "multipliers already present in deterministic_recommendation. Hard feasibility "
+            "zeros from voice, menu disable, stockout, or staff coverage are guardrails: "
+            "the final_qty must remain 0. If changing a non-zero forecast, keep the change "
+            "bounded and evidence-bound. Return JSON only with item_final_forecasts, "
+            "global_notes, memory_updates, and confidence. item_final_forecasts must contain "
+            "{menu_item_id, final_qty, confidence, decision, changed, reason, evidence}. "
+            "Use decision='accept_deterministic' when copying the recommendation."
+        )
+        prompt_str = str(context)
         schema = {
             "type": "object",
             "properties": {
@@ -2263,18 +2263,40 @@ class DemandForecaster(BaseAgent):
             "required": ["global_notes", "memory_updates"],
         }
         try:
-            result = self.llm.complete(
-                messages,
-                json_schema=schema,
-                max_tokens=1200,
-                use_site="forecaster_optimization",
-                temperature=0.1,
-            )
+            import concurrent.futures as _cf  # noqa: PLC0415
+            import json as _json  # noqa: PLC0415
+            client = build_genai_client()
+
+            def _call():
+                return client.models.generate_content(
+                    model=GEMINI_REASONER_MODEL,
+                    contents=prompt_str,
+                    config={
+                        "system_instruction": system_instruction,
+                        "temperature": 0.1,
+                        "response_mime_type": "application/json",
+                        "response_schema": schema,
+                    },
+                )
+
+            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_call)
+                try:
+                    resp = future.result(timeout=30.0)
+                except _cf.TimeoutError:
+                    return {}
+
+            if not resp or not resp.text:
+                return {}
+            try:
+                result = _json.loads(resp.text)
+            except _json.JSONDecodeError:
+                return {}
+            if not isinstance(result, dict):
+                return {}
+            return result
         except Exception:  # noqa: BLE001 - deterministic fallback is the contract.
             return {}
-        if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
-            return {}
-        return result
 
     def _llm_batch_plan(
         self,

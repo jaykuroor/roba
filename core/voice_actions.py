@@ -1186,6 +1186,101 @@ class VoiceActions:
                     pass
         return reasoner.consult(question, context)
 
+    def register_demand_event(self, note: str, mode: str = "confirm") -> Dict[str, Any]:
+        """Log an upcoming event or demand change that affects customer volume.
+
+        Calls the demand synthesizer LLM to interpret the manager's statement, then
+        emits a DEMAND_EVENT signal targeting the forecaster agent.
+        """
+        from . import reasoner as _reasoner  # noqa: PLC0415
+        import json as _json  # noqa: PLC0415
+
+        # Resolve sim day and weekday
+        try:
+            sim_time_f = float(self.bus.sim_time)
+        except Exception:  # noqa: BLE001
+            sim_time_f = 0.0
+        _SECONDS_PER_DAY = 86400
+        sim_day = int(sim_time_f // _SECONDS_PER_DAY)
+        _WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        weekday_name = _WEEKDAY_NAMES[sim_day % 7]
+
+        # Build a compact ops snapshot for context
+        sim_context: dict = {}
+        try:
+            session = self.db_session_factory()
+            try:
+                from .models import Ingredient as _Ing, MenuItem as _MI  # noqa: PLC0415
+                low_stock = session.query(_Ing).filter(_Ing.on_hand <= _Ing.safety_stock).all()
+                sim_context["low_stock_ingredients"] = [i.name for i in low_stock if i.name]
+                sim_context["menu_item_count"] = session.query(_MI).filter(_MI.active.is_(True)).count()
+            finally:
+                session.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+        synth = _reasoner.synthesize_demand_event(note, sim_day, weekday_name, sim_context)
+
+        if synth.get("error") and not synth.get("event_ref"):
+            return {
+                "need": "clarification",
+                "question": f"I couldn't understand the event from: {note!r}. Please be more specific.",
+            }
+
+        # Resolve the time window from day offsets
+        from .clock import DAY_OPEN_OFFSET, DAY_CLOSE_OFFSET, SECONDS_PER_DAY  # noqa: PLC0415
+        base_day = sim_day
+        start_hour = synth.get("start_hour")
+        end_hour = synth.get("end_hour")
+        d_start = (base_day + synth["day_from"]) * SECONDS_PER_DAY + (
+            start_hour * 3600 if start_hour is not None else DAY_OPEN_OFFSET
+        )
+        d_end = (base_day + synth["day_to"]) * SECONDS_PER_DAY + (
+            end_hour * 3600 if end_hour is not None else DAY_CLOSE_OFFSET
+        )
+        window = {"start": d_start, "end": d_end}
+
+        # Build human-readable multiplier string
+        if synth.get("demand_multiplier"):
+            mult_str = f"{synth['demand_multiplier']:.1f}×"
+        elif synth.get("expected_attendance"):
+            mult_str = f"{int(synth['expected_attendance'])} expected"
+        else:
+            mult_str = "~1.4×"
+
+        day_from = synth.get("day_from", 0)
+        day_to = synth.get("day_to", 0)
+        hr = (
+            f"Log demand event: '{synth['event_ref']}' — {mult_str} demand, "
+            f"{day_from}–{day_to} days from now."
+        )
+
+        def _apply() -> Dict[str, Any]:
+            payload_dict = {
+                "event_ref": synth["event_ref"],
+                "event_kind": synth.get("event_kind", "event"),
+                "demand_multiplier": synth.get("demand_multiplier"),
+                "expected_attendance": synth.get("expected_attendance"),
+                "affected_categories": synth.get("affected_categories", []),
+                "affected_menu_item_ids": synth.get("affected_menu_item_ids", []),
+                "window": window,
+                "raw_text": note,
+                "confidence": float(synth.get("confidence", 0.7)),
+            }
+            from .signals import SignalType  # noqa: PLC0415
+            ttl = max(window["end"] - float(self.bus.sim_time), 3600.0)
+            self.bus.emit(
+                SignalType.DEMAND_EVENT,
+                payload_dict,
+                source="voice",
+                ttl=ttl,
+                dedup_key=f"demand_event:{synth['event_ref']}",
+                target_agents=["track_a.forecaster"],
+            )
+            return {"ok": True, "event_ref": synth["event_ref"], "window": window, "demand": mult_str}
+
+        return self._stage_or_apply(mode, _apply, human_readable=hr)
+
     # -----------------------------------------------------------------------
     # Staging (confirm/auto mode)
     # -----------------------------------------------------------------------
