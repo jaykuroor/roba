@@ -721,14 +721,6 @@ class InventoryOptimizer(BaseAgent):
                 best_o["qty"] = float(best_o["qty"]) + extra_packs * ps
                 best_o["reason"] = best_o.get("reason", "") + " [qty padded to meet MOV]"
 
-            # Reattach delivery_charge to each order (split evenly across items in the group)
-            for (sup_id, _day), grp in groups.items():
-                dc = sup_meta.get(sup_id, {}).get("delivery_charge", 0.0)
-                n = max(1, len(grp))
-                for o in grp:
-                    o["delivery_charge"] = dc
-                    o["delivery_charge_share"] = round(dc / n, 4)
-
             # Flatten back to new_orders preserving insertion order as best we can
             new_orders = [o for grp in groups.values() for o in grp]
 
