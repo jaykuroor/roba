@@ -701,6 +701,7 @@ class InventoryOptimizer(BaseAgent):
                     pad_candidates.append((
                         -(ing_sl if ing_sl is not None else 99999),  # sort: longer shelf first
                         o["ingredient_id"],
+                        len(pad_candidates),  # stable tiebreaker; avoids comparing dicts
                         o,
                     ))
 
@@ -708,7 +709,7 @@ class InventoryOptimizer(BaseAgent):
                     continue  # can't pad safely; leave under MOV (will be flagged in plan)
 
                 pad_candidates.sort()
-                best_o = pad_candidates[0][2]
+                best_o = pad_candidates[0][3]
                 ps = pack_by.get((sup_id, best_o["ingredient_id"]), float(best_o.get("qty") or 1.0))
                 if ps <= 0:
                     ps = 1.0
