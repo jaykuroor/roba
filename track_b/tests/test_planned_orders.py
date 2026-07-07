@@ -44,12 +44,13 @@ class _FakeProcurement:
     def __init__(self):
         self.calls = []
 
-    def create_po(self, supplier_id, lines, created_by="optimizer", planned_delivery=None):
+    def create_po(self, supplier_id, lines, created_by="optimizer", planned_delivery=None, delivery_charge=0.0):
         self.calls.append({
             "supplier_id": supplier_id,
             "lines": lines,
             "created_by": created_by,
             "planned_delivery": planned_delivery,
+            "delivery_charge": delivery_charge,
         })
         # Return a SimpleNamespace mimicking a PurchaseOrder so callers don't crash.
         return SimpleNamespace(id=9999, status="placed")

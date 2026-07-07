@@ -981,8 +981,6 @@ class InventoryOptimizer(BaseAgent):
                 )
                 continue
 
-            count += len(lines)
-
             # Mark all PlannedOrder rows in the group as placed.
             for row_id in placed_ids:
                 session4 = self.db_session_factory()
@@ -996,7 +994,7 @@ class InventoryOptimizer(BaseAgent):
                 finally:
                     session4.close()
 
-            count += 1
+            count += 1  # one PO created per supplier-day group
 
         return count
 

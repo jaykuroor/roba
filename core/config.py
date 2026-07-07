@@ -73,7 +73,7 @@ PAR_DAYS = 3
 EXPIRY_SCAN_SIM_S = 3600
 EXPIRY_WINDOW_SIM_S = 172800               # 2 sim-days
 PROMO_DISCOUNT_PCT = 20
-APPROVAL_PO_THRESHOLD = 200                # currency units; above -> needs approval
+APPROVAL_PO_THRESHOLD = 500                # currency units; above -> needs approval
 
 # procurement — forecast-driven par / reorder sizing
 # REORDER_INTERVAL_DAYS: expected days between reorder checks (how long between sweeps)

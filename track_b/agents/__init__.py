@@ -41,6 +41,7 @@ def register(
     approvals: Any = None,
     ws_broadcast: Any = None,
     inventory_signal_policy: Any = None,
+    approval_policy: Any = None,
     **_kwargs: Any,
 ) -> Dict[str, Any]:
     """Wire Track B into the running core (agents, services, triggers, mock).
@@ -55,6 +56,7 @@ def register(
     procurement = Procurement(
         bus, db_session_factory, orchestrator, ledger,
         approvals=approvals, ws_broadcast=ws_broadcast,
+        approval_policy=approval_policy,
     )
     optimizer = InventoryOptimizer(
         bus, db_session_factory, ws_broadcast=ws_broadcast,

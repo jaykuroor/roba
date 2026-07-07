@@ -24,6 +24,48 @@ function PayloadPreview({ payload }: { payload: unknown }) {
   );
 }
 
+function PurchaseOrderPreview({ payload }: { payload: unknown }) {
+  if (!payload || typeof payload !== "object") return <PayloadPreview payload={payload} />;
+  const po = payload as Record<string, unknown>;
+  const lines = Array.isArray(po.lines) ? (po.lines as Record<string, unknown>[]) : [];
+  return (
+    <div className="mt-2 rounded-md border border-muted bg-primary/50 p-2 text-xs text-text/70">
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+        <span className="text-text/45">PO #</span>
+        <span className="font-medium text-text">{String(po.po_id ?? "—")}</span>
+        <span className="text-text/45">Total</span>
+        <span className="font-medium text-text">€{Number(po.total ?? 0).toFixed(2)}</span>
+      </div>
+      {lines.length > 0 && (
+        <table className="mt-2 w-full text-[11px]">
+          <thead>
+            <tr className="border-b border-muted/60 text-text/45">
+              <th className="py-0.5 text-left font-normal">Ingredient #</th>
+              <th className="py-0.5 text-right font-normal">Qty</th>
+              <th className="py-0.5 text-right font-normal">Unit price</th>
+              <th className="py-0.5 text-right font-normal">Line total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lines.map((l, i) => {
+              const qty = Number(l.qty ?? 0);
+              const price = Number(l.unit_price ?? 0);
+              return (
+                <tr key={i} className="border-b border-muted/30 last:border-0">
+                  <td className="py-0.5">{String(l.ingredient_id ?? "?")}</td>
+                  <td className="py-0.5 text-right">{qty.toLocaleString()}</td>
+                  <td className="py-0.5 text-right">€{price.toFixed(4)}</td>
+                  <td className="py-0.5 text-right">€{(qty * price).toFixed(2)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 function ForecastProposalPreview({ payload }: { payload: unknown }) {
   if (!payload || typeof payload !== "object") return <PayloadPreview payload={payload} />;
   const proposal = payload as Record<string, unknown>;
@@ -75,6 +117,8 @@ function ApprovalCard({ approval }: { approval: ApprovalRequest }) {
       <p className="mt-1 text-sm text-text/70">{approval.summary}</p>
       {approval.type === "forecast_override_proposal" ? (
         <ForecastProposalPreview payload={approval.payload} />
+      ) : approval.type === "purchase_order" ? (
+        <PurchaseOrderPreview payload={approval.payload} />
       ) : (
         <PayloadPreview payload={approval.payload} />
       )}
