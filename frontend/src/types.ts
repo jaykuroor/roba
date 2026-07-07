@@ -356,6 +356,10 @@ export interface InventorySignalPolicy {
   shortage_signals_enabled: boolean;
 }
 
+export interface ApprovalThreshold {
+  approval_threshold: number;
+}
+
 // -- Call overhaul (Phase 1) ---------------------------------------------------
 
 export interface ManagerChange {

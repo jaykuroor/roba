@@ -35,6 +35,7 @@ class Procurement:
         approvals: Any = None,
         ws_broadcast: Any = None,
         name: str = "procurement",
+        approval_policy: Any = None,
     ):
         self.bus = bus
         self.db_session_factory = db_session_factory
@@ -43,6 +44,7 @@ class Procurement:
         self.approvals = approvals
         self.ws_broadcast = ws_broadcast
         self.name = name
+        self.approval_policy = approval_policy
 
     def attach_approvals(self, approvals: Any) -> None:
         self.approvals = approvals
@@ -130,7 +132,13 @@ class Procurement:
         finally:
             session.close()
 
-        if total > config.APPROVAL_PO_THRESHOLD and self.approvals is not None:
+        # Use the runtime-configurable threshold if available, else fall back to config.
+        _threshold = (
+            self.approval_policy.approval_threshold
+            if self.approval_policy is not None
+            else float(config.APPROVAL_PO_THRESHOLD)
+        )
+        if total > _threshold and self.approvals is not None:
             approval = self.approvals.create(
                 type="purchase_order",
                 title=f"Purchase order #{po_id} (${total:.2f})",

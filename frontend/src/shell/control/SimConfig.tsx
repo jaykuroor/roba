@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { apiGet, apiPatch } from "../../api";
 import { useSimState } from "../../store";
-import type { InventorySignalPolicy, SimState } from "../../types";
+import type { ApprovalThreshold, InventorySignalPolicy, SimState } from "../../types";
 import { SectionHeading, ApplyButton } from "./shared";
 
 export function SimConfigPanel() {
@@ -17,6 +17,11 @@ export function SimConfigPanel() {
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
 
+  // Procurement approval threshold
+  const [approvalThreshold, setApprovalThreshold] = useState(500);
+  const [thresholdBusy, setThresholdBusy] = useState(false);
+  const [thresholdSaved, setThresholdSaved] = useState(false);
+
   useEffect(() => {
     apiGet<SimState>("/api/sim/state").then((s) => {
       const win = s.operating_window;
@@ -29,6 +34,9 @@ export function SimConfigPanel() {
     }).catch(() => undefined);
     apiGet<InventorySignalPolicy>("/api/runtime/inventory-signal-policy")
       .then(setInventoryPolicy)
+      .catch(() => undefined);
+    apiGet<ApprovalThreshold>("/api/runtime/approval-threshold")
+      .then((t) => setApprovalThreshold(t.approval_threshold))
       .catch(() => undefined);
   }, []);
 
@@ -57,6 +65,19 @@ export function SimConfigPanel() {
       );
       setInventoryPolicy(next);
     } catch { /* server state remains source of truth */ } finally { setPolicyBusy(false); }
+  }
+
+  async function applyApprovalThreshold() {
+    setThresholdBusy(true);
+    try {
+      const next = await apiPatch<ApprovalThreshold>(
+        "/api/runtime/approval-threshold",
+        { approval_threshold: approvalThreshold },
+      );
+      setApprovalThreshold(next.approval_threshold);
+      setThresholdSaved(true);
+      setTimeout(() => setThresholdSaved(false), 2000);
+    } catch { /* ignore */ } finally { setThresholdBusy(false); }
   }
 
   const shortageSignalsEnabled = inventoryPolicy?.shortage_signals_enabled ?? true;
@@ -148,6 +169,28 @@ export function SimConfigPanel() {
               }
             />
           </button>
+        </div>
+      </div>
+
+      <div>
+        <SectionHeading>Procurement</SectionHeading>
+        <p className="mb-3 text-[10px] text-text/40">
+          Purchase orders above this amount require manager approval in the Approval Inbox.
+        </p>
+        <div className="flex flex-wrap items-end gap-4">
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] font-medium uppercase text-text/40">PO approval threshold (€)</span>
+            <input
+              type="number" min={0} step={50} value={approvalThreshold}
+              onChange={(e) => setApprovalThreshold(Number(e.target.value))}
+              className="w-28 rounded-md border border-muted bg-primary px-2 py-1.5 text-sm text-text outline-none focus:border-accent"
+            />
+          </label>
+          <ApplyButton
+            onClick={() => void applyApprovalThreshold()}
+            busy={thresholdBusy}
+            label={thresholdSaved ? "✓ Saved" : "Apply"}
+          />
         </div>
       </div>
 

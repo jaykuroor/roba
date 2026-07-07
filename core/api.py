@@ -42,7 +42,7 @@ from .formatter import DataFormatter, line_to_dict, order_to_dict
 from .llm import LLMProvider
 from .orchestrator import Orchestrator
 from .pos_simulator import POSSimulator
-from .runtime_policy import InventorySignalPolicy
+from .runtime_policy import ApprovalPolicy, InventorySignalPolicy
 from .scenarios import ScenarioEngine
 from .seeding import Seeder
 from .signals import SignalType
@@ -165,6 +165,7 @@ class AppContext:
         self.pos: Optional[POSSimulator] = None
         self.scenarios: Optional[ScenarioEngine] = None
         self.inventory_signal_policy: Optional[InventorySignalPolicy] = None
+        self.approval_policy: Optional[ApprovalPolicy] = None
         self.forecast_jobs: Optional[ForecastJobRunner] = None
         self.hub: WebSocketHub = WebSocketHub()
         self.loop_task: Optional[asyncio.Task] = None
@@ -249,6 +250,7 @@ def _bootstrap() -> None:
     inventory_signal_policy = InventorySignalPolicy(
         config.INVENTORY_SHORTAGE_SIGNALS_ENABLED
     )
+    approval_policy = ApprovalPolicy(config.APPROVAL_PO_THRESHOLD)
     voice = VoiceProcessor(llm, bus, factory)
     seeder = Seeder(llm, factory)
     weather = WeatherProvider(bus, factory, clock)
@@ -347,6 +349,7 @@ def _bootstrap() -> None:
         approvals=approvals,
         ws_broadcast=sink,
         inventory_signal_policy=inventory_signal_policy,
+        approval_policy=approval_policy,
     )
 
     ctx.bus = bus
@@ -354,6 +357,7 @@ def _bootstrap() -> None:
     ctx.orchestrator = orchestrator
     ctx.llm = llm
     ctx.inventory_signal_policy = inventory_signal_policy
+    ctx.approval_policy = approval_policy
     ctx.voice = voice
     ctx.seeder = seeder
     ctx.weather = weather
@@ -530,6 +534,10 @@ class PosBody(BaseModel):
 
 class InventorySignalPolicyBody(BaseModel):
     shortage_signals_enabled: bool
+
+
+class ApprovalThresholdBody(BaseModel):
+    approval_threshold: float
 
 
 def _ensure_loop_task() -> None:
@@ -726,6 +734,22 @@ def patch_inventory_signal_policy(body: InventorySignalPolicyBody) -> Dict[str, 
         body.shortage_signals_enabled
     )
     ctx.hub.broadcast("inventory_signal_policy_changed", snapshot.__dict__)
+    return snapshot.__dict__
+
+
+@app.get("/api/runtime/approval-threshold")
+def get_approval_threshold() -> Dict[str, Any]:
+    if ctx.approval_policy is None:
+        raise HTTPException(status_code=503, detail="Approval policy unavailable")
+    return ctx.approval_policy.snapshot().__dict__
+
+
+@app.patch("/api/runtime/approval-threshold")
+def patch_approval_threshold(body: ApprovalThresholdBody) -> Dict[str, Any]:
+    if ctx.approval_policy is None:
+        raise HTTPException(status_code=503, detail="Approval policy unavailable")
+    snapshot = ctx.approval_policy.set_approval_threshold(body.approval_threshold)
+    ctx.hub.broadcast("approval_threshold_changed", snapshot.__dict__)
     return snapshot.__dict__
 
 
@@ -2738,6 +2762,18 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
         dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day % 7]
         return f"Day {day} ({dow})"
 
+    def _day_time_label(sim_s: float, overdue: bool = False) -> str:
+        """Concrete label: 'Day X (Dow) HH:MM' with optional '(overdue)' suffix."""
+        day = int(sim_s // _SPD)
+        dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day % 7]
+        sod = int(sim_s) % _SPD
+        hh, mm = divmod(sod // 60, 60)
+        suffix = " (overdue)" if overdue else ""
+        return f"Day {day} ({dow}) {hh:02d}:{mm:02d}{suffix}"
+
+    # Current sim time (for overdue label).
+    now_sim = float(ctx.bus.sim_time) if ctx.bus is not None else 0.0
+
     # Pre-load all referenced suppliers to compute delivery_charge_share.
     sup_ids = {o.supplier_id for o in orders if o.supplier_id}
     supplier_map: Dict[int, Any] = {}
@@ -2757,8 +2793,10 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
     for o in orders:
         ing = db_session.get(models.Ingredient, o.ingredient_id)
         sup = supplier_map.get(o.supplier_id) if o.supplier_id else None
-        order_label = (
-            "Now (at-risk)" if o.status == "at_risk" else _day_label(float(o.order_date or 0.0))
+        order_date_s = float(o.order_date or 0.0)
+        order_label = _day_time_label(
+            order_date_s,
+            overdue=(o.status == "at_risk" or order_date_s <= now_sim),
         )
         delivery_day_idx = int(float(o.delivery_date or 0.0) // _SPD)
         n_in_group = group_counts.get((o.supplier_id, delivery_day_idx), 1)
@@ -2793,12 +2831,15 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
 
 @app.post("/api/track-b/procurement/plan/run")
 def run_procurement_plan() -> Dict[str, Any]:
-    """Manually trigger a procurement plan rebuild."""
+    """Manually trigger a procurement plan rebuild and execute any overdue orders."""
     optimizer = (ctx.tracks.get("track_b") or {}).get("optimizer")
     if optimizer is None:
         raise HTTPException(status_code=503, detail="Optimizer not active")
+    # Execute overdue planned orders first (converts at_risk / past-due rows into POs),
+    # then rebuild the plan so the UI reflects the updated state.
+    executed = optimizer.execute_due_planned_orders()
     count = optimizer.build_procurement_plan()
-    return {"ok": True, "items_planned": count}
+    return {"ok": True, "items_planned": count, "orders_executed": executed}
 
 
 # ===========================================================================
