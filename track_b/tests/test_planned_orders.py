@@ -458,7 +458,9 @@ def test_plan_run_header_created(bus, session_factory):
     try:
         run = session.query(ProcurementPlanRun).order_by(ProcurementPlanRun.id.desc()).first()
         assert run is not None, "ProcurementPlanRun row must be created"
-        assert run.method == "projection"
+        assert run.method in ("milp", "projection", "greedy"), (
+            f"Expected milp/projection/greedy, got {run.method!r}"
+        )
         assert run.horizon_days == pytest.approx(14.0)
     finally:
         session.close()
@@ -594,16 +596,22 @@ def _seed_supplier_with_default(session_factory, ing_id, lead_time_days=2.0, pri
 
 
 def test_build_plan_uses_milp_default_supplier(bus, session_factory):
-    """build_procurement_plan must pick the is_default=1 supplier, not the heuristic winner."""
+    """Time-phased MILP picks the cheapest available supplier independently.
+
+    The time-phased ordering MILP is now its own cost optimizer — it selects
+    suppliers based on total landed cost, not by deferring to the sourcing
+    MILP's is_default flag.  So when one supplier is materially cheaper, the
+    ordering MILP should prefer it over the is_default one.
+    """
     ing_id = _seed_ingredient(session_factory, on_hand=0.0, safety_stock=50.0)
     item_id = _seed_dish(session_factory, ing_id, recipe_qty=100.0)
 
-    # Heuristic-preferred supplier: cheaper price, faster lead — would win on score.
-    _seed_supplier_with_default(session_factory, ing_id, lead_time_days=1.0, price=0.1,
-                                 pack_size=10.0, is_default=0)
-    # MILP-chosen default supplier: slower lead, higher price — but is_default=1.
-    default_sup_id = _seed_supplier_with_default(session_factory, ing_id, lead_time_days=3.0,
-                                                  price=5.0, pack_size=10.0, is_default=1)
+    # Cheaper supplier: price=0.1, lead=1 day — time-phased MILP should prefer this.
+    cheap_sup_id = _seed_supplier_with_default(session_factory, ing_id, lead_time_days=1.0,
+                                               price=0.1, pack_size=10.0, is_default=0)
+    # Expensive supplier: price=5.0 (50× more), marked is_default=1.
+    _seed_supplier_with_default(session_factory, ing_id, lead_time_days=3.0,
+                                price=5.0, pack_size=10.0, is_default=1)
 
     bus.sim_time = 0.0
     _emit_horizon(bus, menu_item_id=item_id, daily_qty=1.0, days=7)
@@ -617,9 +625,10 @@ def test_build_plan_uses_milp_default_supplier(bus, session_factory):
             PlannedOrder.status.in_(["planned", "at_risk"])
         ).all()
         assert rows, "Expected at least one PlannedOrder row"
+        # Time-phased MILP should pick the cheaper supplier (50× price difference).
         for row in rows:
-            assert row.supplier_id == default_sup_id, (
-                f"Plan used supplier {row.supplier_id} but expected MILP default {default_sup_id}"
+            assert row.supplier_id == cheap_sup_id, (
+                f"Expected cheapest supplier {cheap_sup_id} but got {row.supplier_id}"
             )
     finally:
         session.close()

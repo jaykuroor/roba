@@ -356,7 +356,15 @@ class InventoryOptimizer(BaseAgent):
                 lead_by_supplier = {s.id: float(s.lead_time_days or 1.0) for s in suppliers}
                 candidate = self._select_supplier(specs, lead_by_supplier)
                 if candidate is None:
-                    continue
+                    # C3: All-suppliers-out fallback — pick cheapest available anyway
+                    # so we can still emit an at_risk planned order rather than silently
+                    # dropping the ingredient from coverage tracking.
+                    if specs:
+                        candidate = min(
+                            specs, key=lambda s: float(s.get("current_price") or 1e9)
+                        )
+                    if candidate is None:
+                        continue
 
                 lead_days = float(lead_by_supplier.get(candidate["supplier_id"], 1.0))
                 on_hand = float(level.on_hand_cached or 0.0)
@@ -426,7 +434,17 @@ class InventoryOptimizer(BaseAgent):
                     if exp_delivery is None:
                         continue
                     arr_day = int(float(exp_delivery) // SECONDS_PER_DAY) - now_day
-                    # Overdue deliveries (arr_day < 0) are treated as arriving today.
+                    # C1: Phantom-inventory fix — only credit POs expected to arrive
+                    # within the horizon.  POs overdue by more than 1 day are treated
+                    # as stuck (never delivered) so the planner re-orders instead of
+                    # relying on stock that may never arrive.
+                    if arr_day < -1:
+                        logger.debug(
+                            "Excluding overdue in-flight PO (arr_day=%d) for ingredient %s "
+                            "from projection — treating as undelivered.",
+                            arr_day, ing_id_t,
+                        )
+                        continue
                     arr_day = max(arr_day, 0)
                     if ing_id_t in inbound_by_day:
                         inbound_by_day[ing_id_t][arr_day] = (
@@ -436,294 +454,162 @@ class InventoryOptimizer(BaseAgent):
                 session.close()
 
         # ----------------------------------------------------------------
-        # Phase 2: Day-by-day stock projection per ingredient
+        # Phase 2 + 2.5 (replaced): Time-phased cost-optimal plan via MILP.
+        #
+        # The old greedy projection + same-day consolidation is replaced by a
+        # multi-period optimizer that jointly minimises goods cost + delivery
+        # charges + discounts subject to coverage, lead-time feasibility, MOV,
+        # and expiry constraints.  Falls back to a greedy projection
+        # (plan_optimizer._solve_greedy) when PuLP is unavailable or the MILP
+        # returns non-optimal.
         # ----------------------------------------------------------------
         new_orders: List[Dict] = []
+        plan_method = "milp"
 
-        _LOT_NEVER_EXPIRES = 999999.0  # sentinel exp_day for non-perishable lots
-
-        for ing_id, data in ingredients_data.items():
-            candidate = data["candidate"]
-            lead_days = data["lead_days"]
-            on_hand = data["on_hand"]
-            safety_stock = data["safety_stock"]
-            shelf_life = data["shelf_life"]
-            pack_size = candidate["pack_size"]
-
-            # A9: Seed the projection with the ingredient's real dated lots
-            # (qty, exp_day_offset) so stock that expires mid-horizon isn't
-            # counted as available coverage.  If lots are absent (edge-case),
-            # fall back to on_hand as a non-expiring lump to stay safe.
-            lots_proj: List[List[float]] = (
-                [list(l) for l in data.get("lots", [])]
-                or [[on_hand, _LOT_NEVER_EXPIRES]]
+        # -- Gather full catalog + all suppliers for every active ingredient --
+        if ingredients_data:
+            from track_b.procurement.plan_optimizer import (  # noqa: PLC0415
+                solve_time_phased_plan as _solve_time_phased,
             )
-
-            for d in range(n_days):
-                delivery_sim_s = float((now_day + d) * SECONDS_PER_DAY + DAY_OPEN_OFFSET)
-                # Day-0 opens at 08:00 but the sim may already be past that; clamp
-                # so delivery is never scheduled in the past (avoids spurious at_risk).
-                if d == 0:
-                    delivery_sim_s = max(delivery_sim_s, now)
-
-                # A1+A9: Credit inbound deliveries arriving today as a fresh lot
-                # (expiry anchored to the ingredient's shelf life from arrival day).
-                inbound_today = inbound_by_day[ing_id].get(d, 0.0)
-                if inbound_today > 0:
-                    inbound_exp = d + (shelf_life if shelf_life is not None else _LOT_NEVER_EXPIRES)
-                    lots_proj.append([inbound_today, inbound_exp])
-
-                # A9: Expire lots that spoil on or before today (exp_day <= d).
-                lots_proj = [l for l in lots_proj if l[1] > d]
-
-                # Sort soonest-expiry first for FIFO consumption.
-                lots_proj.sort(key=lambda l: l[1])
-
-                # Robust demand floor: max(transient qty, steady-state baseline).
-                day_qty = per_day_demand[ing_id].get(d, 0.0)
-                day_base = per_day_baseline[ing_id].get(d, 0.0)
-                day_demand = max(day_qty, day_base)
-
-                # Consume demand FIFO from soonest-expiry lot.
-                rem_demand = day_demand
-                for lot in lots_proj:
-                    take = min(lot[0], rem_demand)
-                    lot[0] -= take
-                    rem_demand -= take
-                    if rem_demand <= 0.0:
-                        break
-                lots_proj = [l for l in lots_proj if l[0] > 1e-9]
-
-                running_stock = sum(l[0] for l in lots_proj)
-
-                if running_stock < safety_stock:
-                    order_date = delivery_sim_s - lead_days * SECONDS_PER_DAY
-
-                    # Size: cover demand for lead_days + REORDER_INTERVAL_DAYS + 1 more days.
-                    cover_days = lead_days + config.REORDER_INTERVAL_DAYS + 1
-                    cover_end = min(n_days, d + math.ceil(cover_days))
-
-                    demand_to_cover = sum(
-                        max(
-                            per_day_demand[ing_id].get(dd, 0.0),
-                            per_day_baseline[ing_id].get(dd, 0.0),
-                        )
-                        for dd in range(d, cover_end)
-                    )
-                    needed = max(0.0, demand_to_cover + safety_stock - max(0.0, running_stock))
-
-                    # A1 (sizing): subtract inbound scheduled within the coverage window.
-                    # running_stock already accounts for inbound on days 0..d; subtract
-                    # days d+1..cover_end so the order size reflects the true net shortfall.
-                    inbound_in_window = sum(
-                        inbound_by_day[ing_id].get(dd, 0.0) for dd in range(d + 1, cover_end)
-                    )
-                    needed = max(0.0, needed - inbound_in_window)
-
-                    # Perishable ceiling: don't order more than can be consumed before expiry.
-                    if shelf_life is not None:
-                        expiry_end = min(n_days, d + math.ceil(min(shelf_life, cover_days)))
-                        demand_before_expiry = sum(
-                            max(
-                                per_day_demand[ing_id].get(dd, 0.0),
-                                per_day_baseline[ing_id].get(dd, 0.0),
-                            )
-                            for dd in range(d, expiry_end)
-                        )
-                        if 0 < demand_before_expiry < needed:
-                            needed = demand_before_expiry
-
-                    if needed <= 0:
-                        continue
-
-                    qty = math.ceil(needed / pack_size) * pack_size
-                    # A9: Add the planned delivery as a fresh lot so subsequent
-                    # days see the replenishment and don't double-plan.
-                    order_exp = d + (shelf_life if shelf_life is not None else _LOT_NEVER_EXPIRES)
-                    lots_proj.append([qty, order_exp])
-                    running_stock += qty
-
-                    covers_until = float(
-                        (now_day + d + math.ceil(cover_days)) * SECONDS_PER_DAY + DAY_OPEN_OFFSET
-                    )
-                    status = "at_risk" if order_date < now else "planned"
-
-                    new_orders.append({
-                        "ingredient_id": ing_id,
-                        "supplier_id": candidate["supplier_id"],
-                        "qty": qty,
-                        "unit": candidate["unit"],
-                        "unit_price": candidate["current_price"],
-                        "order_date": order_date,
-                        "delivery_date": delivery_sim_s,
-                        "covers_from": delivery_sim_s,
-                        "covers_until": covers_until,
-                        "status": status,
-                        "reason": (
-                            f"Projected stock below safety_stock ({safety_stock:.1f}) "
-                            f"on sim day {now_day + d}"
-                        ),
-                    })
-
-        # ----------------------------------------------------------------
-        # Phase 2.5: MOV consolidation + delivery-charge attachment
-        #
-        # The per-ingredient projection above creates orders greedily; some
-        # supplier-day groups may individually fall below a supplier's
-        # min_order_value.  This pass:
-        #   1. Loads each supplier's min_order_value, delivery_charge,
-        #      pack_size-per-ingredient, and shelf_life-per-ingredient.
-        #   2. Groups new_orders by (supplier_id, delivery_day_index).
-        #   3. Merges a sub-MOV group with the nearest same-supplier group,
-        #      guarded by perishable shelf-life (don't pull a perishable order
-        #      so far forward that it expires before the original need date).
-        #   4. If the surviving group is still < MOV, pads the ingredient with
-        #      the longest shelf life in pack_size increments until MOV is met
-        #      (never pads a short-shelf perishable).
-        #   5. Attaches delivery_charge per order so cost totals are accurate.
-        # ----------------------------------------------------------------
-        if new_orders:
             session = self.db_session_factory()
             try:
-                # Build supplier metadata map {supplier_id: {min_order_value, delivery_charge}}
-                sup_ids_needed = {o["supplier_id"] for o in new_orders if o["supplier_id"]}
-                sups = (
-                    session.query(Supplier)
-                    .filter(Supplier.id.in_(sup_ids_needed))
-                    .all()
-                )
-                sup_meta: Dict[int, Dict] = {
-                    s.id: {
-                        "mov": float(s.min_order_value or 0.0),
-                        "delivery_charge": float(s.delivery_charge or 0.0),
-                    }
-                    for s in sups
-                }
-                # Pack sizes per (supplier_id, ingredient_id) for padding
-                cat_rows = (
+                _active_ing_ids = list(ingredients_data.keys())
+                _all_cat_rows = (
                     session.query(SupplierCatalog)
-                    .filter(SupplierCatalog.supplier_id.in_(sup_ids_needed))
+                    .filter(SupplierCatalog.ingredient_id.in_(_active_ing_ids))
                     .all()
                 )
-                pack_by: Dict[tuple, float] = {
-                    (c.supplier_id, c.ingredient_id): float(c.pack_size or 1.0)
-                    for c in cat_rows
-                }
+                _all_sup_ids = {c.supplier_id for c in _all_cat_rows}
+                _all_sup_rows = (
+                    session.query(Supplier)
+                    .filter(Supplier.id.in_(_all_sup_ids))
+                    .all()
+                )
+                _ing_rows = (
+                    session.query(Ingredient)
+                    .filter(Ingredient.id.in_(_active_ing_ids))
+                    .all()
+                )
+                _ing_name_by_id = {i.id: i.name for i in _ing_rows}
             finally:
                 session.close()
 
-            now_day_i = int(now // SECONDS_PER_DAY)
+            milp_ingredients = [
+                {
+                    "id": iid,
+                    "perishable": 1 if data["shelf_life"] is not None else 0,
+                    "shelf_life_days": data["shelf_life"],
+                    "base_unit": data["candidate"].get("unit", "g"),
+                    "name": _ing_name_by_id.get(iid, str(iid)),
+                }
+                for iid, data in ingredients_data.items()
+            ]
+            milp_catalog = [
+                {
+                    "supplier_id": int(c.supplier_id),
+                    "ingredient_id": int(c.ingredient_id),
+                    "current_price": float(c.current_price or 0.0),
+                    "pack_size": float(c.pack_size or 1.0),
+                    "unit": c.unit or "g",
+                    "availability": c.availability or "in_stock",
+                    "is_default": int(getattr(c, "is_default", 0) or 0),
+                    "discount": (
+                        c.discount
+                        if hasattr(c, "discount") and c.discount
+                        else None
+                    ),
+                }
+                for c in _all_cat_rows
+            ]
+            milp_suppliers = [
+                {
+                    "id": int(s.id),
+                    "name": s.name,
+                    "lead_time_days": float(s.lead_time_days or 1.0),
+                    "reliability_score": float(s.reliability_score or 1.0),
+                    "min_order_value": float(s.min_order_value or 0.0),
+                    "delivery_charge": float(s.delivery_charge or 0.0),
+                    "volume_discount": (
+                        s.volume_discount
+                        if hasattr(s, "volume_discount") and s.volume_discount
+                        else None
+                    ),
+                }
+                for s in _all_sup_rows
+            ]
+            _lead_by_sup = {int(s.id): float(s.lead_time_days or 1.0) for s in _all_sup_rows}
 
-            def _delivery_day(o: Dict) -> int:
-                return int(float(o["delivery_date"]) // SECONDS_PER_DAY)
+            # Robust demand floor: max(transient qty, steady-state baseline).
+            _demand_map: Dict[int, Dict[int, float]] = {}
+            for iid in ingredients_data:
+                _demand_map[iid] = {
+                    d: max(
+                        per_day_demand.get(iid, {}).get(d, 0.0),
+                        per_day_baseline.get(iid, {}).get(d, 0.0),
+                    )
+                    for d in range(n_days)
+                }
 
-            def _goods_value(orders: List[Dict]) -> float:
-                return sum(float(o["unit_price"] or 0.0) * float(o["qty"]) for o in orders)
+            _on_hand_map = {iid: data["on_hand"] for iid, data in ingredients_data.items()}
+            _safety_map = {iid: data["safety_stock"] for iid, data in ingredients_data.items()}
 
-            # Group by (supplier_id, delivery_day)
-            from collections import defaultdict as _dd
-            groups: Dict[tuple, List[Dict]] = _dd(list)
-            for o in new_orders:
-                groups[(o["supplier_id"], _delivery_day(o))].append(o)
+            _solution = _solve_time_phased(
+                n_days=n_days,
+                ingredients=milp_ingredients,
+                catalog=milp_catalog,
+                suppliers=milp_suppliers,
+                demand_by_day=_demand_map,
+                inbound_by_day=inbound_by_day,
+                on_hand=_on_hand_map,
+                safety_stock=_safety_map,
+                params={
+                    "lead_risk_lambda": 0.3,
+                    "spoilage_penalty_multiplier": 2.0,
+                    "slack_penalty": 1000.0,
+                    "reorder_interval_days": config.REORDER_INTERVAL_DAYS,
+                },
+            )
+            plan_method = _solution.method
+            logger.info(
+                "Time-phased plan: method=%s, %d orders, total_cost=%.2f — %s",
+                _solution.method,
+                len(_solution.orders),
+                _solution.total_cost,
+                _solution.rationale,
+            )
 
-            # Sort groups by (supplier_id, delivery_day) for nearest-group search
-            sorted_keys = sorted(groups.keys(), key=lambda k: (k[0], k[1]))
-
-            # --- Merge sub-MOV groups ---
-            for key in list(sorted_keys):
-                if key not in groups:
-                    continue
-                sup_id, day = key
-                meta = sup_meta.get(sup_id, {})
-                mov = meta.get("mov", 0.0)
-                if mov <= 0:
-                    continue
-                grp = groups[key]
-                if _goods_value(grp) >= mov:
-                    continue
-
-                # Find nearest other group for same supplier (earlier preferred, then later)
-                candidates = [
-                    (abs(k[1] - day), k[1] - day, k)
-                    for k in sorted_keys
-                    if k != key and k[0] == sup_id and k in groups
-                ]
-                if not candidates:
-                    continue
-                candidates.sort()
-                _, day_delta, target_key = candidates[0]
-
-                # Shelf-life guard: if we're merging LATER into EARLIER (day_delta < 0 means
-                # target is before us), check each perishable item in grp would still arrive
-                # before it expires from the earlier delivery date.
-                target_day = target_key[1]
-                safe_to_merge = True
-                if target_day < day:  # merging forward (earlier delivery)
-                    earliest_order_shift = day - target_day  # days earlier we'd order
-                    for o in grp:
-                        ing_sl = ingredients_data.get(o["ingredient_id"], {}).get("shelf_life")
-                        if ing_sl is not None:
-                            # The lot would arrive earliest_order_shift days sooner and need
-                            # to survive until the original need day + cover window.
-                            # Reject if shelf_life < earliest_order_shift + 1 day buffer.
-                            if ing_sl < earliest_order_shift + 1:
-                                safe_to_merge = False
-                                break
-
-                if not safe_to_merge:
-                    continue
-
-                # Merge: absorb grp into target group, remove this group
-                groups[target_key].extend(grp)
-                del groups[key]
-
-            # --- Pad groups still below MOV ---
-            for key, grp in groups.items():
-                sup_id, day = key
-                meta = sup_meta.get(sup_id, {})
-                mov = meta.get("mov", 0.0)
-                if mov <= 0:
-                    continue
-                val = _goods_value(grp)
-                if val >= mov:
-                    continue
-
-                # Find best candidate to pad: longest shelf life, not short-shelf perishable
-                pad_candidates = []
-                for o in grp:
-                    ing_sl = ingredients_data.get(o["ingredient_id"], {}).get("shelf_life")
-                    unit_price = float(o["unit_price"] or 0.0)
-                    if unit_price <= 0:
-                        continue
-                    # Prefer non-perishable or long-shelf items; reject shelf < 2 days
-                    if ing_sl is not None and ing_sl < 2:
-                        continue
-                    pad_candidates.append((
-                        -(ing_sl if ing_sl is not None else 99999),  # sort: longer shelf first
-                        o["ingredient_id"],
-                        len(pad_candidates),  # stable tiebreaker; avoids comparing dicts
-                        o,
-                    ))
-
-                if not pad_candidates:
-                    continue  # can't pad safely; leave under MOV (will be flagged in plan)
-
-                pad_candidates.sort()
-                best_o = pad_candidates[0][3]
-                ps = pack_by.get((sup_id, best_o["ingredient_id"]), float(best_o.get("qty") or 1.0))
-                if ps <= 0:
-                    ps = 1.0
-                unit_p = float(best_o["unit_price"] or 0.0)
-                if unit_p <= 0:
-                    continue
-
-                deficit = mov - val
-                extra_packs = math.ceil(deficit / (ps * unit_p))
-                best_o["qty"] = float(best_o["qty"]) + extra_packs * ps
-                best_o["reason"] = best_o.get("reason", "") + " [qty padded to meet MOV]"
-
-            # Flatten back to new_orders preserving insertion order as best we can
-            new_orders = [o for grp in groups.values() for o in grp]
+            # Map PlanSolution.orders → new_orders dict (Phase 3 schema)
+            for _order in _solution.orders:
+                _iid = _order.ingredient_id
+                _s_id = _order.supplier_id
+                _lead = _lead_by_sup.get(_s_id, 1.0)
+                _delivery_sim_s = float(
+                    (now_day + _order.delivery_day) * SECONDS_PER_DAY + DAY_OPEN_OFFSET
+                )
+                _order_sim_s = _delivery_sim_s - _lead * SECONDS_PER_DAY
+                _status = "at_risk" if (_order.at_risk or _order_sim_s < now) else "planned"
+                _covers_until = float(
+                    (
+                        now_day
+                        + _order.delivery_day
+                        + math.ceil(_lead + config.REORDER_INTERVAL_DAYS + 1)
+                    )
+                    * SECONDS_PER_DAY
+                    + DAY_OPEN_OFFSET
+                )
+                new_orders.append({
+                    "ingredient_id": _iid,
+                    "supplier_id": _s_id,
+                    "qty": _order.qty,
+                    "unit": _order.unit,
+                    "unit_price": _order.unit_price,
+                    "order_date": _order_sim_s,
+                    "delivery_date": _delivery_sim_s,
+                    "covers_from": _delivery_sim_s,
+                    "covers_until": _covers_until,
+                    "status": _status,
+                    "reason": _order.reason,
+                })
 
         # ----------------------------------------------------------------
         # Phase 3: Hysteresis + persist
@@ -754,7 +640,11 @@ class InventoryOptimizer(BaseAgent):
                 ing_id = order_data["ingredient_id"]
                 new_delivery = order_data["delivery_date"]
                 new_qty = order_data["qty"]
-                pack_size = ingredients_data[ing_id]["candidate"]["pack_size"]
+                pack_size = (
+                    ingredients_data[ing_id]["candidate"]["pack_size"]
+                    if ing_id in ingredients_data
+                    else 1.0
+                )
 
                 matched = None
                 for ex in existing_by_ingredient.get(ing_id, []):
@@ -812,7 +702,7 @@ class InventoryOptimizer(BaseAgent):
                 created_at=now,
                 horizon_days=horizon_days,
                 items_planned=total_active,
-                method="projection",
+                method=plan_method,
             )
             session.add(run)
             session.flush()
