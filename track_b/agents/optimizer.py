@@ -465,6 +465,8 @@ class InventoryOptimizer(BaseAgent):
         # ----------------------------------------------------------------
         new_orders: List[Dict] = []
         plan_method = "milp"
+        plan_coverage_ok = True
+        plan_total_short = 0.0
 
         # -- Gather full catalog + all suppliers for every active ingredient --
         if ingredients_data:
@@ -552,6 +554,9 @@ class InventoryOptimizer(BaseAgent):
 
             _on_hand_map = {iid: data["on_hand"] for iid, data in ingredients_data.items()}
             _safety_map = {iid: data["safety_stock"] for iid, data in ingredients_data.items()}
+            # A9: pass dated opening lots so the solver's expiry model uses real
+            # lot expiries (fresh-initial) rather than a single never-expiring lot.
+            _lots_map = {iid: data["lots"] for iid, data in ingredients_data.items()}
 
             _solution = _solve_time_phased(
                 n_days=n_days,
@@ -566,17 +571,29 @@ class InventoryOptimizer(BaseAgent):
                     "lead_risk_lambda": 0.3,
                     "spoilage_penalty_multiplier": 2.0,
                     "slack_penalty": 1000.0,
+                    "safety_penalty_multiplier": 1.5,
                     "reorder_interval_days": config.REORDER_INTERVAL_DAYS,
+                    "lots_by_ing": _lots_map,
                 },
             )
             plan_method = _solution.method
+            plan_coverage_ok = bool(getattr(_solution, "coverage_ok", True))
+            plan_total_short = float(getattr(_solution, "total_short", 0.0))
             logger.info(
-                "Time-phased plan: method=%s, %d orders, total_cost=%.2f — %s",
+                "Time-phased plan: method=%s, %d orders, total_cost=%.2f, "
+                "coverage_ok=%s, total_short=%.1f — %s",
                 _solution.method,
                 len(_solution.orders),
                 _solution.total_cost,
+                plan_coverage_ok,
+                plan_total_short,
                 _solution.rationale,
             )
+            if not plan_coverage_ok:
+                logger.warning(
+                    "Procurement plan leaves %.0f base units of forecasted demand "
+                    "UNCOVERABLE (lead-time / supply infeasible).", plan_total_short,
+                )
 
             # Map PlanSolution.orders → new_orders dict (Phase 3 schema)
             for _order in _solution.orders:
@@ -703,6 +720,8 @@ class InventoryOptimizer(BaseAgent):
                 horizon_days=horizon_days,
                 items_planned=total_active,
                 method=plan_method,
+                coverage_ok=1 if plan_coverage_ok else 0,
+                total_short=plan_total_short,
             )
             session.add(run)
             session.flush()
@@ -792,6 +811,9 @@ class InventoryOptimizer(BaseAgent):
             groups[(po_data["supplier_id"], delivery_day)].append(po_data)
 
         count = 0
+        # Planned rows whose need is already fully covered by an in-flight PO —
+        # marked 'superseded' so they never linger as zombie at_risk duplicates.
+        resolved_ids: List[int] = []
         for (supplier_id, _delivery_day), group in groups.items():
             # A5: For each ingredient, compute in-flight qty and only place the shortfall.
             lines = []
@@ -814,6 +836,9 @@ class InventoryOptimizer(BaseAgent):
                 inbound_qty = float(inbound_qty_row or 0.0)
                 shortfall = float(po_data["qty"] or 0.0) - inbound_qty
                 if shortfall <= 0:
+                    # Already covered by an in-flight PO — resolve this planned row
+                    # instead of leaving it dangling (was: silent `continue` → zombie).
+                    resolved_ids.append(po_data["id"])
                     continue
 
                 # Fall back to catalog for unit / price if the PlannedOrder row lacks them.
@@ -886,6 +911,19 @@ class InventoryOptimizer(BaseAgent):
                     session4.close()
 
             count += 1  # one PO created per supplier-day group
+
+        # Resolve planned rows already covered by in-flight POs (no zombie duplicates).
+        for row_id in resolved_ids:
+            session5 = self.db_session_factory()
+            try:
+                row = session5.get(PlannedOrder, row_id)
+                if row and row.status in ("planned", "at_risk"):
+                    row.status = "superseded"
+                    session5.commit()
+            except Exception:  # noqa: BLE001
+                session5.rollback()
+            finally:
+                session5.close()
 
         return count
 

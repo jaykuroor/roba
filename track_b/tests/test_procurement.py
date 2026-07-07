@@ -4,7 +4,7 @@ placed -> delivered -> receive."""
 import pytest
 
 from core import config
-from core.models import PurchaseOrder, PurchaseOrderLine, Supplier
+from core.models import PurchaseOrder, PurchaseOrderLine, Supplier, SupplierCatalog
 from core.orchestrator import Orchestrator
 from core.signals import SignalType
 from track_b.procurement.procurement import Procurement
@@ -143,3 +143,48 @@ def test_place_after_approval_then_delivery_calls_ledger(bus, session_factory, o
     finally:
         session.close()
     assert ledger.received == [po.id]
+
+
+def _seed_supplier_with_discounts(session_factory):
+    """Supplier with a volume discount + a catalog row with a per-item qty discount."""
+    session = session_factory()
+    try:
+        sup = Supplier(
+            name="DiscountCo", lead_time_days=1.0, reliability_score=0.9,
+            min_order_value=0.0, contact="", delivery_charge=0.0,
+            volume_discount=[{"min_value": 100.0, "discount_pct": 10}],
+        )
+        session.add(sup)
+        session.flush()
+        session.add(SupplierCatalog(
+            supplier_id=sup.id, ingredient_id=1, current_price=1.0, unit="g",
+            pack_size=1.0, availability="in_stock", is_default=1,
+            discount=[{"min_qty": 50.0, "unit_price": 0.8}],
+        ))
+        session.commit()
+        return sup.id
+    finally:
+        session.close()
+
+
+def test_po_total_reflects_item_and_volume_discounts(bus, session_factory, orchestrator):
+    """create_po stores the true landed cost: per-item qty discount then the
+    supplier volume discount are both applied to total_cost (was: ignored)."""
+    supplier_id = _seed_supplier_with_discounts(session_factory)
+    proc = Procurement(bus, session_factory, orchestrator, _FakeLedger(),
+                       approvals=_FakeApprovals())
+    bus.sim_time = 0.0
+    # qty 200 @ 1.0 base. per-item: 200 >= 50 -> price 0.8 -> subtotal 160.
+    # volume: 160 >= 100 -> 10% off -> 144.  No delivery charge.
+    po = proc.create_po(
+        supplier_id=supplier_id,
+        lines=[{"ingredient_id": 1, "qty": 200.0, "unit": "g", "unit_price": 1.0}],
+    )
+    session = session_factory()
+    try:
+        row = session.get(PurchaseOrder, po.id)
+        assert row.total_cost == pytest.approx(144.0), (
+            f"Expected discounted total 144.0, got {row.total_cost}"
+        )
+    finally:
+        session.close()

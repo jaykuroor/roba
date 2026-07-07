@@ -227,31 +227,150 @@ def test_volume_discount_captured():
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Perishable cap — delivery ≤ consumable-before-expiry demand
+# Coverage helper: expiry-aware, lot-based day-by-day stockout check
 # ---------------------------------------------------------------------------
 
-def test_perishable_cap():
-    """Each delivery for a perishable should not exceed consumable-before-expiry demand."""
+def _stockout_days(sol, ing, demand_by_day, on_hand, n_days, inbound=None):
+    """Return [(day, short_qty), ...] where forecasted demand can't be met.
+
+    Mirrors the solver's opening-stock assumption (on_hand is a single
+    never-expiring lot; new deliveries expire at delivery_day + shelf_life).
+    """
+    inbound = inbound or {}
+    iid = int(ing["id"])
+    shelf = float(ing["shelf_life_days"]) if ing.get("perishable") and ing.get("shelf_life_days") else None
+    NEVER = 10 ** 9
+    lots = [[float(on_hand.get(iid, 0.0)), NEVER]]
+    by_day = {}
+    for o in sol.orders:
+        if o.ingredient_id == iid and o.qty > 0:
+            by_day[o.delivery_day] = by_day.get(o.delivery_day, 0.0) + o.qty
+    for d, q in (inbound.get(iid, {}) or {}).items():
+        by_day[d] = by_day.get(d, 0.0) + q
+    short = []
+    for d in range(n_days):
+        if by_day.get(d, 0.0) > 0:
+            lots.append([by_day[d], d + shelf if shelf else NEVER])
+        lots = [l for l in lots if l[1] > d]
+        lots.sort(key=lambda l: l[1])
+        rem = demand_by_day.get(iid, {}).get(d, 0.0)
+        for l in lots:
+            t = min(l[0], rem)
+            l[0] -= t
+            rem -= t
+            if rem <= 1e-9:
+                break
+        lots = [l for l in lots if l[0] > 1e-9]
+        if rem > 1e-6:
+            short.append((d, round(rem, 2)))
+    return short
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Perishable — demand covered every day with no spurious waste
+# ---------------------------------------------------------------------------
+
+def test_perishable_covered_no_waste():
+    """A perishable's forecasted demand is met every feasible day, and the plan
+    does not over-order (total ordered ≈ demand net of on-hand).
+
+    (Replaces the old ``test_perishable_cap`` which asserted the *buggy*
+    per-order-quantity ceiling that silently dropped ingredients whose pack
+    exceeded the shrinking before-expiry window — the exact Caesar bug.)
+    """
     n = 7
     shelf_life = 3  # 3-day shelf life
     daily_demand = 200.0
+    ing = _ing(1, perishable=1, shelf_life=float(shelf_life))
+    demand = {1: {d: daily_demand for d in range(n)}}
+    # Opening stock covers day 0 (not lead-feasible with lead=1); orders cover 1..6.
+    on_hand = {1: daily_demand}
     sol = _run(
-        ingredients=[_ing(1, perishable=1, shelf_life=float(shelf_life))],
+        ingredients=[ing],
         catalog=[_cat(1, 1, price=0.01, pack=100.0)],
         suppliers=[_sup(1, lead=1.0)],
-        demand_by_day={1: {d: daily_demand for d in range(n)}},
-        on_hand={1: 0.0},
+        demand_by_day=demand,
+        on_hand=on_hand,
         safety_stock={1: 0.0},
         n_days=n,
     )
     assert sol.orders, "Expected orders for perishable"
-    for o in sol.orders:
-        # Max consumable from delivery day d to d+shelf_life-1
-        max_can_consume = daily_demand * shelf_life
-        assert o.qty <= max_can_consume + 1e-6, (
-            f"Delivery of {o.qty}g on day {o.delivery_day} exceeds "
-            f"consumable-before-expiry ({max_can_consume}g)"
-        )
+    assert sol.coverage_ok, f"Perishable demand should be fully coverable (short={sol.total_short})"
+    assert not _stockout_days(sol, ing, demand, on_hand, n), "No day should stock out"
+    # No gross over-ordering: total ordered within one pack of covered demand.
+    total_ordered = sum(o.qty for o in sol.orders)
+    covered_demand = daily_demand * (n - 1)  # day 0 served from opening stock
+    assert total_ordered <= covered_demand + 100.0 + 1e-6, (
+        f"Over-ordered perishable: {total_ordered} vs covered demand {covered_demand}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 5b: Regression — pack larger than any before-expiry window is orderable
+# ---------------------------------------------------------------------------
+
+def test_large_pack_perishable_is_ordered():
+    """The Caesar-Dressing bug: a long-ish shelf-life item whose pack size
+    exceeds the remaining before-expiry demand on *every* feasible delivery day
+    must still be ordered (the old per-order expiry cap made it infeasible, so
+    it was silently dropped onto slack and never appeared in the plan).
+    """
+    n = 7
+    lead = 3           # deliveries only on days 3..6
+    pack = 2000.0      # one pack > any single feasible-day window remaining
+    daily = 460.0      # window remaining on days 3..6 is < 2000
+    ing = _ing(11, perishable=1, shelf_life=30.0, name="Caesar Dressing")
+    demand = {11: {d: daily for d in range(n)}}
+    on_hand = {11: 3.0 * daily}  # covers only the first ~3 days
+    sol = _run(
+        ingredients=[ing],
+        catalog=[_cat(11, 11, price=0.009, pack=pack)],  # cat(sup, ing,...)
+        suppliers=[_sup(11, lead=float(lead))],
+        demand_by_day=demand,
+        on_hand=on_hand,
+        safety_stock={11: 0.0},
+        n_days=n,
+    )
+    ordered = [o for o in sol.orders if o.ingredient_id == 11 and o.qty > 0]
+    assert ordered, "Large-pack perishable must be ordered, not silently dropped"
+    assert sol.coverage_ok, f"Expected full coverage, got total_short={sol.total_short}"
+    late = [(d, q) for d, q in _stockout_days(sol, ing, demand, on_hand, n) if d >= lead]
+    assert not late, f"Stockout on lead-feasible days despite orders: {late}"
+
+
+# ---------------------------------------------------------------------------
+# Test 5c: Short-shelf item gets a fresh late-week re-delivery
+# ---------------------------------------------------------------------------
+
+def test_short_shelf_schedules_late_redelivery():
+    """A short-shelf perishable (Basil-like) can't be covered by one early bulk
+    delivery — the plan must schedule a second, fresh delivery later in the week
+    so end-of-horizon demand is met without relying on expired stock.
+    """
+    n = 7
+    shelf_life = 4
+    daily = 185.0
+    ing = _ing(4, perishable=1, shelf_life=float(shelf_life), name="Basil")
+    demand = {4: {d: daily for d in range(n)}}
+    on_hand = {4: 200.0}
+    sol = _run(
+        ingredients=[ing],
+        catalog=[_cat(4, 4, price=0.03, pack=500.0)],
+        suppliers=[_sup(4, lead=1.0)],
+        demand_by_day=demand,
+        on_hand=on_hand,
+        safety_stock={4: 0.0},
+        n_days=n,
+    )
+    ordered = [o for o in sol.orders if o.ingredient_id == 4 and o.qty > 0]
+    assert ordered, "Expected orders for short-shelf perishable"
+    assert sol.coverage_ok, f"Expected full coverage, got total_short={sol.total_short}"
+    delivery_days = {o.delivery_day for o in ordered}
+    assert len(delivery_days) >= 2, (
+        f"Short-shelf item needs staggered re-deliveries; got days {delivery_days}"
+    )
+    late = [(d, q) for d, q in _stockout_days(sol, ing, demand, on_hand, n) if d >= 1]
+    assert not late, f"Stockout despite staggered deliveries: {late}"
 
 
 # ---------------------------------------------------------------------------

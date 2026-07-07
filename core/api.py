@@ -2825,6 +2825,8 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
     return {
         "plan_run_id": latest_run.id if latest_run else None,
         "generated_at": float(latest_run.created_at) if latest_run else 0.0,
+        "coverage_ok": bool(getattr(latest_run, "coverage_ok", 1)) if latest_run else True,
+        "total_short": float(getattr(latest_run, "total_short", 0.0) or 0.0) if latest_run else 0.0,
         "items": result,
     }
 

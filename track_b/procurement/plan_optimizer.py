@@ -14,6 +14,20 @@ The MILP jointly decides:
     charge per supplier-day),
   * whether volume-discount thresholds are crossed.
 
+Perishability is modelled as a *held-inventory* cap (standard perishable
+lot-sizing): the stock on hand at the end of each day may not exceed what
+arrived within the ingredient's shelf life plus the still-fresh opening stock.
+Excess is disposed via a penalised ``waste`` variable.  This never forbids
+ordering a whole pack (the old per-order expiry cap did, silently dropping
+ingredients whose pack exceeded the shrinking before-expiry window), and it
+naturally schedules a fresh late-week delivery for short-shelf items.
+
+Coverage is two-tier: forecasted demand is a hard requirement (heavily
+penalised ``demand_short``) while ``safety_stock`` is a soft buffer topped up
+only when cheap (lightly, value-scaled ``safety_short``).  Any demand that is
+physically impossible to cover (early days before any delivery can arrive, or
+all suppliers out) is surfaced as ``at_risk`` — never hidden.
+
 This eliminates the fragmented per-ingredient-per-day POs produced by the
 old greedy path, naturally consolidates across days (delivery charges drive
 fewer supplier-day openings), satisfies MOV as a hard constraint (never needs
@@ -35,6 +49,9 @@ try:
 except ImportError:
     _PULP_AVAILABLE = False
     logger.warning("PuLP not available; plan optimizer will use greedy fallback.")
+
+
+_INF_DAY = 10 ** 9  # sentinel expiry-day offset for "never expires"
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +78,8 @@ class PlanSolution:
     total_cost: float = 0.0
     method: str = "greedy"    # "milp" | "greedy"
     rationale: str = ""
+    total_short: float = 0.0  # total un-coverable forecasted demand (base units)
+    coverage_ok: bool = True  # False when any forecasted demand is left uncovered
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +117,13 @@ def solve_time_phased_plan(
     ``params``         -- optional overrides:
                             lead_risk_lambda (default 0.3)
                             spoilage_penalty_multiplier (default 2.0)
-                            slack_penalty (default 1000.0)
+                            slack_penalty (default 1000.0)          -- demand
+                            safety_penalty_multiplier (default 1.5) -- soft buffer
+                            lots_by_ing: {ing_id: [[qty, exp_day_offset], ...]}
+                              dated opening lots for expiry-aware fresh stock;
+                              exp_day_offset counts days from now (>= n_days or
+                              missing => never expires within horizon).  Absent
+                              => a single never-expiring lot equal to on_hand.
     """
     p = params or {}
     if _PULP_AVAILABLE:
@@ -152,7 +177,9 @@ def _solve_milp(
 
     lead_risk_lambda = float(params.get("lead_risk_lambda", 0.3))
     spoil_pen_mult = float(params.get("spoilage_penalty_multiplier", 2.0))
-    slack_penalty = float(params.get("slack_penalty", 1000.0))
+    slack_penalty = float(params.get("slack_penalty", 1000.0))            # demand (hard)
+    safety_pen_mult = float(params.get("safety_penalty_multiplier", 1.5))  # buffer (soft)
+    lots_by_ing: Dict[int, List[List[float]]] = params.get("lots_by_ing") or {}
 
     ing_by_id: Dict[int, Dict] = {int(i["id"]): i for i in ingredients}
     sup_by_id: Dict[int, Dict] = {int(s["id"]): s for s in suppliers}
@@ -184,9 +211,36 @@ def _solve_milp(
         return PlanSolution(orders=[], total_cost=0.0, method="milp",
                             rationale="No active ingredients require ordering.")
 
-    # For each active ingredient, which suppliers are available on which days?
-    # (i, s, d) exists only when d >= lead_ceil[s] (order placed at/after now)
     all_sup_ids = list({int(s["id"]) for s in suppliers})
+
+    # Cheapest available unit price per ingredient — used to value-scale the
+    # soft safety-buffer and waste penalties (so they never justify a dedicated
+    # delivery just to top up a buffer, but are filled when piggybacking).
+    ref_price: Dict[int, float] = {}
+    for iid in active_ids:
+        prices = [
+            float(cat_by_is[(iid, s_id)].get("current_price") or 0.0)
+            for s_id in all_sup_ids
+            if (iid, s_id) in cat_by_is
+        ]
+        ref_price[iid] = min(prices) if prices else 0.0
+
+    # Opening fresh stock: fresh_initial[iid][d] = opening lot qty still unexpired
+    # at end of day d.  Falls back to a single never-expiring lot == on_hand.
+    def _lots_for(iid: int) -> List[List[float]]:
+        raw = lots_by_ing.get(iid)
+        if raw:
+            return [[float(qq), float(ee)] for qq, ee in raw]
+        return [[float(on_hand.get(iid, 0.0)), float(_INF_DAY)]]
+
+    fresh_initial: Dict[int, Dict[int, float]] = {}
+    initial_total: Dict[int, float] = {}
+    for iid in active_ids:
+        lots = _lots_for(iid)
+        initial_total[iid] = sum(qq for qq, _ in lots)
+        fresh_initial[iid] = {
+            d: sum(qq for qq, ee in lots if ee > d) for d in range(n_days)
+        }
 
     # Big-M for linking constraints (in base units)
     max_demand = max(
@@ -205,8 +259,14 @@ def _solve_milp(
     q: Dict[Tuple[int, int, int], Any] = {}
     # deliver[s,d] = 1 iff we place an order with supplier s on day d
     deliver: Dict[Tuple[int, int], Any] = {}
-    # slack[i,d] = safety-stock shortfall on day d for ingredient i (penalty)
-    slack: Dict[Tuple[int, int], Any] = {}
+    # inv[i,d] = stock on hand at end of day d (>= 0)
+    inv: Dict[Tuple[int, int], Any] = {}
+    # demand_short[i,d] = uncovered forecasted demand on day d (hard penalty)
+    demand_short: Dict[Tuple[int, int], Any] = {}
+    # safety_short[i,d] = un-topped-up safety buffer on day d (soft penalty)
+    safety_short: Dict[Tuple[int, int], Any] = {}
+    # waste[i,d] = stock disposed on day d (perishables; keeps held-stock fresh)
+    waste: Dict[Tuple[int, int], Any] = {}
     # volume-discount tier binaries per supplier-day
     vol_tier: Dict[Tuple[int, int, int], Any] = {}
     # per-item qty-discount binaries and discount qty
@@ -215,7 +275,14 @@ def _solve_milp(
 
     for iid in active_ids:
         for d in range(n_days):
-            slack[iid, d] = pulp.LpVariable(f"slack_{iid}_{d}", lowBound=0, cat="Continuous")
+            inv[iid, d] = pulp.LpVariable(f"inv_{iid}_{d}", lowBound=0, cat="Continuous")
+            demand_short[iid, d] = pulp.LpVariable(
+                f"dshort_{iid}_{d}", lowBound=0, cat="Continuous"
+            )
+            safety_short[iid, d] = pulp.LpVariable(
+                f"sshort_{iid}_{d}", lowBound=0, cat="Continuous"
+            )
+            waste[iid, d] = pulp.LpVariable(f"waste_{iid}_{d}", lowBound=0, cat="Continuous")
 
     for s_id in all_sup_ids:
         ld = lead_ceil[s_id]
@@ -232,10 +299,7 @@ def _solve_milp(
         for s_id in all_sup_ids:
             if (iid, s_id) not in cat_by_is:
                 continue
-            c = cat_by_is[iid, s_id]
-            pack_size = float(c.get("pack_size") or 1.0)
             ld = lead_ceil[s_id]
-            disc_tiers = c.get("discount") or []
             for d in range(ld, n_days):
                 q[iid, s_id, d] = pulp.LpVariable(
                     f"q_{iid}_{s_id}_{d}", lowBound=0, cat="Integer"
@@ -247,15 +311,23 @@ def _solve_milp(
                     f"xdisc_{iid}_{s_id}_{d}", lowBound=0, cat="Continuous"
                 )
 
-    # Derived: actual quantity in base units
+    # Derived: actual quantity in base units delivered for (i, s, d)
     def _x(iid: int, s_id: int, d: int) -> Any:
-        """Quantity of ingredient iid from supplier s_id on day d."""
         key = (iid, s_id, d)
         if key not in q:
             return 0.0
         c = cat_by_is.get((iid, s_id), {})
         pack_size = float(c.get("pack_size") or 1.0)
         return q[key] * pack_size
+
+    # Arrivals of ingredient i on day d (new orders + in-flight inbound).
+    def _arrivals(iid: int, d: int) -> Any:
+        terms = [
+            _x(iid, s_id, d)
+            for s_id in all_sup_ids
+            if (iid, s_id, d) in q
+        ]
+        return pulp.lpSum(terms) + inbound_by_day.get(iid, {}).get(d, 0.0)
 
     # ------------------------------------------------------------------
     # Objective
@@ -264,8 +336,8 @@ def _solve_milp(
 
     for iid in active_ids:
         ing = ing_by_id.get(iid, {})
-        shelf_life = float(ing.get("shelf_life_days") or 0.0)
         perishable = bool(ing.get("perishable"))
+        p_ref = ref_price.get(iid, 0.0)
 
         for s_id in all_sup_ids:
             if (iid, s_id) not in cat_by_is:
@@ -273,7 +345,6 @@ def _solve_milp(
             c = cat_by_is[iid, s_id]
             sup = sup_by_id.get(s_id, {})
             p = float(c.get("current_price") or 0.0)
-            pack_size = float(c.get("pack_size") or 1.0)
             lead = float(sup.get("lead_time_days") or 1.0)
             reliability = float(sup.get("reliability_score") or 1.0)
             risk_coeff = lead_risk_lambda * lead * (1.0 - reliability)
@@ -292,17 +363,6 @@ def _solve_milp(
                 if risk_coeff > 0:
                     obj_terms.append(risk_coeff * x_var)
 
-                # (4) Spoilage penalty for perishables
-                if perishable and 0 < shelf_life < n_days:
-                    # consumable-before-expiry demand from delivery day d
-                    dbe = sum(
-                        demand_by_day.get(iid, {}).get(dd, 0.0)
-                        for dd in range(d, min(n_days, d + math.ceil(shelf_life)))
-                    )
-                    # spoilage excess = max(0, ordered - can-consume)
-                    # we approximate by penalising the slack; excess ordering
-                    # is also discouraged by the expiry cap constraint below.
-
                 # (6) Per-item quantity-discount savings
                 if disc_tiers:
                     tier = disc_tiers[0]
@@ -310,9 +370,16 @@ def _solve_milp(
                     if disc_p < p:
                         obj_terms.append(-(p - disc_p) * x_disc.get((iid, s_id, d), 0.0))
 
-        # Slack penalty
+        # Coverage penalties + spoilage
         for d in range(n_days):
-            obj_terms.append(slack_penalty * slack[iid, d])
+            # (3a) Hard demand-coverage shortfall — dominates all cost terms.
+            obj_terms.append(slack_penalty * demand_short[iid, d])
+            # (3b) Soft safety-buffer shortfall — value-scaled so it is filled
+            #      opportunistically but never justifies a dedicated delivery.
+            obj_terms.append(safety_pen_mult * max(p_ref, 1e-6) * safety_short[iid, d])
+            # (4) Spoilage / waste penalty (perishables carry real waste vars).
+            if perishable:
+                obj_terms.append(spoil_pen_mult * max(p_ref, 1e-6) * waste[iid, d])
 
     # (2) Delivery charges — one per supplier-day
     for s_id in all_sup_ids:
@@ -364,65 +431,51 @@ def _solve_milp(
     # Constraints
     # ------------------------------------------------------------------
 
-    # Inventory balance + coverage
+    # Inventory balance + coverage + perishable held-stock cap
     for iid in active_ids:
         ing = ing_by_id.get(iid, {})
         shelf_life = float(ing.get("shelf_life_days") or 0.0)
-        perishable = bool(ing.get("perishable"))
+        perishable = bool(ing.get("perishable")) and shelf_life > 0
+        sl = math.ceil(shelf_life) if perishable else 0
         ss = float(safety_stock.get(iid, 0.0))
-
-        inv_prev = float(on_hand.get(iid, 0.0))
-        # For perishables: only count on-hand that won't expire before it's used.
-        # Simple approximation: cap on-hand to demand consumable within shelf_life days.
-        if perishable and shelf_life > 0:
-            consumable_now = sum(
-                demand_by_day.get(iid, {}).get(d, 0.0)
-                for d in range(min(n_days, math.ceil(shelf_life)))
-            )
-            inv_prev = min(inv_prev, consumable_now)
 
         for d in range(n_days):
             demand_d = demand_by_day.get(iid, {}).get(d, 0.0)
-            inbound_d = inbound_by_day.get(iid, {}).get(d, 0.0)
+            prev = initial_total[iid] if d == 0 else inv[iid, d - 1]
 
-            # Sum of orders delivered on day d across all suppliers
-            new_delivery = pulp.lpSum(
-                _x(iid, s_id, d)
-                for s_id in all_sup_ids
-                if (iid, s_id, d) in q
+            # Stock balance:
+            #   inv[d] = prev + arrivals[d] - demand[d] - waste[d] + demand_short[d]
+            # demand_short bumps inv to >= 0 when demand cannot be met (lost
+            # sales — backlog is not carried).  waste disposes aged stock.
+            prob += (
+                inv[iid, d]
+                == prev + _arrivals(iid, d) - demand_d - waste[iid, d] + demand_short[iid, d],
+                f"inv_bal_{iid}_{d}",
             )
 
-            # inv[d] = inv[d-1] + inbound_d + new_delivery - demand_d
-            # We track the balance via a flowing constraint
-            if d == 0:
-                inv_d_expr = inv_prev + inbound_d + new_delivery - demand_d
-            else:
-                # inv_prev here is updated below for each day via auxiliary var
-                inv_d_expr = inv_prev_var + inbound_d + new_delivery - demand_d  # type: ignore[used-before-def]  # noqa: F821
-
-            # Coverage: inv[d] + slack[d] >= safety_stock  (last day: relax to 0)
+            # Soft safety-buffer target (relaxed to 0 on the last horizon day).
             target_ss = ss if d < n_days - 1 else 0.0
-            prob += inv_d_expr + slack[iid, d] >= target_ss, f"cov_{iid}_{d}"
+            prob += (
+                inv[iid, d] + safety_short[iid, d] >= target_ss,
+                f"cov_{iid}_{d}",
+            )
 
-            # Non-negative inventory (stock can't go negative)
-            prob += inv_d_expr + slack[iid, d] >= 0, f"nonneg_{iid}_{d}"
-
-            # Expiry cap: don't order more than can be consumed before expiry
-            if perishable and shelf_life > 0:
-                for s_id in all_sup_ids:
-                    if (iid, s_id, d) not in q:
-                        continue
-                    cap_demand = sum(
-                        demand_by_day.get(iid, {}).get(dd, 0.0)
-                        for dd in range(d, min(n_days, d + math.ceil(shelf_life)))
-                    )
-                    if cap_demand > 0:
-                        prob += _x(iid, s_id, d) <= cap_demand, f"expiry_cap_{iid}_{s_id}_{d}"
-
-            # Advance inv_prev for next iteration using an auxiliary variable
-            inv_prev_var = pulp.LpVariable(f"inv_{iid}_{d}", lowBound=0, cat="Continuous")
-            prob += inv_prev_var == inv_d_expr + slack[iid, d], f"inv_bal_{iid}_{d}"
-            inv_prev = 0  # will be overridden by inv_prev_var on next iteration
+            if perishable:
+                # Held-stock expiry cap: what is on hand at end of day d cannot
+                # exceed stock that arrived within the last `sl` days plus the
+                # opening stock still unexpired at day d.  This never blocks
+                # ordering a whole pack; it just forces disposal of aged stock.
+                window_arrivals = pulp.lpSum(
+                    _arrivals(iid, dd)
+                    for dd in range(max(0, d - sl + 1), d + 1)
+                )
+                prob += (
+                    inv[iid, d] <= window_arrivals + fresh_initial[iid].get(d, 0.0),
+                    f"expiry_hold_{iid}_{d}",
+                )
+            else:
+                # Non-perishables never spoil.
+                prob += waste[iid, d] == 0, f"no_waste_{iid}_{d}"
 
     # Link q → deliver: can only order on an open delivery day
     for iid in active_ids:
@@ -510,6 +563,22 @@ def _solve_milp(
     orders: List[PlanOrder] = []
     total_cost = 0.0
 
+    # Per-ingredient hard shortfall (uncoverable forecasted demand).
+    short_by_ing: Dict[int, float] = {}
+    short_days_by_ing: Dict[int, List[int]] = {}
+    for iid in active_ids:
+        days = []
+        tot = 0.0
+        for d in range(n_days):
+            v = pulp.value(demand_short.get((iid, d))) or 0.0
+            if v > 0.5:
+                tot += v
+                days.append(d)
+        short_by_ing[iid] = tot
+        short_days_by_ing[iid] = days
+    total_short = sum(short_by_ing.values())
+
+    ordered_ings: set = set()
     for iid in active_ids:
         ing = ing_by_id.get(iid, {})
         unit = ing.get("base_unit", "g")
@@ -527,13 +596,9 @@ def _solve_milp(
                 if q_val is None or q_val < 0.5:
                     continue
                 qty = round(q_val) * pack_size
-                # Mark at_risk if there is any uncovered safety-stock shortfall
-                # either BEFORE this delivery arrives (early demand that can't be
-                # filled in time) or on the delivery day itself.
-                at_risk = any(
-                    (pulp.value(slack.get((iid, dd), 0.0)) or 0.0) > 0.5
-                    for dd in range(0, d + 1)
-                )
+                # at_risk if a hard demand shortfall exists on/before this
+                # delivery day (early demand that cannot be filled in time).
+                at_risk = any(dd <= d for dd in short_days_by_ing.get(iid, []))
                 reason = (
                     f"MILP: {ing.get('name', iid)} from supplier {s_id} "
                     f"on day {d} qty={qty:.0f}"
@@ -549,6 +614,41 @@ def _solve_milp(
                     reason=reason,
                 ))
                 total_cost += qty * p
+                ordered_ings.add(iid)
+
+    # Never drop an ingredient silently: any ingredient with uncoverable
+    # forecasted demand but no order line gets an explicit at_risk marker.
+    for iid in active_ids:
+        if short_by_ing.get(iid, 0.0) <= 1.0 or iid in ordered_ings:
+            continue
+        ing = ing_by_id.get(iid, {})
+        unit = ing.get("base_unit", "g")
+        # Pick the cheapest catalog supplier (for context) even if unusable.
+        cand: Optional[Tuple[int, float]] = None
+        for s_id in all_sup_ids:
+            if (iid, s_id) in cat_by_is:
+                pr = float(cat_by_is[(iid, s_id)].get("current_price") or 0.0)
+                if cand is None or pr < cand[1]:
+                    cand = (s_id, pr)
+        s_id = cand[0] if cand else 0
+        price = cand[1] if cand else 0.0
+        ld = lead_ceil.get(s_id, 1)
+        days = short_days_by_ing.get(iid, [])
+        deliver_day = min(max(ld, min(days) if days else 0), n_days - 1)
+        orders.append(PlanOrder(
+            ingredient_id=iid,
+            supplier_id=s_id,
+            delivery_day=deliver_day,
+            qty=0.0,
+            unit_price=price,
+            unit=unit,
+            at_risk=True,
+            reason=(
+                f"uncovered: {ing.get('name', iid)} short "
+                f"{short_by_ing.get(iid, 0.0):.0f}{unit} on day(s) "
+                f"{','.join(str(x) for x in days)} — no lead-feasible / in-stock supply"
+            ),
+        ))
 
     # Add delivery charges to total_cost
     for s_id in all_sup_ids:
@@ -562,13 +662,18 @@ def _solve_milp(
             if dv is not None and dv > 0.5:
                 total_cost += dc
 
+    coverage_ok = total_short <= 1.0
     return PlanSolution(
         orders=orders,
         total_cost=total_cost,
         method="milp",
+        total_short=total_short,
+        coverage_ok=coverage_ok,
         rationale=(
             f"Time-phased MILP: {len(orders)} order lines across "
-            f"{len({(o.supplier_id, o.delivery_day) for o in orders})} supplier-days."
+            f"{len({(o.supplier_id, o.delivery_day) for o in orders if o.qty > 0})} "
+            f"supplier-days."
+            + ("" if coverage_ok else f" COVERAGE GAP: {total_short:.0f} base units uncoverable.")
         ),
     )
 

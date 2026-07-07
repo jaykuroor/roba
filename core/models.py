@@ -1208,10 +1208,13 @@ class ProcurementPlanRun(Base):
     horizon_days = mapped_column(Float)
     items_planned = mapped_column(Integer)
     method = mapped_column(String)         # "projection"
+    coverage_ok = mapped_column(Integer, default=1)      # 0 => a forecasted-demand gap exists
+    total_short = mapped_column(Float, default=0.0)      # un-coverable forecasted demand (base units)
 
     def __repr__(self):
         return (f"<ProcurementPlanRun id={self.id} horizon_days={self.horizon_days} "
-                f"items_planned={self.items_planned} method={self.method!r}>")
+                f"items_planned={self.items_planned} method={self.method!r} "
+                f"coverage_ok={self.coverage_ok}>")
 
 
 class PlannedOrder(Base):

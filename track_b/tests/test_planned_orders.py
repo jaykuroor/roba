@@ -389,16 +389,19 @@ def test_at_risk_when_order_date_in_past(bus, session_factory):
     # Short lead (1 day) but we're already 5 days in with no stock → many orders will be at_risk.
     _seed_supplier(session_factory, ing_id, lead_time_days=1.0, pack_size=10.0)
 
-    # Emit horizon with demand starting from day 0 (all before day 5 = at_risk).
+    # Emit horizon with demand from offset day 0 (day_index is 0-relative to now).
+    # With on_hand=0 and lead=1, offset-day-0 demand cannot be delivered in time
+    # → a genuine demand shortfall → at_risk (an unmet *safety* buffer alone is
+    # the soft target and is intentionally NOT flagged at_risk).
     now_day = int(bus.sim_time // SECONDS_PER_DAY)  # 5
     day_entries = [
         {
             "day_index": d,
-            "start": float(d * SECONDS_PER_DAY),
-            "end": float((d + 1) * SECONDS_PER_DAY),
+            "start": float((now_day + d) * SECONDS_PER_DAY),
+            "end": float((now_day + d + 1) * SECONDS_PER_DAY),
             "items": [{"menu_item_id": item_id, "qty": 1.0, "baseline": 1.0}],
         }
-        for d in range(now_day, now_day + 14)
+        for d in range(14)
     ]
     bus.emit(
         type=SignalType.DEMAND_FORECAST_HORIZON,

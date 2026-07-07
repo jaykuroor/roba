@@ -112,6 +112,9 @@ def _ensure_columns() -> None:
         # SupplierTerm columns (added with robust-capture workstream)
         ("supplier_terms",  "unit_basis",              "TEXT"),
         ("supplier_terms",  "manager_change_id",       "INTEGER"),
+        # Procurement plan coverage status (added with least-cost/no-stockout fix)
+        ("procurement_plan_runs", "coverage_ok",       "INTEGER DEFAULT 1"),
+        ("procurement_plan_runs", "total_short",       "REAL DEFAULT 0.0"),
     ]
     conn = engine.raw_connection()
     try:

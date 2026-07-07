@@ -19,7 +19,15 @@ from typing import Any, Dict, List, Optional
 
 from core import config
 from core.events import log_event as core_log_event
-from core.models import EventLog, InventoryOptimizerMemory, PurchaseOrder, PurchaseOrderLine, Supplier, SupplierTerm
+from core.models import (
+    EventLog,
+    InventoryOptimizerMemory,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    Supplier,
+    SupplierCatalog,
+    SupplierTerm,
+)
 from core.signals import SignalType
 
 
@@ -77,6 +85,56 @@ class Procurement:
         )
         return row
 
+    # -- pricing helpers ------------------------------------------------------
+
+    def _discounted_goods_total(
+        self, supplier_id: int, lines: List[Dict[str, Any]]
+    ) -> float:
+        """Goods subtotal with per-item quantity discounts and supplier volume
+        discount applied — mirrors the optimizer's landed-cost basis.
+
+        1. Per-item: if the catalog row for (supplier, ingredient) has a
+           ``discount`` tier whose ``min_qty`` is met, the line is billed at the
+           tier ``unit_price`` (the lowest qualifying).
+        2. Supplier-level: the highest ``volume_discount`` tier whose
+           ``min_value`` the (post-item-discount) subtotal meets rebates
+           ``discount_pct`` % off the whole order.
+        """
+        session = self.db_session_factory()
+        try:
+            subtotal = 0.0
+            for l in lines:
+                qty = float(l["qty"])
+                unit_price = float(l["unit_price"] or 0.0)
+                cat = (
+                    session.query(SupplierCatalog)
+                    .filter(
+                        SupplierCatalog.supplier_id == supplier_id,
+                        SupplierCatalog.ingredient_id == l["ingredient_id"],
+                    )
+                    .first()
+                )
+                eff_price = unit_price
+                tiers = (getattr(cat, "discount", None) or []) if cat is not None else []
+                for tier in tiers:
+                    min_qty = float(tier.get("min_qty") or 0.0)
+                    tier_price = float(tier.get("unit_price") or unit_price)
+                    if qty >= min_qty > 0 and tier_price < eff_price:
+                        eff_price = tier_price
+                subtotal += qty * eff_price
+
+            supplier = session.get(Supplier, supplier_id)
+            vd = (getattr(supplier, "volume_discount", None) or []) if supplier else []
+            best_pct = 0.0
+            for tier in vd:
+                min_value = float(tier.get("min_value") or 0.0)
+                pct = float(tier.get("discount_pct") or 0.0)
+                if subtotal >= min_value > 0 and pct > best_pct:
+                    best_pct = pct
+            return subtotal * (1.0 - best_pct / 100.0)
+        finally:
+            session.close()
+
     # -- create (§18.8 / §B4.4) ----------------------------------------------
 
     def create_po(
@@ -96,9 +154,13 @@ class Procurement:
 
         ``delivery_charge`` — fixed delivery fee for this supplier order; added
         to ``total_cost`` so PO totals reflect true landed cost.
+
+        Supplier ``volume_discount`` tiers and per-item catalog ``discount``
+        tiers are applied to ``total_cost`` so the stored PO total equals the
+        true landed cost the optimizer minimises against.
         """
         now = self.sim_time
-        goods_total = sum(float(l["qty"]) * float(l["unit_price"] or 0.0) for l in lines)
+        goods_total = self._discounted_goods_total(supplier_id, lines)
         total = goods_total + float(delivery_charge or 0.0)
 
         session = self.db_session_factory()
