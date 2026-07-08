@@ -2293,17 +2293,6 @@ def apply_manager_change(
     # Re-run the procurement planner when a supplier term or negotiated price is
     # applied so the optimizer picks up the new terms immediately (§W1b).
     if change.kind in ("supplier_term", "call_price"):
-        if ctx.bus is not None:
-            details = change.details or {}
-            ctx.bus.emit(
-                SignalType.SUPPLIER_PRICE_UPDATE,
-                {
-                    "supplier_id": details.get("supplier_id"),
-                    "ingredient_id": details.get("ingredient_id"),
-                    "via": "manager_apply",
-                },
-                source="manager_api",
-            )
         background_tasks.add_task(_replan_in_background)
     return _change_to_dict(change)
 
@@ -2328,17 +2317,6 @@ def revert_manager_change(
     ctx.hub.broadcast("manager_change", _change_to_dict(change))
     # Re-plan after reverting a supplier term so the optimizer removes the benefit (§W1b).
     if change.kind in ("supplier_term", "call_price"):
-        if ctx.bus is not None:
-            details = change.details or {}
-            ctx.bus.emit(
-                SignalType.SUPPLIER_PRICE_UPDATE,
-                {
-                    "supplier_id": details.get("supplier_id"),
-                    "ingredient_id": details.get("ingredient_id"),
-                    "via": "manager_revert",
-                },
-                source="manager_api",
-            )
         background_tasks.add_task(_replan_in_background)
     return _change_to_dict(change)
 
