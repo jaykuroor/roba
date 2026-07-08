@@ -635,6 +635,77 @@ function CardsBoard({
 }
 
 // ---------------------------------------------------------------------------
+// History board — past completed calls + resolved change cards
+// ---------------------------------------------------------------------------
+
+type HistoryItem =
+  | { _type: "call"; _ts: number; call: Call }
+  | { _type: "change"; _ts: number; change: ManagerChange };
+
+function HistoryBoard() {
+  const [items, setItems] = useState<HistoryItem[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  function load() {
+    setLoading(true);
+    Promise.all([
+      apiGet<Call[]>("/api/calls?status=completed,auto_resolved&limit=30"),
+      apiGet<ManagerChange[]>("/api/manager/changes?status=applied,reverted,dismissed"),
+    ])
+      .then(([calls, changes]) => {
+        const merged: HistoryItem[] = [
+          ...calls.map((c) => ({ _type: "call" as const, _ts: c.ended_at ?? c.started_at ?? 0, call: c })),
+          ...changes.map((c) => ({ _type: "change" as const, _ts: c.resolved_at ?? c.created_at ?? 0, change: c })),
+        ];
+        merged.sort((a, b) => b._ts - a._ts);
+        setItems(merged);
+      })
+      .catch(() => undefined)
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  // Refresh when new calls end or changes resolve.
+  const changeVersion = useManagerChangeVersion();
+  useEffect(() => {
+    if (changeVersion > 0) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [changeVersion]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16 text-text/30 text-sm">
+        Loading history…
+      </div>
+    );
+  }
+
+  if (items.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 py-14 text-center">
+        <PhoneOff size={22} className="text-text/20" />
+        <p className="text-sm text-text/30">No history yet</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2 p-3">
+      {items.map((item, i) =>
+        item._type === "call" ? (
+          <CompletedCallCard key={`call-${item.call.id}`} call={item.call} changes={[]} />
+        ) : (
+          <ChangeCard key={`change-${item.change.id}-${i}`} change={item.change} onRefresh={load} />
+        ),
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // ManagerVoice
 // ---------------------------------------------------------------------------
 
@@ -642,6 +713,7 @@ export function ManagerVoice() {
   const live = useVoiceLive("manager");
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [showDev, setShowDev] = useState(false);
+  const [boardView, setBoardView] = useState<"live" | "history">("live");
   const transcriptEndRef = useRef<HTMLDivElement>(null);
 
   // Connect the operator WS so the desk receives call_started / call_ended /
@@ -842,9 +914,29 @@ export function ManagerVoice() {
       <div className="shrink-0 flex items-center gap-2 border-b border-muted/30 px-3 py-2.5">
         <Radio size={14} className="text-accent" />
         <span className="text-sm font-semibold text-text">Ops Board</span>
+        <div className="ml-auto flex items-center gap-0.5 rounded-lg bg-muted/40 p-0.5">
+          {(["live", "history"] as const).map((v) => (
+            <button
+              key={v}
+              onClick={() => setBoardView(v)}
+              className={[
+                "rounded-md px-2.5 py-1 text-xs font-medium capitalize transition-colors",
+                boardView === v
+                  ? "bg-surface text-text shadow-sm"
+                  : "text-text/50 hover:text-text/70",
+              ].join(" ")}
+            >
+              {v}
+            </button>
+          ))}
+        </div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto">
-        <CardsBoard approvals={approvals} onResolve={handleResolve} />
+        {boardView === "live" ? (
+          <CardsBoard approvals={approvals} onResolve={handleResolve} />
+        ) : (
+          <HistoryBoard />
+        )}
       </div>
     </section>
   );

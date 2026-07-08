@@ -127,10 +127,25 @@ export const actions = {
       .then((call) => {
         if (call) {
           actions.startCall(call);
-        } else if (state.activeCall !== null) {
-          // Clear the active indicator — don't overwrite a completed-call summary.
-          setState({ activeCall: null, callTurns: [] });
+        } else {
+          if (state.activeCall !== null) {
+            // Clear the active indicator — don't overwrite a completed-call summary.
+            setState({ activeCall: null, callTurns: [] });
+          }
+          // Hydrate the most-recently-completed call so the desk card survives a
+          // page refresh (the WS call_ended event is ephemeral).
+          actions.hydrateLastCompletedCall();
         }
+      })
+      .catch(() => undefined);
+  },
+
+  /** Fetch the most recent completed call and surface it as the desk summary card. */
+  hydrateLastCompletedCall(): void {
+    if (state.lastCompletedCall !== null) return; // already populated from WS
+    apiGet<Call | null>("/api/calls/recent")
+      .then((call) => {
+        if (call) setState({ lastCompletedCall: call });
       })
       .catch(() => undefined);
   },

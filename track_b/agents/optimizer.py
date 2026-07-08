@@ -173,6 +173,14 @@ class InventoryOptimizer(BaseAgent):
                 str(payload.get("action") or "disable"),
                 str(payload.get("reason") or payload.get("raw_text") or "manual voice request"),
             )
+        elif signal.type in (
+            SignalType.SUPPLIER_PRICE_UPDATE.value,
+            SignalType.CALL_OUTCOME.value,
+        ):
+            # A supplier offer was applied (manually or auto) — re-cost the forward plan
+            # and re-run the sourcing solver so new terms feed into PO decisions.
+            self.build_procurement_plan()
+            self.run_sourcing_plan()
 
     # -- reorder (§18.8) ------------------------------------------------------
 

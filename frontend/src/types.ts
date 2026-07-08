@@ -364,7 +364,7 @@ export interface ApprovalThreshold {
 
 export interface ManagerChange {
   id: number;
-  kind: "sourcing_default" | "call_price" | "onboarding" | "supplier_data";
+  kind: "sourcing_default" | "call_price" | "onboarding" | "supplier_data" | "supplier_term";
   status: "pending" | "applied" | "reverted" | "dismissed";
   auto_applied: number;
   summary: string;
