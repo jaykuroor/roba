@@ -448,6 +448,26 @@ class CallSubsystem:
 
         self._broadcast("call_ended", {"call": self._to_dict(call), "outcome": outcome})
 
+        # Persist a narrative event_log row so the history view can surface this
+        # call after a page refresh (the call_ended WS broadcast is ephemeral).
+        try:
+            from .events import log_event as _log_event  # noqa: PLC0415
+            _es = self.db_session_factory()
+            try:
+                summary_text = (outcome.get("summary") if isinstance(outcome, dict) else None) or f"Call {status}: {call.counterparty_type} #{call.counterparty_id}"
+                _log_event(
+                    _es,
+                    sim_time=now,
+                    category="call",
+                    actor=f"{call.counterparty_type}:{call.counterparty_id}",
+                    summary=summary_text,
+                    detail={"call_id": call_id, "status": status},
+                )
+            finally:
+                _es.close()
+        except Exception as _le_exc:  # noqa: BLE001
+            logger.warning("call event_log write failed: %s", _le_exc)
+
         # A second call that was queued while this one ran can now start.
         self._start_next_pending()
         return outcome
@@ -499,6 +519,7 @@ class CallSubsystem:
         """Create a ManagerChange(kind='call_price') so the agreed price surfaces
         as a desk card for the manager to apply/revert (§8.5 / workstream E)."""
         from .models import (  # noqa: PLC0415
+            AppSettings as _AppSettings,
             ManagerChange as _MC,
             Supplier as _Sup,
             SupplierCatalog as _SCat,
@@ -509,6 +530,10 @@ class CallSubsystem:
 
         session = self.db_session_factory()
         try:
+            # Respect the auto-apply setting (§W1c).
+            _settings = session.get(_AppSettings, 1)
+            auto_apply = bool(_settings.auto_apply_supplier_changes if _settings else False)
+
             sup = session.get(_Sup, call.counterparty_id)
             sup_name = sup.name if sup else f"Supplier #{call.counterparty_id}"
 
@@ -553,11 +578,20 @@ class CallSubsystem:
                 before_disp = f"€{current_price:.2f}/{cat_unit}"
                 after_disp = f"€{agreed_price:.2f}/{cat_unit}"
 
+            now_t = float(self.bus.sim_time)
+
+            # When auto-apply is on, apply the price to the catalog immediately.
+            if auto_apply:
+                cat.current_price = agreed_price
+                cat.updated_at = now_t
+
             change = _MC(
                 kind="call_price",
-                status="pending",
+                status="applied" if auto_apply else "pending",
+                auto_applied=1 if auto_apply else 0,
                 summary=f"Price for {ing_name} ({sup_name}): {before_disp} → {after_disp}",
-                created_at=float(self.bus.sim_time),
+                created_at=now_t,
+                resolved_at=now_t if auto_apply else None,
                 details={
                     "before": {"price": current_price, "unit": cat_unit},
                     "after": {"price": agreed_price, "unit": cat_unit},
@@ -577,6 +611,18 @@ class CallSubsystem:
                 "manager_change",
                 {"kind": "call_price", "id": change.id, "ingredient": ing_name, "supplier": sup_name},
             )
+
+            # When auto-applied, emit signal so the optimizer re-plans (§W1c).
+            if auto_apply:
+                self.bus.emit(
+                    SignalType.SUPPLIER_PRICE_UPDATE,
+                    {
+                        "supplier_id": call.counterparty_id,
+                        "ingredient_id": cat.ingredient_id,
+                        "via": "call_auto_apply",
+                    },
+                    source="calls",
+                )
         finally:
             session.close()
 
@@ -1012,11 +1058,16 @@ class CallSubsystem:
         when both the live tool and post-call extraction fire for the same update.
         Returns the term row, or None if a duplicate was found.
         """
+        from .models import AppSettings as _AppSettings  # noqa: PLC0415
         from .models import ManagerChange as _MC  # noqa: PLC0415
 
         now = effective_at
         session = self.db_session_factory()
         try:
+            # Respect the auto-apply setting (§W1c): mirror market_spectator behaviour.
+            _settings = session.get(_AppSettings, 1)
+            auto_apply = bool(_settings.auto_apply_supplier_changes if _settings else False)
+
             # Deduplicate: same call, same type, same scope, same ingredient
             existing = (
                 session.query(SupplierTerm)
@@ -1099,7 +1150,7 @@ class CallSubsystem:
                 expiry_kind=expiry_kind,
                 expires_at=expires_at,
                 remaining_orders=remaining_orders,
-                status="pending",
+                status="active" if auto_apply else "pending",
                 source_call_id=call.id,
                 verbatim_quote=verbatim_quote,
                 created_at=now,
@@ -1125,9 +1176,11 @@ class CallSubsystem:
             }
             change = _MC(
                 kind="supplier_term",
-                status="pending",
+                status="applied" if auto_apply else "pending",
+                auto_applied=1 if auto_apply else 0,
                 summary=summary,
                 created_at=now,
+                resolved_at=now if auto_apply else None,
                 details=details,
             )
             session.add(change)
@@ -1145,6 +1198,20 @@ class CallSubsystem:
                     "term_type": term_type,
                 },
             )
+
+            # When auto-applied, emit a price-update signal so the optimizer re-plans
+            # immediately without waiting for the next scheduled interval sweep (§W1c).
+            if auto_apply:
+                self.bus.emit(
+                    SignalType.SUPPLIER_PRICE_UPDATE,
+                    {
+                        "supplier_id": call.counterparty_id,
+                        "ingredient_id": ingredient_id,
+                        "via": "call_auto_apply",
+                    },
+                    source="calls",
+                )
+
             return term
         finally:
             session.close()

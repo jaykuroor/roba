@@ -27,7 +27,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, text
@@ -1328,8 +1328,29 @@ def read_active_call(db_session: Any = Depends(db.get_db)) -> Optional[Dict[str,
 
 
 @app.get("/api/calls")
-def read_calls(db_session: Any = Depends(db.get_db)) -> List[Dict[str, Any]]:
-    return [_row_to_dict(r) for r in db_session.query(models.Call).all()]
+def read_calls(
+    status: Optional[str] = None,
+    limit: int = 50,
+    db_session: Any = Depends(db.get_db),
+) -> List[Dict[str, Any]]:
+    q = db_session.query(models.Call)
+    if status:
+        statuses = [s.strip() for s in status.split(",")]
+        q = q.filter(models.Call.status.in_(statuses))
+    q = q.order_by(models.Call.id.desc()).limit(limit)
+    return [_row_to_dict(r) for r in q.all()]
+
+
+@app.get("/api/calls/recent")
+def read_recent_call(db_session: Any = Depends(db.get_db)) -> Optional[Dict[str, Any]]:
+    """Return the most recently completed call (for desk hydration on reconnect)."""
+    row = (
+        db_session.query(models.Call)
+        .filter(models.Call.status.in_(["completed", "auto_resolved"]))
+        .order_by(models.Call.id.desc())
+        .first()
+    )
+    return _row_to_dict(row) if row is not None else None
 
 
 # ===========================================================================
@@ -2230,8 +2251,33 @@ def _apply_change_to_db(change: models.ManagerChange, db_session: Any, direction
                     db_session.delete(existing)
 
 
+def _replan_in_background() -> None:
+    """Run build_procurement_plan + run_sourcing_plan after a supplier term is applied/reverted.
+
+    Registered as a FastAPI BackgroundTask so it runs after the HTTP response is
+    sent. Signals only dispatch during orchestrator ticks (which don't fire when
+    the sim is paused), so this direct call ensures immediate re-pricing.
+    """
+    logger.info("_replan_in_background: starting")
+    optimizer = (ctx.tracks.get("track_b") or {}).get("optimizer")
+    if optimizer is None:
+        logger.warning("_replan_in_background: optimizer not found in ctx.tracks")
+        return
+    logger.info("_replan_in_background: running build + sourcing")
+    try:
+        optimizer.build_procurement_plan()
+        optimizer.run_sourcing_plan()
+        logger.info("_replan_in_background: done")
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("post-apply replan failed: %s", _exc)
+
+
 @app.post("/api/manager/changes/{change_id}/apply")
-def apply_manager_change(change_id: int, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+def apply_manager_change(
+    change_id: int,
+    background_tasks: BackgroundTasks,
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
     """Apply a pending manager change to the catalog."""
     change = db_session.get(models.ManagerChange, change_id)
     if change is None:
@@ -2244,11 +2290,30 @@ def apply_manager_change(change_id: int, db_session: Any = Depends(db.get_db)) -
     change.resolved_at = now
     db_session.commit()
     ctx.hub.broadcast("manager_change", _change_to_dict(change))
+    # Re-run the procurement planner when a supplier term or negotiated price is
+    # applied so the optimizer picks up the new terms immediately (§W1b).
+    if change.kind in ("supplier_term", "call_price"):
+        if ctx.bus is not None:
+            details = change.details or {}
+            ctx.bus.emit(
+                SignalType.SUPPLIER_PRICE_UPDATE,
+                {
+                    "supplier_id": details.get("supplier_id"),
+                    "ingredient_id": details.get("ingredient_id"),
+                    "via": "manager_apply",
+                },
+                source="manager_api",
+            )
+        background_tasks.add_task(_replan_in_background)
     return _change_to_dict(change)
 
 
 @app.post("/api/manager/changes/{change_id}/revert")
-def revert_manager_change(change_id: int, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+def revert_manager_change(
+    change_id: int,
+    background_tasks: BackgroundTasks,
+    db_session: Any = Depends(db.get_db),
+) -> Dict[str, Any]:
     """Revert an applied manager change."""
     change = db_session.get(models.ManagerChange, change_id)
     if change is None:
@@ -2261,6 +2326,20 @@ def revert_manager_change(change_id: int, db_session: Any = Depends(db.get_db)) 
     change.resolved_at = now
     db_session.commit()
     ctx.hub.broadcast("manager_change", _change_to_dict(change))
+    # Re-plan after reverting a supplier term so the optimizer removes the benefit (§W1b).
+    if change.kind in ("supplier_term", "call_price"):
+        if ctx.bus is not None:
+            details = change.details or {}
+            ctx.bus.emit(
+                SignalType.SUPPLIER_PRICE_UPDATE,
+                {
+                    "supplier_id": details.get("supplier_id"),
+                    "ingredient_id": details.get("ingredient_id"),
+                    "via": "manager_revert",
+                },
+                source="manager_api",
+            )
+        background_tasks.add_task(_replan_in_background)
     return _change_to_dict(change)
 
 

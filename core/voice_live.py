@@ -1324,9 +1324,21 @@ async def live_bridge(
         # Genuine error (already surfaced to the client) — stop the loop.
         break
 
-    # ── Call teardown: end the call row and unregister hint queue. ────────────
+    # ── Call teardown: flush any open user buffer, end the call row, unregister. ─
     if call_id is not None:
         try:
+            # Flush any counterparty speech that was mid-turn when the bridge tore
+            # down — without this, a call that ends while the user is speaking loses
+            # that final utterance from calls.transcript and _extract_outcome.
+            if buffers._user_open and calls is not None:
+                try:
+                    await _flush_transcript(
+                        websocket, "user", buffers,
+                        call_id=call_id, calls=calls,
+                    )
+                except Exception as _bf_exc:  # noqa: BLE001
+                    logger.warning("teardown user-buffer flush failed: %s", _bf_exc)
+
             if calls is not None:
                 _loaded = calls._load(call_id)
                 if _loaded is not None and _loaded.status == "active":
@@ -1379,6 +1391,23 @@ async def _client_to_gemini(
                 elif msg_type == "text_input":
                     text = str(msg.get("text") or "")
                     if text:
+                        # Echo the typed turn back as a final user transcript frame so
+                        # it appears in the UI immediately (voice path gets this via STT
+                        # transcription; typed text must be echoed explicitly).
+                        await _safe_send_json(websocket, {
+                            "type": "transcript",
+                            "role": "user",
+                            "text": text,
+                            "turn_id": str(uuid.uuid4()),
+                            "final": True,
+                        })
+                        # Persist the typed turn so it's captured in calls.transcript
+                        # and feeds _extract_outcome on call end.
+                        if call_id is not None and calls is not None:
+                            try:
+                                await asyncio.to_thread(calls.add_turn, call_id, "counterparty", text)
+                            except Exception as _tt_exc:  # noqa: BLE001
+                                logger.warning("calls.add_turn for text_input failed: %s", _tt_exc)
                         await session.send_client_content(
                             turns={"parts": [{"text": text}]},
                             turn_complete=True,
