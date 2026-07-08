@@ -751,6 +751,62 @@ class InventoryOptimizer(BaseAgent):
                     if row.id not in kept_ids and row.id not in superseded_ids:
                         superseded_ids.add(row.id)
 
+            # Fix B (R1): Reconciliation gate — never persist a new or kept planned row
+            # when an open real PO already covers the same ingredient+supplier demand.
+            # W4 (sizing, above) prevents the MILP from over-ordering, but it does not
+            # remove PlannedOrder rows that a pending-approval PO has already addressed.
+            # This is the safeguard that ensures "at_risk planned row + open PO" never
+            # coexist on the list, regardless of the W4 arrival-estimate accuracy.
+            try:
+                from sqlalchemy import func as _sa_func_r1  # local import; avoids top-level dep
+                _open_po_coverage: Dict[tuple, float] = {}
+                _open_po_rows = (
+                    session.query(
+                        PurchaseOrderLine.ingredient_id,
+                        PurchaseOrder.supplier_id,
+                        _sa_func_r1.sum(PurchaseOrderLine.qty).label("total_qty"),
+                    )
+                    .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
+                    .filter(PurchaseOrder.status.in_(("proposed", "approved", "placed")))
+                    .group_by(PurchaseOrderLine.ingredient_id, PurchaseOrder.supplier_id)
+                    .all()
+                )
+                for _r1_ing, _r1_sup, _r1_qty in _open_po_rows:
+                    _open_po_coverage[(_r1_ing, _r1_sup)] = float(_r1_qty or 0.0)
+
+                if _open_po_coverage:
+                    _r1_filtered: List[Dict] = []
+                    for _od in final_new_orders:
+                        _r1_key = (_od["ingredient_id"], _od["supplier_id"])
+                        if _open_po_coverage.get(_r1_key, 0.0) >= float(_od["qty"] or 0.0):
+                            logger.info(
+                                "R1: suppressing planned row ingredient=%s supplier=%s "
+                                "(open PO qty %.1f ≥ needed %.1f).",
+                                _od["ingredient_id"], _od["supplier_id"],
+                                _open_po_coverage[_r1_key], _od["qty"],
+                            )
+                        else:
+                            _r1_filtered.append(_od)
+                    final_new_orders = _r1_filtered
+
+                    for _r1_row_id in list(kept_ids):
+                        _r1_krow = session.get(PlannedOrder, _r1_row_id)
+                        if _r1_krow is None:
+                            continue
+                        _r1_key = (_r1_krow.ingredient_id, _r1_krow.supplier_id)
+                        if _open_po_coverage.get(_r1_key, 0.0) >= float(_r1_krow.qty or 0.0):
+                            logger.info(
+                                "R1: superseding kept planned row %s ingredient=%s supplier=%s "
+                                "(open PO already covers demand).",
+                                _r1_row_id, _r1_krow.ingredient_id, _r1_krow.supplier_id,
+                            )
+                            kept_ids.discard(_r1_row_id)
+                            superseded_ids.add(_r1_row_id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "build_procurement_plan: R1 open-PO reconciliation query failed; skipping."
+                )
+
             for row_id in superseded_ids:
                 row = session.get(PlannedOrder, row_id)
                 if row:
@@ -937,7 +993,7 @@ class InventoryOptimizer(BaseAgent):
             dc = delivery_charges.get(supplier_id, 0.0)
 
             try:
-                self.procurement.create_po(
+                created_po = self.procurement.create_po(
                     supplier_id=supplier_id,
                     lines=lines,
                     created_by=self.name,
@@ -950,13 +1006,40 @@ class InventoryOptimizer(BaseAgent):
                 )
                 continue
 
-            # Mark all PlannedOrder rows in the group as placed.
+            # Fix A: re-read the committed PO status before deciding what to do with
+            # the source PlannedOrder rows.  create_po expunges the object before
+            # _place runs, so the returned object may not reflect the final status.
+            # When the PO went to approval (status="proposed", over the threshold) we
+            # mark source rows "superseded" — a real pending PO now represents them, so
+            # they must leave the planned list immediately.  Marking them "placed"
+            # unconditionally was the primary cause of the at_risk+proposed-PO duplicate.
+            target_status = "placed"
+            if created_po is not None:
+                session_chk = self.db_session_factory()
+                try:
+                    fresh_po = session_chk.get(PurchaseOrder, created_po.id)
+                    if fresh_po is not None and fresh_po.status == "proposed":
+                        target_status = "superseded"
+                        logger.info(
+                            "execute_due_planned_orders: PO #%s is pending approval → "
+                            "marking source planned rows superseded (not placed).",
+                            created_po.id,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "execute_due_planned_orders: could not re-read PO %s status; "
+                        "defaulting to 'placed'.",
+                        getattr(created_po, "id", "?"),
+                    )
+                finally:
+                    session_chk.close()
+
             for row_id in placed_ids:
                 session4 = self.db_session_factory()
                 try:
                     row = session4.get(PlannedOrder, row_id)
                     if row:
-                        row.status = "placed"
+                        row.status = target_status
                         session4.commit()
                 except Exception:  # noqa: BLE001
                     session4.rollback()
