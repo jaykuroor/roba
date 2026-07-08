@@ -940,3 +940,179 @@ def test_expiry_aware_projection_triggers_early_order(bus, session_factory):
         )
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# Helper: fake Procurement that writes a *proposed* (approval-pending) PO to DB
+# ---------------------------------------------------------------------------
+
+
+class _FakeProcurementApproval:
+    """Simulates create_po routing to approval (over threshold) by writing a
+    'proposed' PO to the real DB so Fix A's committed-status re-read works."""
+
+    def __init__(self, session_factory):
+        self._sf = session_factory
+        self.calls: list = []
+
+    def create_po(self, supplier_id, lines, created_by="optimizer",
+                  planned_delivery=None, delivery_charge=0.0):
+        self.calls.append({"supplier_id": supplier_id, "lines": lines})
+        session = self._sf()
+        try:
+            po = PurchaseOrder(
+                supplier_id=supplier_id,
+                status="proposed",          # pending approval — NOT placed
+                created_at=0.0,
+                expected_delivery=None,     # no date until approved
+                total_cost=sum(
+                    float(ln["qty"]) * float(ln.get("unit_price", 0.0)) for ln in lines
+                ),
+                created_by=created_by,
+                approval_id=None,
+            )
+            session.add(po)
+            session.flush()
+            for ln in lines:
+                session.add(PurchaseOrderLine(
+                    po_id=po.id,
+                    ingredient_id=ln["ingredient_id"],
+                    qty=float(ln["qty"]),
+                    unit=ln.get("unit", "g"),
+                    unit_price=float(ln.get("unit_price", 0.0)),
+                    line_total=float(ln["qty"]) * float(ln.get("unit_price", 0.0)),
+                ))
+            session.commit()
+            po_id = po.id
+        finally:
+            session.close()
+        from types import SimpleNamespace as _SN
+        return _SN(id=po_id, status="proposed")
+
+
+# ---------------------------------------------------------------------------
+# Test Fix A: over-threshold PO → source planned rows become 'superseded'
+# ---------------------------------------------------------------------------
+
+
+def test_execute_due_marks_superseded_when_po_pending_approval(bus, session_factory):
+    """Fix A: when create_po routes to approval (PO stays 'proposed'), the source
+    PlannedOrder rows must be marked 'superseded', NOT 'placed'.
+
+    Marking them 'placed' unconditionally was the primary cause of the
+    at_risk-row + proposed-PO duplicate: the next build_procurement_plan run
+    would see the at_risk row gone (badge dropped) but the proposed PO still
+    open, then regenerate a fresh at_risk row against the same ingredient+supplier.
+    """
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0, safety_stock=50.0)
+    sup_id = _seed_supplier(session_factory, ing_id, lead_time_days=1.0,
+                            price=2.0, pack_size=10.0)
+
+    session = session_factory()
+    try:
+        planned = PlannedOrder(
+            plan_run_id=None,
+            ingredient_id=ing_id,
+            supplier_id=sup_id,
+            qty=100.0,
+            unit="g",
+            unit_price=2.0,
+            order_date=0.0,                          # due at t=0
+            delivery_date=float(SECONDS_PER_DAY),
+            covers_from=float(SECONDS_PER_DAY),
+            covers_until=float(2 * SECONDS_PER_DAY),
+            status="at_risk",
+            reason="test",
+            created_at=0.0,
+        )
+        session.add(planned)
+        session.commit()
+        session.refresh(planned)
+        planned_id = planned.id
+    finally:
+        session.close()
+
+    bus.sim_time = 10.0
+    proc = _FakeProcurementApproval(session_factory)
+    opt = InventoryOptimizer(bus, session_factory, procurement=proc)
+    executed = opt.execute_due_planned_orders()
+
+    assert executed == 1, f"Expected 1 order executed, got {executed}"
+    assert len(proc.calls) == 1, "create_po must be called once"
+
+    # The source planned row must become 'superseded' — a real (proposed) PO now
+    # represents the demand.  'placed' would be wrong because the PO was never placed.
+    session = session_factory()
+    try:
+        row = session.get(PlannedOrder, planned_id)
+        assert row.status == "superseded", (
+            f"Expected 'superseded' when PO was routed to approval, got {row.status!r}. "
+            "Marking 'placed' here causes a ghost at_risk row to re-appear after re-planning."
+        )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Test Fix B (R1): proposed PO already in DB prevents new planned row
+# ---------------------------------------------------------------------------
+
+
+def test_build_plan_r1_skips_when_proposed_po_covers_demand(bus, session_factory):
+    """Fix B (R1): build_procurement_plan must not create a new planned/at_risk row
+    when a proposed (approval-pending) PO for the same ingredient+supplier already
+    covers the needed quantity.
+
+    This is the second half of the duplicate scenario: even if build_procurement_plan
+    runs again after a proposed PO was created, the R1 reconciliation gate must
+    suppress any new planned row that would duplicate the real pending PO.
+    """
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0, safety_stock=50.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=100.0)
+    sup_id = _seed_supplier(session_factory, ing_id, lead_time_days=2.0,
+                            pack_size=10.0, price=1.0)
+
+    # Pre-seed a proposed (approval-pending) PO with enough qty to cover any horizon.
+    session = session_factory()
+    try:
+        open_po = PurchaseOrder(
+            supplier_id=sup_id,
+            status="proposed",
+            created_at=0.0,
+            expected_delivery=None,
+            total_cost=9999.0,
+            created_by="test",
+        )
+        session.add(open_po)
+        session.flush()
+        session.add(PurchaseOrderLine(
+            po_id=open_po.id,
+            ingredient_id=ing_id,
+            qty=9999.0,
+            unit="g",
+            unit_price=1.0,
+            line_total=9999.0,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    bus.sim_time = float(5 * SECONDS_PER_DAY)   # day 5, on_hand=0 → immediate shortage
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=1.0, days=7)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=7.0)
+
+    # R1 must suppress new planned rows because the proposed PO qty (9999g) is
+    # greater than or equal to the MILP's computed need for this ingredient+supplier.
+    session = session_factory()
+    try:
+        active_rows = session.query(PlannedOrder).filter(
+            PlannedOrder.status.in_(["planned", "at_risk"])
+        ).count()
+        assert active_rows == 0, (
+            f"Expected 0 active planned rows when a proposed PO already covers demand, "
+            f"got {active_rows}. R1 reconciliation gate is not suppressing duplicates."
+        )
+    finally:
+        session.close()
