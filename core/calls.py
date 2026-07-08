@@ -619,6 +619,9 @@ class CallSubsystem:
                     {
                         "supplier_id": call.counterparty_id,
                         "ingredient_id": cat.ingredient_id,
+                        "old_price": float(current_price),
+                        "new_price": float(agreed_price),
+                        "availability": cat.availability or "in_stock",
                         "via": "call_auto_apply",
                     },
                     source="calls",
@@ -1199,18 +1202,43 @@ class CallSubsystem:
                 },
             )
 
-            # When auto-applied, emit a price-update signal so the optimizer re-plans
-            # immediately without waiting for the next scheduled interval sweep (§W1c).
+            # When auto-applied, emit a signal so the optimizer re-plans immediately
+            # without waiting for the next scheduled interval sweep (§W1c).
             if auto_apply:
-                self.bus.emit(
-                    SignalType.SUPPLIER_PRICE_UPDATE,
-                    {
-                        "supplier_id": call.counterparty_id,
-                        "ingredient_id": ingredient_id,
-                        "via": "call_auto_apply",
-                    },
-                    source="calls",
-                )
+                if ingredient_id is not None:
+                    _cat = (
+                        session.query(SupplierCatalog)
+                        .filter(
+                            SupplierCatalog.supplier_id == call.counterparty_id,
+                            SupplierCatalog.ingredient_id == ingredient_id,
+                        )
+                        .first()
+                    )
+                    if _cat is not None:
+                        self.bus.emit(
+                            SignalType.SUPPLIER_PRICE_UPDATE,
+                            {
+                                "supplier_id": call.counterparty_id,
+                                "ingredient_id": ingredient_id,
+                                "old_price": float(_cat.current_price or 0.0),
+                                "new_price": float(value),
+                                "availability": _cat.availability or "in_stock",
+                                "via": "call_auto_apply",
+                            },
+                            source="calls",
+                        )
+                else:
+                    # scope='all' — emit call outcome so the optimizer re-plans across
+                    # all ingredients rather than per-catalog-row.
+                    self.bus.emit(
+                        SignalType.CALL_OUTCOME,
+                        {
+                            "call_id": call.id,
+                            "counterparty_type": call.counterparty_type or "supplier",
+                            "outcome": {},
+                        },
+                        source="calls",
+                    )
 
             return term
         finally:
