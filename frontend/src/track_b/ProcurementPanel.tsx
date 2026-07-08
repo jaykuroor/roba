@@ -87,26 +87,6 @@ function dayLabel(simS: number | null | undefined): string {
   return `Day ${day} (${dow})`;
 }
 
-function statusBadge(status: string) {
-  const map: Record<string, string> = {
-    proposed: "bg-muted/40 text-text/50",
-    approved: "bg-success/20 text-success",
-    placed: "bg-accent/20 text-accent",
-    delivered: "bg-success/30 text-success",
-    cancelled: "bg-danger/20 text-danger",
-  };
-  return (
-    <span
-      className={
-        "inline-block rounded px-1.5 py-0.5 text-[10px] font-medium " +
-        (map[status] ?? "bg-muted/30 text-text/50")
-      }
-    >
-      {status}
-    </span>
-  );
-}
-
 /** Group items by a string key, preserving insertion order. */
 function groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]> {
   const map = new Map<string, T[]>();
@@ -132,7 +112,6 @@ interface SupplierCardItem {
   unit_price: number | null;
   order_date_label: string;
   delivery_date_label: string;
-  status_badge?: React.ReactNode;
   at_risk?: boolean;
   cost?: number | null;  // pre-computed line_total; falls back to unit_price*qty
 }
@@ -214,11 +193,10 @@ function SupplierCard({
                         <span className="text-xs text-text/50 tabular-nums whitespace-nowrap">
                           {formatQty(item.qty, item.unit)}
                         </span>
-                        {item.status_badge}
-                        {item.at_risk && !item.status_badge && (
+                        {item.at_risk && (
                           <span
                             className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-warning/20 text-warning whitespace-nowrap"
-                            title="Lead time too short to guarantee delivery before shortage"
+                            title="Order-by window passed — placed now for earliest feasible delivery"
                           >
                             <AlertTriangle size={10} />
                             at-risk
@@ -352,7 +330,6 @@ function OrderedSection({
                 unit_price: ln.unit_price,
                 order_date_label: dayLabel(po.created_at),
                 delivery_date_label: dayLabel(po.expected_delivery),
-                status_badge: statusBadge(po.status),
                 cost: ln.line_total,
               }))
             );

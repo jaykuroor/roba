@@ -177,10 +177,12 @@ class InventoryOptimizer(BaseAgent):
             SignalType.SUPPLIER_PRICE_UPDATE.value,
             SignalType.CALL_OUTCOME.value,
         ):
-            # A supplier offer was applied (manually or auto) — re-cost the forward plan
-            # and re-run the sourcing solver so new terms feed into PO decisions.
+            # A supplier offer was applied (manually or auto) — re-cost the forward plan,
+            # re-run the sourcing solver, then immediately place any now-due orders so
+            # at-risk stock is secured without waiting for the next reorder sweep (§W1a).
             self.build_procurement_plan()
             self.run_sourcing_plan()
+            self.execute_due_planned_orders()
 
     # -- reorder (§18.8) ------------------------------------------------------
 
@@ -452,6 +454,42 @@ class InventoryOptimizer(BaseAgent):
                             "from projection — treating as undelivered.",
                             arr_day, ing_id_t,
                         )
+                        continue
+                    arr_day = max(arr_day, 0)
+                    if ing_id_t in inbound_by_day:
+                        inbound_by_day[ing_id_t][arr_day] = (
+                            inbound_by_day[ing_id_t].get(arr_day, 0.0) + float(total_qty or 0.0)
+                        )
+
+                # W4: Also credit POs awaiting approval (proposed/approved, expected_delivery=None).
+                # estimate arrival = created_at + supplier lead_time so they count as pipeline
+                # supply and the MILP doesn't re-order the same ingredient.
+                null_transit = (
+                    session.query(
+                        PurchaseOrderLine.ingredient_id,
+                        PurchaseOrder.created_at,
+                        Supplier.lead_time_days,
+                        _sa_func.sum(PurchaseOrderLine.qty).label("total_qty"),
+                    )
+                    .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
+                    .join(Supplier, Supplier.id == PurchaseOrder.supplier_id)
+                    .filter(
+                        PurchaseOrderLine.ingredient_id.in_(ingredient_ids),
+                        PurchaseOrder.status.in_(("proposed", "approved")),
+                        PurchaseOrder.expected_delivery.is_(None),
+                    )
+                    .group_by(
+                        PurchaseOrderLine.ingredient_id,
+                        PurchaseOrder.created_at,
+                        Supplier.lead_time_days,
+                    )
+                    .all()
+                )
+                for ing_id_t, created_at, lead_days, total_qty in null_transit:
+                    lead = float(lead_days or 1.0)
+                    est_delivery = float(created_at or now) + lead * SECONDS_PER_DAY
+                    arr_day = int(est_delivery // SECONDS_PER_DAY) - now_day
+                    if arr_day < -1:
                         continue
                     arr_day = max(arr_day, 0)
                     if ing_id_t in inbound_by_day:
@@ -797,6 +835,7 @@ class InventoryOptimizer(BaseAgent):
                     "unit": po.unit,
                     "unit_price": po.unit_price,
                     "delivery_date": po.delivery_date,  # A4: carry through for _place
+                    "order_date": po.order_date,        # W2: detect late/at-risk rows
                 }
                 for po in due
             ]
@@ -885,8 +924,14 @@ class InventoryOptimizer(BaseAgent):
             if not lines:
                 continue
 
-            # Use the earliest delivery_date in the group as the planned delivery.
-            planned_delivery = min(
+            # W2: At-risk rows have order_date < now (the order-by window already
+            # passed).  Pass planned_delivery=None so _place uses now + lead_time
+            # (deliver-ASAP), rather than the stale future date the MILP assumed.
+            # On-time rows keep their planned delivery date (A4 behaviour).
+            group_late = any(
+                float(d.get("order_date") or now + 1) < now for d in group
+            )
+            planned_delivery = None if group_late else min(
                 float(d["delivery_date"] or 0.0) for d in group
             )
             dc = delivery_charges.get(supplier_id, 0.0)
@@ -896,7 +941,7 @@ class InventoryOptimizer(BaseAgent):
                     supplier_id=supplier_id,
                     lines=lines,
                     created_by=self.name,
-                    planned_delivery=planned_delivery,  # A4: honour plan date
+                    planned_delivery=planned_delivery,  # A4/W2: ASAP for late, plan date for on-time
                     delivery_charge=dc,                 # include delivery fee in total_cost
                 )
             except Exception:  # noqa: BLE001

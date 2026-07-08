@@ -2252,22 +2252,20 @@ def _apply_change_to_db(change: models.ManagerChange, db_session: Any, direction
 
 
 def _replan_in_background() -> None:
-    """Run build_procurement_plan + run_sourcing_plan after a supplier term is applied/reverted.
+    """Re-plan procurement after a supplier term is applied/reverted.
 
     Registered as a FastAPI BackgroundTask so it runs after the HTTP response is
-    sent. Signals only dispatch during orchestrator ticks (which don't fire when
-    the sim is paused), so this direct call ensures immediate re-pricing.
+    sent. Calls build + sourcing + execute so any now-due at-risk orders are placed
+    immediately even while the sim is paused (§W1b).
     """
-    logger.info("_replan_in_background: starting")
     optimizer = (ctx.tracks.get("track_b") or {}).get("optimizer")
     if optimizer is None:
         logger.warning("_replan_in_background: optimizer not found in ctx.tracks")
         return
-    logger.info("_replan_in_background: running build + sourcing")
     try:
         optimizer.build_procurement_plan()
         optimizer.run_sourcing_plan()
-        logger.info("_replan_in_background: done")
+        optimizer.execute_due_planned_orders()
     except Exception as _exc:  # noqa: BLE001
         logger.warning("post-apply replan failed: %s", _exc)
 
