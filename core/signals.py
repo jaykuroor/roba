@@ -64,6 +64,8 @@ class SignalType(str, Enum):
     BATCH_PROGRESS = "BATCH_PROGRESS"
     # Multi-day demand horizon from the forecaster (for procurement sizing).
     DEMAND_FORECAST_HORIZON = "DEMAND_FORECAST_HORIZON"
+    # Ingredient demand cannot be covered — no lead-feasible / in-stock supply.
+    INGREDIENT_UNCOVERABLE = "INGREDIENT_UNCOVERABLE"
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +253,14 @@ SIGNAL_REGISTRY: Dict[SignalType, Dict[str, Any]] = {
         "groups": ["inventory", "procurement", "forecasting", "human"],
         "priority": 2,
         "default_ttl_sim_s": 172800.0,         # 2 sim-days — survives between daily emits
+    },
+    SignalType.INGREDIENT_UNCOVERABLE: {
+        # Surfaced on the procurement page so the user knows sourcing has failed.
+        # "frontend" group → auto-pushed via the orchestrator→WS signal_emitted bridge.
+        # dedup_key = "uncoverable:{ingredient_id}" gives one live warning per ingredient.
+        "groups": ["procurement", "inventory", "human", "frontend"],
+        "priority": 5,
+        "default_ttl_sim_s": 86400.0,          # 24h — refreshed each plan rebuild
     },
 }
 
@@ -609,6 +619,19 @@ class DemandForecastHorizonPayload(BaseModel):
     item_daily_baseline_median: Dict[str, float] = {}  # key = str(menu_item_id)
 
 
+class IngredientUncoverablePayload(BaseModel):
+    """Payload for INGREDIENT_UNCOVERABLE — emitted when the optimizer cannot
+    source enough of an ingredient to meet forecasted demand.
+
+    Query: bus.live(type=SignalType.INGREDIENT_UNCOVERABLE) and match payload["ingredient_id"].
+    """
+    ingredient_id: int
+    ingredient_name: str
+    short_qty: float            # base units that cannot be covered
+    unit: str
+    reason: str                 # human-readable explanation from the planner
+
+
 # Convenience map: SignalType -> its payload model.
 SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.DEMAND_FORECAST: DemandForecastPayload,
@@ -647,4 +670,5 @@ SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.OPERATIONAL_BRIEFING: OperationalBriefingPayload,
     SignalType.BATCH_PROGRESS: BatchProgressPayload,
     SignalType.DEMAND_FORECAST_HORIZON: DemandForecastHorizonPayload,
+    SignalType.INGREDIENT_UNCOVERABLE: IngredientUncoverablePayload,
 }

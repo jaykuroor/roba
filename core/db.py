@@ -115,6 +115,8 @@ def _ensure_columns() -> None:
         # Procurement plan coverage status (added with least-cost/no-stockout fix)
         ("procurement_plan_runs", "coverage_ok",       "INTEGER DEFAULT 1"),
         ("procurement_plan_runs", "total_short",       "REAL DEFAULT 0.0"),
+        # PO urgency label carried from the source planned row (at_risk/uncoverable/None)
+        ("purchase_orders",       "urgency",            "TEXT"),
     ]
     conn = engine.raw_connection()
     try:

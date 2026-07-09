@@ -344,6 +344,7 @@ class PurchaseOrder(Base):
     total_cost = mapped_column(Float)
     created_by = mapped_column(String)
     approval_id = mapped_column(ForeignKey("approval_requests.id"), nullable=True)
+    urgency = mapped_column(String, nullable=True)  # "at_risk" | "uncoverable" | None
 
     def __repr__(self):
         return (f"<PurchaseOrder id={self.id} supplier_id={self.supplier_id} "
@@ -1220,10 +1221,12 @@ class ProcurementPlanRun(Base):
 class PlannedOrder(Base):
     """A forward-scheduled procurement order produced by the planner.
 
-    status: 'planned' | 'at_risk' | 'placed' | 'superseded'
-    'at_risk' means order_date < now (lead time insufficient to cover shortage).
-    'placed' means a real PO was auto-created from this row.
-    'superseded' means a later plan run replaced this row.
+    status: 'planned' | 'at_risk' | 'uncoverable' | 'placed' | 'superseded'
+    'planned'     — normal forward order, order_date in the future.
+    'at_risk'     — order_date < now (late/expedite) but supply exists; placed ASAP.
+    'uncoverable' — no lead-feasible / in-stock supply; qty=0 sentinel row.
+    'placed'      — a real PO was auto-placed from this row.
+    'superseded'  — a later plan run or open PO replaced this row.
     """
     __tablename__ = "planned_orders"
 

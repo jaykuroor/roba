@@ -1257,6 +1257,7 @@ def read_purchase_orders(
     for po in orders:
         row = _row_to_dict(po)
         row["supplier_name"] = sup_names.get(po.supplier_id, str(po.supplier_id))
+        row["urgency"] = getattr(po, "urgency", None)
         if include_lines:
             lines = (
                 db_session.query(models.PurchaseOrderLine)
@@ -2801,7 +2802,7 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
 
     orders = (
         db_session.query(models.PlannedOrder)
-        .filter(models.PlannedOrder.status.in_(["planned", "at_risk"]))
+        .filter(models.PlannedOrder.status.in_(["planned", "at_risk", "uncoverable"]))
         .order_by(models.PlannedOrder.order_date)
         .all()
     )
@@ -2897,6 +2898,35 @@ def run_procurement_plan() -> Dict[str, Any]:
     executed = optimizer.execute_due_planned_orders()
     count = optimizer.build_procurement_plan()
     return {"ok": True, "items_planned": count, "orders_executed": executed}
+
+
+@app.get("/api/track-b/procurement/warnings")
+def get_procurement_warnings() -> List[Dict[str, Any]]:
+    """Return live INGREDIENT_UNCOVERABLE signals — one per ingredient that the
+    optimizer cannot source.
+
+    This is the queryable warning surface for future features:
+        bus.live(type=SignalType.INGREDIENT_UNCOVERABLE)
+
+    The UI fetches this on mount; live updates arrive via the ``signal_emitted``
+    WebSocket event (type == "INGREDIENT_UNCOVERABLE") which the ProcurementPanel
+    already subscribes to.
+    """
+    if ctx.bus is None:
+        return []
+    signals = ctx.bus.live(type=SignalType.INGREDIENT_UNCOVERABLE)
+    return [
+        {
+            "signal_id": s.signal_id,
+            "ingredient_id": (s.payload or {}).get("ingredient_id"),
+            "ingredient_name": (s.payload or {}).get("ingredient_name", ""),
+            "short_qty": (s.payload or {}).get("short_qty", 0.0),
+            "unit": (s.payload or {}).get("unit", ""),
+            "reason": (s.payload or {}).get("reason", ""),
+            "created_at": s.created_at,
+        }
+        for s in signals
+    ]
 
 
 # ===========================================================================

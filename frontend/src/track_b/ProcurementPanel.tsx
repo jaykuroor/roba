@@ -11,6 +11,7 @@
 import { useEffect, useState, useCallback } from "react";
 import {
   AlertTriangle,
+  AlertOctagon,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
@@ -44,6 +45,7 @@ interface PurchaseOrder {
   supplier_id: number;
   supplier_name: string;
   status: string;
+  urgency: "at_risk" | "uncoverable" | null;
   created_at: number | null;
   expected_delivery: number | null;
   total_cost: number | null;
@@ -65,7 +67,7 @@ interface PlanItem {
   delivery_date_label: string;
   covers_from: number;
   covers_until: number;
-  status: "planned" | "at_risk" | "placed" | "superseded";
+  status: "planned" | "at_risk" | "uncoverable" | "placed" | "superseded";
   reason: string;
   delivery_charge: number;
   delivery_charge_share: number;
@@ -74,7 +76,18 @@ interface PlanItem {
 interface PlanResponse {
   plan_run_id: number | null;
   generated_at: number;
+  coverage_ok: boolean;
+  total_short: number;
   items: PlanItem[];
+}
+
+interface ProcurementWarning {
+  signal_id: string;
+  ingredient_id: number | null;
+  ingredient_name: string;
+  short_qty: number;
+  unit: string;
+  reason: string;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -113,6 +126,7 @@ interface SupplierCardItem {
   order_date_label: string;
   delivery_date_label: string;
   at_risk?: boolean;
+  uncoverable?: boolean;
   cost?: number | null;  // pre-computed line_total; falls back to unit_price*qty
 }
 
@@ -193,7 +207,16 @@ function SupplierCard({
                         <span className="text-xs text-text/50 tabular-nums whitespace-nowrap">
                           {formatQty(item.qty, item.unit)}
                         </span>
-                        {item.at_risk && (
+                        {item.uncoverable && (
+                          <span
+                            className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-danger/20 text-danger whitespace-nowrap"
+                            title="Cannot be sourced — no lead-feasible / in-stock supply"
+                          >
+                            <AlertOctagon size={10} />
+                            uncoverable
+                          </span>
+                        )}
+                        {item.at_risk && !item.uncoverable && (
                           <span
                             className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-warning/20 text-warning whitespace-nowrap"
                             title="Order-by window passed — placed now for earliest feasible delivery"
@@ -278,6 +301,7 @@ function PlanSection({
               order_date_label: i.order_date_label,
               delivery_date_label: i.delivery_date_label,
               at_risk: i.status === "at_risk",
+              uncoverable: i.status === "uncoverable",
             }));
             return (
               <SupplierCard
@@ -321,6 +345,8 @@ function OrderedSection({
         <div className="space-y-2">
           {Array.from(bySupplier.entries()).map(([supplier, supplierPos]) => {
             // Flatten all lines from all POs for this supplier into card items.
+            // Carry the PO-level urgency label onto each line so the badge shows
+            // on ordered items that were at_risk or uncoverable when placed.
             const cardItems: SupplierCardItem[] = supplierPos.flatMap((po) =>
               (po.lines ?? []).map((ln) => ({
                 id: ln.id,
@@ -331,6 +357,8 @@ function OrderedSection({
                 order_date_label: dayLabel(po.created_at),
                 delivery_date_label: dayLabel(po.expected_delivery),
                 cost: ln.line_total,
+                at_risk: po.urgency === "at_risk",
+                uncoverable: po.urgency === "uncoverable",
               }))
             );
             // Delivery charge = total_cost minus goods total (what create_po added)
@@ -532,6 +560,21 @@ export function ProcurementPanel() {
   const [deliveredPage, setDeliveredPage] = useState(0);
   const [deliveredHasMore, setDeliveredHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Procurement warnings — live INGREDIENT_UNCOVERABLE signals.
+  // Future features query: GET /api/track-b/procurement/warnings
+  // Live updates arrive via signal_emitted WS event (type === "INGREDIENT_UNCOVERABLE").
+  const [warnings, setWarnings] = useState<ProcurementWarning[]>([]);
+
+  const fetchWarnings = useCallback(async () => {
+    try {
+      const res = await apiGet<ProcurementWarning[]>(
+        "/api/track-b/procurement/warnings"
+      );
+      setWarnings(res);
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const fetchPlan = useCallback(async () => {
     setPlanLoading(true);
@@ -569,7 +612,8 @@ export function ProcurementPanel() {
 
   useEffect(() => {
     void fetchPlan();
-  }, [fetchPlan, procurementPlanVersion]);
+    void fetchWarnings();
+  }, [fetchPlan, fetchWarnings, procurementPlanVersion]);
 
   useEffect(() => {
     void fetchOrders(deliveredPage);
@@ -582,6 +626,11 @@ export function ProcurementPanel() {
         void fetchPlan();
         void fetchOrders(deliveredPage);
       }
+      if (signal?.type === "INGREDIENT_UNCOVERABLE") {
+        // A new uncoverable warning arrived — re-fetch the full list so the
+        // banner is always consistent with the server state.
+        void fetchWarnings();
+      }
     });
     const offChange = wsClient.on("manager_change", () => {
       void fetchPlan();
@@ -589,13 +638,14 @@ export function ProcurementPanel() {
     });
     const offPlan = wsClient.on("procurement_plan_updated", () => {
       void fetchPlan();
+      void fetchWarnings();
     });
     return () => {
       offSignal();
       offChange();
       offPlan();
     };
-  }, [fetchPlan, fetchOrders, deliveredPage]);
+  }, [fetchPlan, fetchOrders, fetchWarnings, deliveredPage]);
 
   async function replan() {
     setReplanning(true);
@@ -619,6 +669,30 @@ export function ProcurementPanel() {
         <h2 className="text-sm font-semibold text-text">Procurement</h2>
         {loading && <Loader2 size={14} className="animate-spin text-text/40" />}
       </div>
+
+      {/* Uncoverable-ingredient warnings — distinct from at-risk badges.
+          One row per ingredient the optimizer cannot source at all.
+          Live-updated via signal_emitted(INGREDIENT_UNCOVERABLE) WS event.
+          Future features query: GET /api/track-b/procurement/warnings */}
+      {warnings.length > 0 && (
+        <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 space-y-1">
+          <div className="flex items-center gap-2 text-xs font-semibold text-danger uppercase tracking-wide">
+            <AlertOctagon size={13} />
+            Sourcing Alerts
+          </div>
+          {warnings.map((w) => (
+            <div
+              key={w.signal_id}
+              className="flex items-start gap-2 text-xs text-danger/80"
+            >
+              <span className="font-medium shrink-0">{w.ingredient_name}</span>
+              <span className="text-danger/60 min-w-0 truncate" title={w.reason}>
+                — {w.reason}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Planned — supplier cards */}
       <PlanSection

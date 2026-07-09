@@ -211,6 +211,11 @@ class InventoryOptimizer(BaseAgent):
 
         # Rebuild the forward plan after each reactive sweep.
         self.build_procurement_plan()
+        # B: Execute any overdue rows produced by the build just above (e.g. a
+        # freshly-built at_risk row whose order_date is already < now).  A second
+        # execute pass prevents those rows from sitting visible-and-unexecuted for
+        # a full FORECAST_INTERVAL_SIM_S.  No recursion — execute never calls build.
+        self.execute_due_planned_orders()
 
     def _on_hand_above_reorder(self, ingredient_id: int) -> bool:
         session = self.db_session_factory()
@@ -513,6 +518,7 @@ class InventoryOptimizer(BaseAgent):
         plan_method = "milp"
         plan_coverage_ok = True
         plan_total_short = 0.0
+        _ing_name_by_id: Dict[int, str] = {}  # populated by MILP path; used by emit block
 
         # -- Gather full catalog + all suppliers for every active ingredient --
         if ingredients_data:
@@ -650,7 +656,14 @@ class InventoryOptimizer(BaseAgent):
                     (now_day + _order.delivery_day) * SECONDS_PER_DAY + DAY_OPEN_OFFSET
                 )
                 _order_sim_s = _delivery_sim_s - _lead * SECONDS_PER_DAY
-                _status = "at_risk" if (_order.at_risk or _order_sim_s < now) else "planned"
+                # C: distinguish genuinely uncoverable (no supply, qty==0 sentinel)
+                # from late/expedite orders (buyable but order-by window has passed).
+                if _order.at_risk and (_order.qty or 0) <= 0:
+                    _status = "uncoverable"   # no lead-feasible / in-stock supply
+                elif _order.at_risk or _order_sim_s < now:
+                    _status = "at_risk"       # order window passed, but supply exists
+                else:
+                    _status = "planned"
                 _covers_until = float(
                     (
                         now_day
@@ -674,6 +687,30 @@ class InventoryOptimizer(BaseAgent):
                     "reason": _order.reason,
                 })
 
+        # E: Emit INGREDIENT_UNCOVERABLE signals for genuinely uncoverable rows.
+        # One live signal per ingredient (dedup_key), auto-pushed to the frontend
+        # via the orchestrator→WS signal_emitted bridge.  Future code queries:
+        #     bus.live(type=SignalType.INGREDIENT_UNCOVERABLE)
+        try:
+            from core.signals import IngredientUncoverablePayload  # noqa: PLC0415
+            for _uo in new_orders:
+                if _uo.get("status") == "uncoverable":
+                    _uo_iid = _uo["ingredient_id"]
+                    _uo_name = _ing_name_by_id.get(_uo_iid, str(_uo_iid))
+                    self.emit(
+                        SignalType.INGREDIENT_UNCOVERABLE,
+                        IngredientUncoverablePayload(
+                            ingredient_id=_uo_iid,
+                            ingredient_name=_uo_name,
+                            short_qty=float(plan_total_short),
+                            unit=_uo.get("unit") or "g",
+                            reason=_uo.get("reason") or "No lead-feasible / in-stock supply",
+                        ).model_dump(),
+                        dedup_key=f"uncoverable:{_uo_iid}",
+                    )
+        except Exception:  # noqa: BLE001
+            logger.warning("build_procurement_plan: failed to emit INGREDIENT_UNCOVERABLE signals")
+
         # ----------------------------------------------------------------
         # Phase 3: Hysteresis + persist
         # ----------------------------------------------------------------
@@ -685,7 +722,7 @@ class InventoryOptimizer(BaseAgent):
         try:
             existing_rows = (
                 session.query(PlannedOrder)
-                .filter(PlannedOrder.status.in_(["planned", "at_risk"]))
+                .filter(PlannedOrder.status.in_(["planned", "at_risk", "uncoverable"]))
                 .all()
             )
             existing_by_ingredient: Dict[int, List] = {}
@@ -751,39 +788,42 @@ class InventoryOptimizer(BaseAgent):
                     if row.id not in kept_ids and row.id not in superseded_ids:
                         superseded_ids.add(row.id)
 
-            # Fix B (R1): Reconciliation gate — never persist a new or kept planned row
-            # when an open real PO already covers the same ingredient+supplier demand.
+            # B (R1): Reconciliation gate — never persist a new or kept planned row
+            # when an open real PO already covers that ingredient's demand (any supplier).
             # W4 (sizing, above) prevents the MILP from over-ordering, but it does not
             # remove PlannedOrder rows that a pending-approval PO has already addressed.
-            # This is the safeguard that ensures "at_risk planned row + open PO" never
-            # coexist on the list, regardless of the W4 arrival-estimate accuracy.
+            # Key change from the original: keyed on ingredient_id only (not
+            # ingredient+supplier) so a cross-supplier PO still suppresses the plan row,
+            # preventing the "at_risk plan row + proposed PO on different supplier" duplicate.
             try:
                 from sqlalchemy import func as _sa_func_r1  # local import; avoids top-level dep
-                _open_po_coverage: Dict[tuple, float] = {}
+                _open_po_coverage: Dict[int, float] = {}   # {ingredient_id: total_qty}
                 _open_po_rows = (
                     session.query(
                         PurchaseOrderLine.ingredient_id,
-                        PurchaseOrder.supplier_id,
                         _sa_func_r1.sum(PurchaseOrderLine.qty).label("total_qty"),
                     )
                     .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
                     .filter(PurchaseOrder.status.in_(("proposed", "approved", "placed")))
-                    .group_by(PurchaseOrderLine.ingredient_id, PurchaseOrder.supplier_id)
+                    .group_by(PurchaseOrderLine.ingredient_id)
                     .all()
                 )
-                for _r1_ing, _r1_sup, _r1_qty in _open_po_rows:
-                    _open_po_coverage[(_r1_ing, _r1_sup)] = float(_r1_qty or 0.0)
+                for _r1_ing, _r1_qty in _open_po_rows:
+                    _open_po_coverage[int(_r1_ing)] = (
+                        _open_po_coverage.get(int(_r1_ing), 0.0) + float(_r1_qty or 0.0)
+                    )
 
                 if _open_po_coverage:
                     _r1_filtered: List[Dict] = []
                     for _od in final_new_orders:
-                        _r1_key = (_od["ingredient_id"], _od["supplier_id"])
-                        if _open_po_coverage.get(_r1_key, 0.0) >= float(_od["qty"] or 0.0):
+                        _r1_iid = int(_od["ingredient_id"])
+                        _r1_need = float(_od["qty"] or 0.0)
+                        _r1_covered = _open_po_coverage.get(_r1_iid, 0.0)
+                        if _r1_covered >= _r1_need:
                             logger.info(
-                                "R1: suppressing planned row ingredient=%s supplier=%s "
-                                "(open PO qty %.1f ≥ needed %.1f).",
-                                _od["ingredient_id"], _od["supplier_id"],
-                                _open_po_coverage[_r1_key], _od["qty"],
+                                "R1: suppressing planned row ingredient=%s "
+                                "(open PO qty %.1f across all suppliers ≥ needed %.1f).",
+                                _r1_iid, _r1_covered, _r1_need,
                             )
                         else:
                             _r1_filtered.append(_od)
@@ -793,12 +833,14 @@ class InventoryOptimizer(BaseAgent):
                         _r1_krow = session.get(PlannedOrder, _r1_row_id)
                         if _r1_krow is None:
                             continue
-                        _r1_key = (_r1_krow.ingredient_id, _r1_krow.supplier_id)
-                        if _open_po_coverage.get(_r1_key, 0.0) >= float(_r1_krow.qty or 0.0):
+                        _r1_iid = int(_r1_krow.ingredient_id)
+                        _r1_need = float(_r1_krow.qty or 0.0)
+                        _r1_covered = _open_po_coverage.get(_r1_iid, 0.0)
+                        if _r1_covered >= _r1_need:
                             logger.info(
-                                "R1: superseding kept planned row %s ingredient=%s supplier=%s "
-                                "(open PO already covers demand).",
-                                _r1_row_id, _r1_krow.ingredient_id, _r1_krow.supplier_id,
+                                "R1: superseding kept planned row %s ingredient=%s "
+                                "(open PO qty %.1f across all suppliers covers demand).",
+                                _r1_row_id, _r1_iid, _r1_covered,
                             )
                             kept_ids.discard(_r1_row_id)
                             superseded_ids.add(_r1_row_id)
@@ -876,7 +918,7 @@ class InventoryOptimizer(BaseAgent):
             due = (
                 session.query(PlannedOrder)
                 .filter(
-                    PlannedOrder.status.in_(["planned", "at_risk"]),
+                    PlannedOrder.status.in_(["planned", "at_risk", "uncoverable"]),
                     PlannedOrder.order_date <= now,
                 )
                 .all()
@@ -892,9 +934,20 @@ class InventoryOptimizer(BaseAgent):
                     "unit_price": po.unit_price,
                     "delivery_date": po.delivery_date,  # A4: carry through for _place
                     "order_date": po.order_date,        # W2: detect late/at-risk rows
+                    "status": po.status,                # D: propagate urgency to PO
+                    "plan_run_id": po.plan_run_id,      # A: net-once — find plan's created_at
                 }
                 for po in due
             ]
+            # A: Batch-resolve plan_run created_at so we only net POs the plan
+            # hadn't already credited.  One query across all distinct plan_run_ids.
+            _run_ids = {d["plan_run_id"] for d in due_data if d["plan_run_id"]}
+            _run_created_at: Dict[int, float] = {}
+            if _run_ids:
+                for _run in session.query(ProcurementPlanRun).filter(
+                    ProcurementPlanRun.id.in_(_run_ids)
+                ).all():
+                    _run_created_at[_run.id] = float(_run.created_at or 0.0)
             # Load delivery charges for all relevant suppliers in one query.
             sup_ids = {d["supplier_id"] for d in due_data if d["supplier_id"]}
             delivery_charges: Dict[int, float] = {}
@@ -923,17 +976,31 @@ class InventoryOptimizer(BaseAgent):
             placed_ids = []
             for po_data in group:
                 ing_id = po_data["ingredient_id"]
+                # A: Net once, correctly.  The plan already credited open POs that
+                # existed at plan-build time via inbound_by_day (MILP arrivals).
+                # Only subtract POs created AFTER the plan ran — those are genuinely
+                # new pipeline the plan hadn't accounted for.
+                # If plan_run_id/created_at is unknown, assume plan credited nothing
+                # (order full qty) to avoid re-introducing the double subtraction.
+                _run_id = po_data.get("plan_run_id")
+                _plan_built_at = _run_created_at.get(_run_id) if _run_id else None
+
                 session2 = self.db_session_factory()
                 try:
-                    inbound_qty_row = (
+                    _inbound_q = (
                         session2.query(_sa_func.sum(PurchaseOrderLine.qty))
                         .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
                         .filter(
                             PurchaseOrderLine.ingredient_id == ing_id,
                             PurchaseOrder.status.in_(("proposed", "approved", "placed")),
                         )
-                        .scalar()
                     )
+                    if _plan_built_at is not None:
+                        # Only count POs placed AFTER the plan was built.
+                        _inbound_q = _inbound_q.filter(
+                            PurchaseOrder.created_at >= _plan_built_at
+                        )
+                    inbound_qty_row = _inbound_q.scalar()
                 finally:
                     session2.close()
                 inbound_qty = float(inbound_qty_row or 0.0)
@@ -992,6 +1059,16 @@ class InventoryOptimizer(BaseAgent):
             )
             dc = delivery_charges.get(supplier_id, 0.0)
 
+            # D: Derive group urgency from source planned rows — "uncoverable" wins
+            # over "at_risk"; stored on the PO so the Ordered section can badge it.
+            _group_statuses = {d.get("status") for d in group}
+            if "uncoverable" in _group_statuses:
+                _group_urgency: Optional[str] = "uncoverable"
+            elif "at_risk" in _group_statuses or group_late:
+                _group_urgency = "at_risk"
+            else:
+                _group_urgency = None
+
             try:
                 created_po = self.procurement.create_po(
                     supplier_id=supplier_id,
@@ -999,6 +1076,7 @@ class InventoryOptimizer(BaseAgent):
                     created_by=self.name,
                     planned_delivery=planned_delivery,  # A4/W2: ASAP for late, plan date for on-time
                     delivery_charge=dc,                 # include delivery fee in total_cost
+                    urgency=_group_urgency,             # D: propagate at_risk/uncoverable label
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(

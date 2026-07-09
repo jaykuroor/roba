@@ -144,6 +144,7 @@ class Procurement:
         created_by: str = "optimizer",
         planned_delivery: Optional[float] = None,
         delivery_charge: float = 0.0,
+        urgency: Optional[str] = None,
     ) -> PurchaseOrder:
         """Create a PO (+ lines); auto-place or route to approval (§18.8).
 
@@ -154,6 +155,11 @@ class Procurement:
 
         ``delivery_charge`` — fixed delivery fee for this supplier order; added
         to ``total_cost`` so PO totals reflect true landed cost.
+
+        ``urgency`` — propagated from the source PlannedOrder rows:
+        ``"uncoverable"`` if any source row was uncoverable, ``"at_risk"`` if
+        any was late/expedited, else ``None``.  Stored on the PO so the UI can
+        show the label on the Ordered section permanently.
 
         Supplier ``volume_discount`` tiers and per-item catalog ``discount``
         tiers are applied to ``total_cost`` so the stored PO total equals the
@@ -173,6 +179,7 @@ class Procurement:
                 total_cost=total,
                 created_by=created_by,
                 approval_id=None,
+                urgency=urgency or None,
             )
             session.add(po)
             session.flush()
