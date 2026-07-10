@@ -623,7 +623,7 @@ class InventoryOptimizer(BaseAgent):
                     "lead_risk_lambda": 0.3,
                     "spoilage_penalty_multiplier": 2.0,
                     "slack_penalty": 1000.0,
-                    "safety_penalty_multiplier": 1.5,
+                    "safety_penalty_multiplier": 0.0,  # safety buffer is a reporting target only; never drives a goods purchase
                     "reorder_interval_days": config.REORDER_INTERVAL_DAYS,
                     "lots_by_ing": _lots_map,
                 },

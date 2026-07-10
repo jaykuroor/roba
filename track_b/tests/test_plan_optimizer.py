@@ -542,3 +542,65 @@ def test_no_orders_when_fully_stocked():
     assert not sol.orders, (
         f"Expected zero orders when fully stocked, got: {sol.orders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 13: safety_penalty_multiplier=0 → safety buffer never drives a purchase
+# ---------------------------------------------------------------------------
+
+def test_milp_no_safety_purchase_when_demand_covered():
+    """With safety_penalty_multiplier=0, the MILP must NOT order solely to top up
+    the safety buffer when all forecast demand is already covered by on-hand stock."""
+    n = 7
+    daily_demand = 20.0
+    total_demand = daily_demand * n  # 140
+    on_hand_qty = total_demand + 10.0  # 150 — covers all demand
+    safety_stock_qty = on_hand_qty + 50.0  # 200 — above on_hand: safety deficit exists
+
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=0.02, pack=2000.0)],
+        suppliers=[_sup(1, lead=1.0, dc=15.0, mov=80.0)],
+        demand_by_day={1: {d: daily_demand for d in range(n)}},
+        on_hand={1: on_hand_qty},
+        safety_stock={1: safety_stock_qty},
+        n_days=n,
+        params={"slack_penalty": 1000.0, "safety_penalty_multiplier": 0.0},
+    )
+    assert not sol.orders, (
+        f"Expected no orders when demand is covered and safety is non-cost-bearing, "
+        f"got: {sol.orders}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Greedy fallback — demand-driven, safety buffer never drives a purchase
+# ---------------------------------------------------------------------------
+
+def test_greedy_no_safety_purchase_when_demand_covered():
+    """Greedy fallback must NOT order solely to fill the safety buffer when all
+    forecast demand is already covered by on-hand stock."""
+    import track_b.procurement.plan_optimizer as _pm
+
+    n = 7
+    daily_demand = 20.0
+    total_demand = daily_demand * n  # 140
+    on_hand_qty = total_demand + 10.0  # 150 — covers all demand
+    safety_stock_qty = on_hand_qty + 50.0  # 200 — above on_hand: safety deficit
+
+    with mock.patch.object(_pm, "_PULP_AVAILABLE", False):
+        sol = _run(
+            ingredients=[_ing(1)],
+            catalog=[_cat(1, 1, price=0.02, pack=2000.0)],
+            suppliers=[_sup(1, lead=1.0)],
+            demand_by_day={1: {d: daily_demand for d in range(n)}},
+            on_hand={1: on_hand_qty},
+            safety_stock={1: safety_stock_qty},
+            n_days=n,
+            params={"slack_penalty": 1000.0, "safety_penalty_multiplier": 0.0},
+        )
+    assert sol.method == "greedy", f"Expected greedy fallback, got {sol.method!r}"
+    assert not sol.orders, (
+        f"Expected no greedy orders when demand is covered and safety is non-cost-bearing, "
+        f"got: {sol.orders}"
+    )

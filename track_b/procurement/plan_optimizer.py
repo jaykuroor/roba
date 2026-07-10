@@ -374,9 +374,11 @@ def _solve_milp(
         for d in range(n_days):
             # (3a) Hard demand-coverage shortfall — dominates all cost terms.
             obj_terms.append(slack_penalty * demand_short[iid, d])
-            # (3b) Soft safety-buffer shortfall — value-scaled so it is filled
-            #      opportunistically but never justifies a dedicated delivery.
-            obj_terms.append(safety_pen_mult * max(p_ref, 1e-6) * safety_short[iid, d])
+            # (3b) Soft safety-buffer shortfall — only added to objective when
+            #      safety_pen_mult > 0.  When the caller sets it to 0.0, the safety
+            #      buffer becomes a pure reporting target and never drives a purchase.
+            if safety_pen_mult > 0:
+                obj_terms.append(safety_pen_mult * max(p_ref, 1e-6) * safety_short[iid, d])
             # (4) Spoilage / waste penalty (perishables carry real waste vars).
             if perishable:
                 obj_terms.append(spoil_pen_mult * max(p_ref, 1e-6) * waste[iid, d])
@@ -763,47 +765,49 @@ def _solve_greedy(
             lots = [l for l in lots if l[0] > 1e-9]
             running = sum(l[0] for l in lots)
 
-            if running < ss:
-                cover_days = lead + reorder_interval + 1
-                cover_end = min(n_days, d + _math.ceil(cover_days))
-                demand_to_cover = sum(
-                    demand_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d, cover_end)
+            # Demand-driven reorder: order only when projected demand over the
+            # lead+interval window cannot be met from current stock + inbound.
+            # Safety stock is a reporting target only — never drives a purchase.
+            cover_days = lead + reorder_interval + 1
+            cover_end = min(n_days, d + _math.ceil(cover_days))
+            demand_to_cover = sum(
+                demand_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d, cover_end)
+            )
+            inbound_window = sum(
+                inbound_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d + 1, cover_end)
+            )
+            needed = max(0.0, demand_to_cover - max(0.0, running) - inbound_window)
+            if shelf_life:
+                exp_end = min(n_days, d + _math.ceil(min(shelf_life, cover_days)))
+                dbe = sum(
+                    demand_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d, exp_end)
                 )
-                inbound_window = sum(
-                    inbound_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d + 1, cover_end)
-                )
-                needed = max(0.0, demand_to_cover + ss - max(0.0, running) - inbound_window)
-                if shelf_life:
-                    exp_end = min(n_days, d + _math.ceil(min(shelf_life, cover_days)))
-                    dbe = sum(
-                        demand_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d, exp_end)
-                    )
-                    if 0 < dbe < needed:
-                        needed = dbe
-                if needed <= 0:
-                    continue
-                qty = _math.ceil(needed / pack_size) * pack_size
+                if 0 < dbe < needed:
+                    needed = dbe
+            if needed <= 0:
+                continue
+            qty = _math.ceil(needed / pack_size) * pack_size
 
-                # Lead-time feasible delivery day: d or d + ceil(lead) if d < ceil(lead)
-                delivery_day = max(d, _math.ceil(lead))
+            # Lead-time feasible delivery day: d or d + ceil(lead) if d < ceil(lead)
+            delivery_day = max(d, _math.ceil(lead))
 
-                at_risk = all_out or delivery_day > d
-                orders.append(PlanOrder(
-                    ingredient_id=iid,
-                    supplier_id=s_id,
-                    delivery_day=delivery_day,
-                    qty=qty,
-                    unit_price=price,
-                    unit=unit,
-                    at_risk=at_risk,
-                    reason=(
-                        f"Greedy: projected stock below safety_stock ({ss:.0f}) on day {d}"
-                        + (" [no in-stock supplier]" if all_out else "")
-                    ),
-                ))
-                exp = delivery_day + (shelf_life if shelf_life else _LOT_NEVER)
-                lots.append([qty, exp])
-                running += qty
+            at_risk = all_out or delivery_day > d
+            orders.append(PlanOrder(
+                ingredient_id=iid,
+                supplier_id=s_id,
+                delivery_day=delivery_day,
+                qty=qty,
+                unit_price=price,
+                unit=unit,
+                at_risk=at_risk,
+                reason=(
+                    f"Greedy: demand shortfall on day {d}, safety_stock={ss:.0f}"
+                    + (" [no in-stock supplier]" if all_out else "")
+                ),
+            ))
+            exp = delivery_day + (shelf_life if shelf_life else _LOT_NEVER)
+            lots.append([qty, exp])
+            running += qty
 
     return PlanSolution(
         orders=orders,
