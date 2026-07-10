@@ -2869,20 +2869,33 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
             "order_date": o.order_date,
             "order_date_label": order_label,
             "delivery_date": o.delivery_date,
-            "delivery_date_label": _day_label(float(o.delivery_date or 0.0)),
+            "delivery_date_label": _day_time_label(float(o.delivery_date or 0.0)),
             "covers_from": o.covers_from,
             "covers_until": o.covers_until,
             "status": o.status,
             "reason": o.reason or "",
             "delivery_charge": dc,
             "delivery_charge_share": round(dc / max(1, n_in_group), 4),
+            "projected_stock_before": float(getattr(o, "projected_stock_before", 0.0) or 0.0),
+            "qty_needed_before": float(getattr(o, "qty_needed_before", 0.0) or 0.0),
+            "shortage_if_late": float(getattr(o, "shortage_if_late", 0.0) or 0.0),
+            "latest_safe_arrival": float(o.latest_safe_arrival) if getattr(o, "latest_safe_arrival", None) is not None else None,
         })
 
     return {
         "plan_run_id": latest_run.id if latest_run else None,
         "generated_at": float(latest_run.created_at) if latest_run else 0.0,
+        # forecast_coverage_ok: plan covers demand assuming all deliveries arrive on time
+        #   (includes not-yet-placed planned orders).  Alias of coverage_ok.
         "coverage_ok": bool(getattr(latest_run, "coverage_ok", 1)) if latest_run else True,
+        "forecast_coverage_ok": bool(getattr(latest_run, "coverage_ok", 1)) if latest_run else True,
         "total_short": float(getattr(latest_run, "total_short", 0.0) or 0.0) if latest_run else 0.0,
+        # coverage_depends_on_planned_orders: True when committed supply alone cannot cover
+        #   demand — placing the planned orders is necessary to achieve coverage.
+        "coverage_depends_on_planned_orders": bool(getattr(latest_run, "coverage_depends_on_planned_orders", 0)) if latest_run else False,
+        # late_delivery_coverage_ok: True when a universal one-day delivery slip still
+        #   leaves all demand covered.
+        "late_delivery_coverage_ok": bool(getattr(latest_run, "late_delivery_coverage_ok", 1)) if latest_run else True,
         "reliability_premium": float(getattr(latest_run, "reliability_premium", 0.0) or 0.0) if latest_run else 0.0,
         "exposed_value_baseline": float(getattr(latest_run, "exposed_value_baseline", 0.0) or 0.0) if latest_run else 0.0,
         "exposed_value_protected": float(getattr(latest_run, "exposed_value_protected", 0.0) or 0.0) if latest_run else 0.0,

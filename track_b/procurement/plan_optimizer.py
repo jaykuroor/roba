@@ -90,8 +90,13 @@ class PlanOrder:
     qty: float                 # total quantity in base units
     unit_price: float          # per-base-unit price
     unit: str
-    at_risk: bool = False      # True when coverage cannot be guaranteed
+    at_risk: bool = False      # True when a one-day slip of THIS line causes a shortage
     reason: str = ""
+    # Per-line risk detail (computed by _per_line_risk after solving)
+    projected_stock_before: float = 0.0  # stock on hand at start of delivery day, before this arrival
+    qty_needed_before: float = 0.0       # cumulative demand up to and including the delivery day
+    shortage_if_late: float = 0.0        # units short if this specific line arrives one day late
+    latest_safe_arrival: int = -1        # latest horizon-day this line can arrive without stockout; -1=unconstrained
 
 
 @dataclass
@@ -108,6 +113,8 @@ class PlanSolution:
     reliability_premium: float = 0.0   # extra cash vs the cash-optimal plan
     exposed_value_baseline: float = 0.0  # margin exposed under 1-day delay, no-plan baseline
     exposed_value_plan: float = 0.0    # margin exposed under 1-day delay, chosen plan
+    # Unit shortfall under a universal +1-day delay (always computed by MILP; 0 for greedy)
+    unit_shortfall_if_1day_late: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +291,150 @@ def _one_day_delay_exposure(
 
 
 # ---------------------------------------------------------------------------
+# Per-line risk projection
+# ---------------------------------------------------------------------------
+
+def _per_line_risk(
+    orders: List[PlanOrder],
+    demand_by_day: Dict[int, Dict[int, float]],
+    on_hand: Dict[int, float],
+    inbound_by_day: Dict[int, Dict[int, float]],
+    lots_by_ing: Dict[int, List[List[float]]],
+    n_days: int,
+    ingredient_ids: List[int],
+    ing_by_id: Dict[int, Dict],
+) -> Dict[Tuple[int, int, int], Dict]:
+    """Per-(ingredient, supplier, delivery_day) risk detail.
+
+    For each PlanOrder, runs a single FIFO lot projection per ingredient that
+    records stock BEFORE plan arrivals on each day.  Returns a dict keyed by
+    (ingredient_id, supplier_id, delivery_day) with:
+      projected_stock_before  — stock available before any plan arrivals on the delivery day
+      qty_needed_before       — cumulative demand on days 0..delivery_day (inclusive)
+      shortage_if_late        — extra shortfall on the delivery day if THIS line arrives one day late
+      latest_safe_arrival     — horizon-day offset by which the line must arrive (or -1 if unconstrained)
+      at_risk                 — True when shortage_if_late > 0.5
+    """
+    _LOT_NEVER = float(_INF_DAY)
+
+    # Group orders by ingredient for fast lookup
+    orders_by_ing: Dict[int, List[PlanOrder]] = {}
+    for o in orders:
+        if (o.qty or 0) > 0:
+            orders_by_ing.setdefault(o.ingredient_id, []).append(o)
+
+    # Total plan qty arriving per (ingredient, delivery_day)
+    plan_arrivals: Dict[int, Dict[int, float]] = {}
+    for o in orders:
+        if (o.qty or 0) > 0:
+            plan_arrivals.setdefault(o.ingredient_id, {})
+            plan_arrivals[o.ingredient_id][o.delivery_day] = (
+                plan_arrivals[o.ingredient_id].get(o.delivery_day, 0.0) + o.qty
+            )
+
+    result: Dict[Tuple[int, int, int], Dict] = {}
+
+    for iid in ingredient_ids:
+        if iid not in orders_by_ing:
+            continue
+        ing = ing_by_id.get(iid, {})
+        shelf_life = (
+            float(ing.get("shelf_life_days") or 0.0)
+            if ing.get("perishable")
+            else None
+        )
+        inb = inbound_by_day.get(iid, {})
+
+        # Seed opening lots
+        raw = lots_by_ing.get(iid)
+        if raw:
+            lots: List[List[float]] = [[float(qq), float(ee)] for qq, ee in raw]
+        else:
+            lots = [[float(on_hand.get(iid, 0.0)), _LOT_NEVER]]
+
+        # Run full projection, recording stock BEFORE plan arrivals each day.
+        stock_before_plan: Dict[int, float] = {}
+        for d in range(n_days):
+            # Expire lots
+            lots = [l for l in lots if l[1] > d]
+            lots.sort(key=lambda l: l[1])
+
+            # Credit inbound POs (already-placed, assumed on-time)
+            inb_d = inb.get(d, 0.0)
+            if inb_d > 0:
+                exp = d + (shelf_life if shelf_life else _LOT_NEVER)
+                lots.append([inb_d, exp])
+
+            # Record stock BEFORE plan arrivals on this day
+            stock_before_plan[d] = max(0.0, sum(l[0] for l in lots))
+
+            # Credit plan arrivals
+            pa_d = plan_arrivals.get(iid, {}).get(d, 0.0)
+            if pa_d > 0:
+                exp = d + (shelf_life if shelf_life else _LOT_NEVER)
+                lots.append([pa_d, exp])
+
+            # Consume demand FIFO
+            dem = demand_by_day.get(iid, {}).get(d, 0.0)
+            rem = dem
+            for lot in lots:
+                take = min(lot[0], rem)
+                lot[0] -= take
+                rem -= take
+                if rem <= 0:
+                    break
+            lots = [l for l in lots if l[0] > 1e-9]
+
+        # Cumulative demand per day (for qty_needed_before)
+        cum_demand: Dict[int, float] = {}
+        running = 0.0
+        for d in range(n_days):
+            running += demand_by_day.get(iid, {}).get(d, 0.0)
+            cum_demand[d] = running
+
+        # Per-order detail
+        for o in orders_by_ing[iid]:
+            d = o.delivery_day
+            sb = stock_before_plan.get(d, 0.0)
+            dem_d = demand_by_day.get(iid, {}).get(d, 0.0)
+
+            # Other plan arrivals on the same day (to share the protective buffer)
+            other_plan = max(0.0, plan_arrivals.get(iid, {}).get(d, 0.0) - o.qty)
+
+            # shortage_if_late: demand on day d unmet if THIS line doesn't arrive today
+            # Stock available without this order = stock_before_plan[d] + other_plan
+            shortage_if_late = max(0.0, dem_d - (sb + other_plan))
+
+            # latest_safe_arrival: if shortage_if_late > 0, order must arrive by day d.
+            # Otherwise it can slip to day d+1 with no impact (very conservative — we
+            # don't re-project the tail; reporting "unconstrained" is safe).
+            if shortage_if_late > 0.5:
+                latest_safe = d
+            else:
+                # Check whether day d+1 (or later) would be the first stockout without
+                # this order's quantity.  Approximate: if stock_before_plan[d+1] < demand[d+1],
+                # then this order should arrive by day d+1 at the latest.
+                latest_safe = -1  # unconstrained by default
+                for dd in range(d + 1, n_days):
+                    dem_dd = demand_by_day.get(iid, {}).get(dd, 0.0)
+                    # After consuming day d+1 demand from pre-existing stock-before-plan[d+1],
+                    # is there still enough?  (conservative: ignores this order's qty arriving later)
+                    if stock_before_plan.get(dd, 0.0) < dem_dd - 0.5:
+                        latest_safe = dd
+                        break
+
+            result[(iid, o.supplier_id, d)] = {
+                "projected_stock_before": sb,
+                "qty_needed_before": cum_demand.get(d, 0.0),
+                "shortage_if_late": shortage_if_late,
+                "latest_safe_arrival": latest_safe,
+                "at_risk": shortage_if_late > 0.5,
+            }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # MILP solver
 # ---------------------------------------------------------------------------
 
@@ -324,6 +475,22 @@ def _solve_milp(
     lead_ceil: Dict[int, int] = {
         int(s["id"]): max(1, math.ceil(float(s.get("lead_time_days") or 1.0)))
         for s in suppliers
+    }
+
+    # Delivery hour per supplier (24-h float, e.g. 8.0 = 08:00).
+    # A supplier whose delivery_hour > PRODUCTION_START_HOUR (default 8.0) delivers
+    # AFTER production starts, so its deliveries on physical day d only serve service
+    # day d+1.  With default delivery_hour=8.0 and production_start=8.0 the shift is
+    # 0 — all arrivals serve the same day (identical to historic behaviour).
+    _prod_start = float(params.get("production_start_hour", 8.0))
+    delivery_hour_by_sup: Dict[int, float] = {
+        int(s["id"]): float(s.get("delivery_hour") or 8.0)
+        for s in suppliers
+    }
+    # service_shift[s_id] = 0 if arrives before/at production start, else 1
+    service_shift: Dict[int, int] = {
+        s_id: (0 if dh <= _prod_start else 1)
+        for s_id, dh in delivery_hour_by_sup.items()
     }
 
     # Active ingredients: those with any demand OR on_hand < safety_stock
@@ -447,14 +614,20 @@ def _solve_milp(
         pack_size = float(c.get("pack_size") or 1.0)
         return q[key] * pack_size
 
-    # Arrivals of ingredient i on day d (new orders + in-flight inbound).
-    def _arrivals(iid: int, d: int) -> Any:
-        terms = [
-            _x(iid, s_id, d)
-            for s_id in all_sup_ids
-            if (iid, s_id, d) in q
-        ]
-        return pulp.lpSum(terms) + inbound_by_day.get(iid, {}).get(d, 0.0)
+    # Arrivals of ingredient i on service day D (new orders + in-flight inbound).
+    # For on-time suppliers (shift=0): order vars q[iid, s, D] serve service day D.
+    # For late suppliers (shift=1): order vars q[iid, s, D-1] serve service day D
+    #   (physical delivery on day D-1 arrives after production, so demand served next day).
+    # With default delivery_hour=8 and production_start=8 all shifts are 0 — identical
+    # to the previous behaviour.
+    def _arrivals(iid: int, D: int) -> Any:
+        terms = []
+        for s_id in all_sup_ids:
+            shift = service_shift.get(s_id, 0)
+            phys_d = D - shift  # physical delivery day that serves service day D
+            if phys_d >= 0 and (iid, s_id, phys_d) in q:
+                terms.append(_x(iid, s_id, phys_d))
+        return pulp.lpSum(terms) + inbound_by_day.get(iid, {}).get(D, 0.0)
 
     # ------------------------------------------------------------------
     # Build expression components
@@ -778,6 +951,31 @@ def _solve_milp(
                 total_cost += qty * p
                 ordered_ings.add(iid)
 
+    # ------------------------------------------------------------------
+    # Per-line risk detail — replace blanket at_risk with shortage-based flag
+    # ------------------------------------------------------------------
+    try:
+        _risk_detail = _per_line_risk(
+            orders=orders,
+            demand_by_day=demand_by_day,
+            on_hand=on_hand,
+            inbound_by_day=inbound_by_day,
+            lots_by_ing=lots_by_ing,
+            n_days=n_days,
+            ingredient_ids=active_ids,
+            ing_by_id=ing_by_id,
+        )
+        for o in orders:
+            detail = _risk_detail.get((o.ingredient_id, o.supplier_id, o.delivery_day))
+            if detail is not None:
+                o.projected_stock_before = detail["projected_stock_before"]
+                o.qty_needed_before = detail["qty_needed_before"]
+                o.shortage_if_late = detail["shortage_if_late"]
+                o.latest_safe_arrival = detail["latest_safe_arrival"]
+                o.at_risk = detail["at_risk"]
+    except Exception:  # noqa: BLE001
+        logger.warning("plan_optimizer: _per_line_risk failed; keeping blanket at_risk flags.")
+
     # Never drop an ingredient silently: explicit at_risk marker for uncoverable demand.
     for iid in active_ids:
         if short_by_ing.get(iid, 0.0) <= 1.0 or iid in ordered_ings:
@@ -867,6 +1065,26 @@ def _solve_milp(
             exposed_value_baseline = 0.0
             exposed_value_plan = 0.0
 
+    # ------------------------------------------------------------------
+    # Unit shortfall under a universal +1-day delay (for late_delivery_coverage_ok)
+    # Reuse the existing exposure function with unit weights (1.0 per ingredient).
+    # ------------------------------------------------------------------
+    unit_shortfall_if_1day_late = 0.0
+    try:
+        unit_shortfall_if_1day_late = _one_day_delay_exposure(
+            orders=orders,
+            demand_by_day=demand_by_day,
+            on_hand=on_hand,
+            inbound_by_day=inbound_by_day,
+            lots_by_ing=lots_by_ing,
+            margin_by_ing={iid: 1.0 for iid in active_ids},  # unit weight → returns unit shortfall
+            n_days=n_days,
+            ingredient_ids=active_ids,
+            ing_by_id=ing_by_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("plan_optimizer: unit_shortfall_if_1day_late computation failed; defaulting to 0.")
+
     rationale = (
         f"Time-phased MILP: {len(orders)} order lines across "
         f"{len({(o.supplier_id, o.delivery_day) for o in orders if o.qty > 0})} "
@@ -892,6 +1110,7 @@ def _solve_milp(
         reliability_premium=reliability_premium,
         exposed_value_baseline=exposed_value_baseline,
         exposed_value_plan=exposed_value_plan,
+        unit_shortfall_if_1day_late=unit_shortfall_if_1day_late,
     )
 
 
@@ -1028,6 +1247,33 @@ def _solve_greedy(
             running += qty
 
     cash = sum(o.qty * o.unit_price for o in orders)
+
+    # Per-line risk detail (greedy path)
+    _lots_g = params.get("lots_by_ing") or {}
+    _ing_by_id_g: Dict[int, Dict] = {int(i["id"]): i for i in ingredients}
+    _active_ids_g = list({o.ingredient_id for o in orders if (o.qty or 0) > 0})
+    try:
+        _risk_g = _per_line_risk(
+            orders=orders,
+            demand_by_day=demand_by_day,
+            on_hand=on_hand,
+            inbound_by_day=inbound_by_day,
+            lots_by_ing=_lots_g,
+            n_days=n_days,
+            ingredient_ids=_active_ids_g,
+            ing_by_id=_ing_by_id_g,
+        )
+        for o in orders:
+            detail = _risk_g.get((o.ingredient_id, o.supplier_id, o.delivery_day))
+            if detail is not None:
+                o.projected_stock_before = detail["projected_stock_before"]
+                o.qty_needed_before = detail["qty_needed_before"]
+                o.shortage_if_late = detail["shortage_if_late"]
+                o.latest_safe_arrival = detail["latest_safe_arrival"]
+                o.at_risk = detail["at_risk"] or o.at_risk  # preserve all_out flag
+    except Exception:  # noqa: BLE001
+        logger.warning("plan_optimizer: _per_line_risk (greedy) failed; keeping blanket at_risk flags.")
+
     return PlanSolution(
         orders=orders,
         total_cost=cash,

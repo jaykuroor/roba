@@ -146,6 +146,13 @@ PROMO_SLOW_MOVER_PCT = int(os.getenv("PROMO_SLOW_MOVER_PCT", "15"))
 # RELIABILITY_CASH_TOLERANCE: maximum fraction of the cash-optimal plan cost that may
 # be spent to buy down one-day-delay exposure.  0.01 = 1%.  Set to 0 to force pure
 # cash-optimal ordering (reliability has no influence on supplier selection or timing).
+# Procurement production-start hour: deliveries arriving at or before this hour
+# (24-h clock) are available for the same day's production.  Deliveries after
+# this hour only serve the *next* day.  Default 8.0 = 08:00 (matches the
+# historical DAY_OPEN_OFFSET assumption; no behavioral change unless a supplier's
+# delivery_hour is set above this threshold).
+PRODUCTION_START_HOUR = float(os.getenv("PRODUCTION_START_HOUR", "8.0"))
+
 RELIABILITY_CASH_TOLERANCE = float(os.getenv("RELIABILITY_CASH_TOLERANCE", "0.01"))
 # RELIABILITY_STRESS_ENABLED: when True, run the two-pass lexicographic solve (pass 1
 # = cash-optimal, pass 2 = minimize one-day-delay exposure within the cash cap).

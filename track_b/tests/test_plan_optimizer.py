@@ -22,8 +22,8 @@ from track_b.procurement.plan_optimizer import (
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
-def _sup(sup_id, lead=1.0, reliability=0.95, mov=0.0, dc=0.0, vol_discount=None):
-    return {
+def _sup(sup_id, lead=1.0, reliability=0.95, mov=0.0, dc=0.0, vol_discount=None, delivery_hour=None):
+    d = {
         "id": sup_id,
         "name": f"Supplier{sup_id}",
         "lead_time_days": lead,
@@ -32,6 +32,9 @@ def _sup(sup_id, lead=1.0, reliability=0.95, mov=0.0, dc=0.0, vol_discount=None)
         "delivery_charge": dc,
         "volume_discount": vol_discount,
     }
+    if delivery_hour is not None:
+        d["delivery_hour"] = delivery_hour
+    return d
 
 
 def _cat(sup_id, ing_id, price=1.0, pack=100.0, avail="in_stock",
@@ -692,3 +695,160 @@ def test_stress_pass_produces_solution_fields():
     assert sol.exposed_value_plan >= 0.0, "Plan exposure must be non-negative"
     # Coverage must remain fully intact
     assert sol.coverage_ok, f"Coverage must hold after stress pass; total_short={sol.total_short}"
+
+
+# ---------------------------------------------------------------------------
+# Test 19: Service-day model (workstream D)
+# ---------------------------------------------------------------------------
+
+def test_service_day_late_delivery_hour_serves_next_day():
+    """A supplier with delivery_hour=14 (after production_start=8) can only serve
+    next-day demand: physical delivery on day d ↦ service day d+1.
+
+    Setup: n=5, daily=100g, on_hand=200 (covers service days 0 and 1).
+    Supplier lead=1, delivery_hour=14 → service_shift=1.
+    Earliest physical delivery: day 1 (order on day 0) → serves service day 2.
+    Expected: plan covers service days 2-4 only (≈ 300g ordered).
+    """
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, delivery_hour=14.0)],
+        demand_by_day={1: {d: 100.0 for d in range(5)}},
+        on_hand={1: 200.0},  # covers on-hand days 0 and 1; service days 0-1 accounted for
+        n_days=5,
+    )
+    total_ordered = sum(o.qty for o in sol.orders)
+    # Days 0 and 1 covered by on_hand; days 2-4 must be covered by plan → 300g
+    assert 200.0 <= total_ordered <= 400.0, (
+        f"delivery_hour=14 with on_hand=200 should order ≈300g (days 2-4); got {total_ordered:.0f}"
+    )
+    # No physical delivery should be scheduled for day 0 (would need order on day -1)
+    for o in sol.orders:
+        assert o.delivery_day >= 1, (
+            f"No delivery possible before day 1 with lead=1; got delivery_day={o.delivery_day}"
+        )
+
+
+def test_service_day_normal_hour_serves_same_day():
+    """A supplier with delivery_hour=8 (== production_start) has service_shift=0:
+    physical delivery on day d serves service day d (baseline behaviour unchanged)."""
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, delivery_hour=8.0)],
+        demand_by_day={1: {d: 100.0 for d in range(5)}},
+        on_hand={1: 100.0},  # covers day 0 only
+        n_days=5,
+    )
+    total_ordered = sum(o.qty for o in sol.orders)
+    # Days 0 covered by on_hand; days 1-4 must be covered by plan → 400g
+    assert total_ordered >= 350.0, (
+        f"delivery_hour=8 with on_hand=100 should order ≈400g (days 1-4); got {total_ordered:.0f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 20: Per-line risk detail (workstream C)
+# ---------------------------------------------------------------------------
+
+def test_per_line_risk_critical_line_flagged():
+    """_per_line_risk() sets at_risk=True only on lines where a 1-day slip causes a shortage.
+
+    Ingredient 1: on_hand=0, needs plan from day 1 → stock_before_plan[1]=0,
+                  demand[1]=100 → shortage_if_late=100 → at_risk=True.
+    Ingredient 2: on_hand=500 (covers all 5 days), no orders → no at_risk lines.
+    """
+    sol = _run(
+        ingredients=[_ing(1), _ing(2)],
+        catalog=[
+            _cat(1, 1, price=1.0, pack=100.0),
+            _cat(1, 2, price=1.0, pack=100.0),
+        ],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={1: {d: 100.0 for d in range(5)}, 2: {d: 100.0 for d in range(5)}},
+        on_hand={1: 0.0, 2: 500.0},
+        safety_stock={1: 0.0, 2: 0.0},
+        n_days=5,
+    )
+    # At least one order for ing 1 must be at_risk (first delivery has zero backing stock)
+    ing1_orders = [o for o in sol.orders if o.ingredient_id == 1]
+    ing2_orders = [o for o in sol.orders if o.ingredient_id == 2]
+
+    assert ing1_orders, "Expected orders for ingredient 1 with zero on_hand"
+    assert not ing2_orders, "Expected no orders for ingredient 2 — fully stocked"
+
+    # The earliest order for ing 1 should be at_risk (stock_before=0)
+    earliest = min(ing1_orders, key=lambda o: o.delivery_day)
+    assert earliest.at_risk, (
+        f"Earliest ing1 order (day {earliest.delivery_day}) should be at_risk; "
+        f"shortage_if_late={earliest.shortage_if_late:.1f}, stock_before={earliest.projected_stock_before:.1f}"
+    )
+    assert earliest.shortage_if_late > 0.5, (
+        f"shortage_if_late must be >0.5 for at_risk order; got {earliest.shortage_if_late:.1f}"
+    )
+
+
+def test_per_line_risk_well_buffered_line_not_flagged():
+    """An order that arrives when on_hand already covers that day's demand is not at_risk."""
+    # on_hand=300 covers days 0-2; order arrives day 1 (physical) — stock_before=200
+    # demand[1]=100, so shortage_if_late = max(0, 100-200) = 0 → at_risk=False
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={1: {d: 100.0 for d in range(5)}},
+        on_hand={1: 300.0},  # covers days 0-2; orders for days 3-4
+        n_days=5,
+    )
+    for o in sol.orders:
+        if o.projected_stock_before >= 100.0:
+            # Stock before this arrival already covers the day's demand
+            assert not o.at_risk, (
+                f"Order with projected_stock_before={o.projected_stock_before:.0f} "
+                f"should not be at_risk (demand=100)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test 21: Coverage quality flags (workstream B)
+# ---------------------------------------------------------------------------
+
+def test_unit_shortfall_nonzero_when_plan_orders_needed():
+    """unit_shortfall_if_1day_late > 0 when plan orders are the sole coverage.
+
+    Scenario: zero on_hand, one supplier, demand=100/day.  All plan arrivals
+    if delayed 1 day leave day-1 uncovered → unit shortfall > 0.
+    """
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={1: {d: 100.0 for d in range(5)}},
+        on_hand={1: 100.0},   # only day 0 covered; rest depends on plan
+        n_days=5,
+    )
+    assert hasattr(sol, "unit_shortfall_if_1day_late"), "Missing unit_shortfall_if_1day_late field"
+    assert sol.unit_shortfall_if_1day_late > 0.5, (
+        f"Delay of plan orders should expose unmet demand; "
+        f"unit_shortfall_if_1day_late={sol.unit_shortfall_if_1day_late:.1f}"
+    )
+
+
+def test_unit_shortfall_zero_when_fully_covered_by_stock():
+    """unit_shortfall_if_1day_late == 0 when on_hand alone covers all demand.
+
+    No plan orders → no delay risk → shortfall stays at zero.
+    """
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={1: {d: 100.0 for d in range(5)}},
+        on_hand={1: 600.0},  # covers all 5 days (500g demand + buffer)
+        n_days=5,
+    )
+    assert not sol.orders, "No orders expected — fully stocked"
+    assert sol.unit_shortfall_if_1day_late == 0.0, (
+        f"No plan orders → no delay risk; expected 0, got {sol.unit_shortfall_if_1day_late:.1f}"
+    )

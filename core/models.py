@@ -170,6 +170,7 @@ class Supplier(Base):
     phone = mapped_column(String, nullable=True)                # for Add-supplier + onboarding call
     delivery_charge = mapped_column(Float, default=0.0)         # fixed delivery fee per order
     volume_discount = mapped_column(JSON, nullable=True)        # [{min_value, discount_pct}, …]
+    delivery_hour = mapped_column(Float, default=8.0, nullable=True)  # 24-h hour at which supplier delivers (default 08:00)
 
     def __repr__(self):
         return f"<Supplier id={self.id} name={self.name!r} lead_time_days={self.lead_time_days}>"
@@ -1221,6 +1222,12 @@ class ProcurementPlanRun(Base):
     reliability_premium = mapped_column(Float, default=0.0)
     exposed_value_baseline = mapped_column(Float, default=0.0)
     exposed_value_protected = mapped_column(Float, default=0.0)
+    # Granular coverage flags (added with plan-review fix workstream)
+    # coverage_depends_on_planned_orders: True when one or more ingredients' forecast
+    #   is only satisfied if not-yet-placed planned orders are actually executed.
+    # late_delivery_coverage_ok: True when coverage holds even if all deliveries slip +1 day.
+    coverage_depends_on_planned_orders = mapped_column(Integer, default=0)
+    late_delivery_coverage_ok = mapped_column(Integer, default=1)
 
     def __repr__(self):
         return (f"<ProcurementPlanRun id={self.id} horizon_days={self.horizon_days} "
@@ -1254,6 +1261,11 @@ class PlannedOrder(Base):
     status = mapped_column(String, default="planned")
     reason = mapped_column(Text, nullable=True)
     created_at = mapped_column(Float)
+    # Per-line risk detail (set by the optimizer after solving)
+    projected_stock_before = mapped_column(Float, default=0.0, nullable=True)  # stock before this arrival
+    qty_needed_before = mapped_column(Float, default=0.0, nullable=True)        # cumulative demand up to delivery day
+    shortage_if_late = mapped_column(Float, default=0.0, nullable=True)         # shortfall if this line arrives one day late
+    latest_safe_arrival = mapped_column(Float, nullable=True)                   # sim-seconds; last arrival time before stockout
 
     def __repr__(self):
         return (f"<PlannedOrder id={self.id} ingredient_id={self.ingredient_id} "

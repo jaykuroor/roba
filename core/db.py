@@ -127,6 +127,16 @@ def _ensure_columns() -> None:
         ("procurement_plan_runs", "reliability_premium",       "REAL DEFAULT 0.0"),
         ("procurement_plan_runs", "exposed_value_baseline",    "REAL DEFAULT 0.0"),
         ("procurement_plan_runs", "exposed_value_protected",   "REAL DEFAULT 0.0"),
+        # Supplier delivery hour (added with plan-review fix: service-day model)
+        ("suppliers",             "delivery_hour",             "REAL DEFAULT 8.0"),
+        # Per-line risk detail on planned orders (plan-review fix: precise at_risk)
+        ("planned_orders",        "projected_stock_before",    "REAL DEFAULT 0.0"),
+        ("planned_orders",        "qty_needed_before",         "REAL DEFAULT 0.0"),
+        ("planned_orders",        "shortage_if_late",          "REAL DEFAULT 0.0"),
+        ("planned_orders",        "latest_safe_arrival",       "REAL"),
+        # Granular coverage flags on plan runs (plan-review fix: honest coverage)
+        ("procurement_plan_runs", "coverage_depends_on_planned_orders", "INTEGER DEFAULT 0"),
+        ("procurement_plan_runs", "late_delivery_coverage_ok",          "INTEGER DEFAULT 1"),
     ]
     conn = engine.raw_connection()
     try:

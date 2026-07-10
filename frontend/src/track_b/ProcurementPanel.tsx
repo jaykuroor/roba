@@ -71,13 +71,21 @@ interface PlanItem {
   reason: string;
   delivery_charge: number;
   delivery_charge_share: number;
+  // Per-line risk detail
+  projected_stock_before: number;
+  qty_needed_before: number;
+  shortage_if_late: number;
+  latest_safe_arrival: number | null;
 }
 
 interface PlanResponse {
   plan_run_id: number | null;
   generated_at: number;
   coverage_ok: boolean;
+  forecast_coverage_ok: boolean;
   total_short: number;
+  coverage_depends_on_planned_orders: boolean;
+  late_delivery_coverage_ok: boolean;
   reliability_premium: number;
   exposed_value_baseline: number;
   exposed_value_protected: number;
@@ -130,7 +138,10 @@ interface SupplierCardItem {
   delivery_date_label: string;
   at_risk?: boolean;
   uncoverable?: boolean;
-  cost?: number | null;  // pre-computed line_total; falls back to unit_price*qty
+  cost?: number | null;             // pre-computed line_total; falls back to unit_price*qty
+  delivery_charge_share?: number;  // this item's share of the shipment delivery fee
+  shortage_if_late?: number;       // units short if this line arrives one day late
+  projected_stock_before?: number; // running stock before this order arrives
 }
 
 function SupplierCard({
@@ -145,11 +156,18 @@ function SupplierCard({
   defaultOpen?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  // Goods total (pre-computed cost or unit_price × qty)
   const goodsTotal = items.reduce(
     (sum, i) => sum + (i.cost != null ? i.cost : (i.unit_price ?? 0) * i.qty),
     0
   );
-  const total = goodsTotal + deliveryCharge;
+  // Per-shipment delivery: sum delivery_charge_share across all items.
+  // Falls back to the legacy prop so the OrderedSection (which passes deliveryCharge
+  // from stored PO totals) is unaffected.
+  const totalDelivery = items.some((i) => (i.delivery_charge_share ?? 0) > 0)
+    ? items.reduce((sum, i) => sum + (i.delivery_charge_share ?? 0), 0)
+    : deliveryCharge;
+  const total = goodsTotal + totalDelivery;
   const byDatePair = groupBy(
     items,
     (i) => `${i.order_date_label}|${i.delivery_date_label}`
@@ -179,11 +197,15 @@ function SupplierCard({
         </div>
       </button>
 
-      {/* Card body — one sub-block per date pair */}
+      {/* Card body — one sub-block per (order date → delivery date) shipment */}
       {open && (
         <div className="border-t border-muted/30 divide-y divide-muted/20">
           {Array.from(byDatePair.entries()).map(([dateKey, dateItems]) => {
             const first = dateItems[0];
+            // Per-shipment delivery fee = sum of delivery_charge_share for this date-pair
+            const pairDelivery = dateItems.some((i) => (i.delivery_charge_share ?? 0) > 0)
+              ? dateItems.reduce((s, i) => s + (i.delivery_charge_share ?? 0), 0)
+              : 0;
             return (
               <div key={dateKey} className="px-3 py-2 space-y-1">
                 {/* Date header */}
@@ -198,6 +220,10 @@ function SupplierCard({
                     item.cost != null
                       ? item.cost
                       : (item.unit_price ?? 0) * item.qty;
+                  // At-risk tooltip: concrete numbers when available
+                  const atRiskTitle = (item.shortage_if_late ?? 0) > 0.5
+                    ? `Late-delivery risk: ${formatQty(item.shortage_if_late ?? 0, item.unit)} short on this day if shipment slips 1 day · stock before arrival: ${formatQty(item.projected_stock_before ?? 0, item.unit)}`
+                    : "Order-by window passed — placed now for earliest feasible delivery";
                   return (
                     <div
                       key={item.id}
@@ -222,7 +248,7 @@ function SupplierCard({
                         {item.at_risk && !item.uncoverable && (
                           <span
                             className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-warning/20 text-warning whitespace-nowrap"
-                            title="Order-by window passed — placed now for earliest feasible delivery"
+                            title={atRiskTitle}
                           >
                             <AlertTriangle size={10} />
                             at-risk
@@ -235,11 +261,24 @@ function SupplierCard({
                     </div>
                   );
                 })}
+                {/* Per-shipment delivery fee — one line per (order → delivery) pair */}
+                {pairDelivery > 0.005 && (
+                  <div className="flex items-center justify-between pt-0.5">
+                    <div className="flex items-center gap-1.5 text-xs text-text/40">
+                      <Truck size={11} />
+                      <span>Delivery</span>
+                    </div>
+                    <span className="text-xs text-text/40 tabular-nums">
+                      €{pairDelivery.toFixed(2)}
+                    </span>
+                  </div>
+                )}
               </div>
             );
           })}
-          {/* Delivery charge footer */}
-          {deliveryCharge > 0 && (
+          {/* Legacy per-card delivery footer (OrderedSection path: deliveryCharge prop,
+              no delivery_charge_share on items). Shown only when items carry no share. */}
+          {deliveryCharge > 0 && !items.some((i) => (i.delivery_charge_share ?? 0) > 0) && (
             <div className="px-3 py-2 flex items-center justify-between">
               <div className="flex items-center gap-1.5 text-xs text-text/40">
                 <Truck size={11} />
@@ -294,7 +333,6 @@ function PlanSection({
       ) : (
         <div className="space-y-2">
           {Array.from(bySupplier.entries()).map(([supplier, supplierItems]) => {
-            const dc = supplierItems[0]?.delivery_charge ?? 0;
             const cardItems: SupplierCardItem[] = supplierItems.map((i) => ({
               id: i.id,
               ingredient_name: i.ingredient_name,
@@ -305,13 +343,15 @@ function PlanSection({
               delivery_date_label: i.delivery_date_label,
               at_risk: i.status === "at_risk",
               uncoverable: i.status === "uncoverable",
+              delivery_charge_share: i.delivery_charge_share,
+              shortage_if_late: i.shortage_if_late,
+              projected_stock_before: i.projected_stock_before,
             }));
             return (
               <SupplierCard
                 key={supplier}
                 supplierName={supplier}
                 items={cardItems}
-                deliveryCharge={dc}
                 defaultOpen={true}
               />
             );
@@ -712,6 +752,23 @@ export function ProcurementPanel() {
           <span className="font-medium text-text">
             €{Math.max(0, planMeta.exposed_value_baseline - planMeta.exposed_value_protected).toFixed(2)}
           </span>
+        </div>
+      )}
+
+      {/* Coverage quality banner — only shown when coverage is plan-dependent or fragile */}
+      {planMeta && planMeta.forecast_coverage_ok && planMeta.coverage_depends_on_planned_orders && (
+        <div className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
+          <AlertTriangle size={12} className="inline mr-1 shrink-0" />
+          Forecast covered — conditional on planned orders being placed.
+          {!planMeta.late_delivery_coverage_ok && " Not robust to a late delivery."}
+        </div>
+      )}
+      {planMeta && !planMeta.forecast_coverage_ok && planMeta.total_short > 0 && (
+        <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+          <AlertOctagon size={12} className="inline mr-1 shrink-0" />
+          Demand not fully covered —{" "}
+          <span className="font-medium">{planMeta.total_short.toFixed(0)} units short</span>
+          {" "}even with planned orders.
         </div>
       )}
 

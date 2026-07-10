@@ -591,10 +591,15 @@ class InventoryOptimizer(BaseAgent):
                         if hasattr(s, "volume_discount") and s.volume_discount
                         else None
                     ),
+                    "delivery_hour": float(getattr(s, "delivery_hour", None) or 8.0),
                 }
                 for s in _all_sup_rows
             ]
             _lead_by_sup = {int(s.id): float(s.lead_time_days or 1.0) for s in _all_sup_rows}
+            _delivery_hour_by_sup = {
+                int(s.id): float(getattr(s, "delivery_hour", None) or 8.0)
+                for s in _all_sup_rows
+            }
 
             # Robust demand floor: max(transient qty, steady-state baseline).
             _demand_map: Dict[int, Dict[int, float]] = {}
@@ -692,6 +697,7 @@ class InventoryOptimizer(BaseAgent):
                     "reliability_cash_tolerance": config.RELIABILITY_CASH_TOLERANCE,
                     "stress_enabled": config.RELIABILITY_STRESS_ENABLED,
                     "margin_by_ing": _margin_by_ing,
+                    "production_start_hour": config.PRODUCTION_START_HOUR,
                 },
             )
             plan_method = _solution.method
@@ -721,8 +727,9 @@ class InventoryOptimizer(BaseAgent):
                 _iid = _order.ingredient_id
                 _s_id = _order.supplier_id
                 _lead = _lead_by_sup.get(_s_id, 1.0)
+                _dh = _delivery_hour_by_sup.get(_s_id, 8.0)
                 _delivery_sim_s = float(
-                    (now_day + _order.delivery_day) * SECONDS_PER_DAY + DAY_OPEN_OFFSET
+                    (now_day + _order.delivery_day) * SECONDS_PER_DAY + _dh * 3600.0
                 )
                 _order_sim_s = _delivery_sim_s - _lead * SECONDS_PER_DAY
                 # C: distinguish genuinely uncoverable (no supply, qty==0 sentinel)
@@ -742,6 +749,14 @@ class InventoryOptimizer(BaseAgent):
                     * SECONDS_PER_DAY
                     + DAY_OPEN_OFFSET
                 )
+                # Convert per-line risk's latest_safe_arrival (horizon day offset)
+                # to a sim-seconds timestamp using the supplier's delivery hour.
+                _lsa_offset = getattr(_order, "latest_safe_arrival", -1)
+                _lsa_sim_s: Optional[float] = None
+                if _lsa_offset is not None and _lsa_offset >= 0:
+                    _lsa_sim_s = float(
+                        (now_day + _lsa_offset) * SECONDS_PER_DAY + _dh * 3600.0
+                    )
                 new_orders.append({
                     "ingredient_id": _iid,
                     "supplier_id": _s_id,
@@ -754,6 +769,10 @@ class InventoryOptimizer(BaseAgent):
                     "covers_until": _covers_until,
                     "status": _status,
                     "reason": _order.reason,
+                    "projected_stock_before": float(getattr(_order, "projected_stock_before", 0.0) or 0.0),
+                    "qty_needed_before": float(getattr(_order, "qty_needed_before", 0.0) or 0.0),
+                    "shortage_if_late": float(getattr(_order, "shortage_if_late", 0.0) or 0.0),
+                    "latest_safe_arrival": _lsa_sim_s,
                 })
 
         # E: Emit INGREDIENT_UNCOVERABLE signals for genuinely uncoverable rows.
@@ -844,6 +863,10 @@ class InventoryOptimizer(BaseAgent):
                             "covers_until": order_data.get("covers_until"),
                             "status": order_data["status"],
                             "reason": order_data["reason"],
+                            "projected_stock_before": order_data.get("projected_stock_before", 0.0),
+                            "qty_needed_before": order_data.get("qty_needed_before", 0.0),
+                            "shortage_if_late": order_data.get("shortage_if_late", 0.0),
+                            "latest_safe_arrival": order_data.get("latest_safe_arrival"),
                         }
                         continue
                     else:
@@ -1013,6 +1036,37 @@ class InventoryOptimizer(BaseAgent):
                     _reconciled_total_short,
                 )
 
+            # Coverage-semantics flags:
+            # coverage_depends_on_planned: True when committed supply (on_hand + inbound POs)
+            #   alone cannot cover demand — the plan leans on not-yet-placed orders.
+            # late_delivery_coverage_ok: True when all deliveries slipping +1 day still
+            #   covers demand (derived from the MILP's unit-shortfall projection).
+            _coverage_depends_on_planned = False
+            try:
+                for _chk_iid, _chk_data in ingredients_data.items():
+                    _total_demand_c = sum(
+                        per_day_demand.get(_chk_iid, {}).get(d, 0.0) for d in range(n_days)
+                    )
+                    if _total_demand_c <= 0:
+                        continue
+                    _committed = (
+                        _chk_data["on_hand"]
+                        + sum(inbound_by_day.get(_chk_iid, {}).values())
+                    )
+                    _with_plan = _committed + _plan_qty_by_ing.get(_chk_iid, 0.0)
+                    if _total_demand_c > _committed and _total_demand_c <= _with_plan:
+                        _coverage_depends_on_planned = True
+                        break
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "build_procurement_plan: coverage_depends_on_planned_orders recompute failed."
+                )
+
+            _unit_shortfall_late = float(
+                getattr(_solution, "unit_shortfall_if_1day_late", 0.0) or 0.0
+            )
+            _late_delivery_coverage_ok = _unit_shortfall_late <= 1.0
+
             run = ProcurementPlanRun(
                 created_at=now,
                 horizon_days=horizon_days,
@@ -1023,6 +1077,8 @@ class InventoryOptimizer(BaseAgent):
                 reliability_premium=plan_reliability_premium,
                 exposed_value_baseline=plan_exposed_value_baseline,
                 exposed_value_protected=plan_exposed_value_protected,
+                coverage_depends_on_planned_orders=1 if _coverage_depends_on_planned else 0,
+                late_delivery_coverage_ok=1 if _late_delivery_coverage_ok else 0,
             )
             session.add(run)
             session.flush()
