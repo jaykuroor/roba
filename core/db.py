@@ -26,6 +26,12 @@ engine = create_engine(
     f"sqlite:///{config.DB_PATH}",
     connect_args={"check_same_thread": False},
     pool_pre_ping=True,
+    # SQLite with WAL + check_same_thread=False is cheap on concurrent handles;
+    # raise the pool ceiling so a deep signal cascade (emit → subscriber → emit …)
+    # never exhausts the default size-5/overflow-10 = 15-connection limit.
+    pool_size=20,
+    max_overflow=40,
+    pool_recycle=1800,
 )
 
 SessionLocal = sessionmaker(

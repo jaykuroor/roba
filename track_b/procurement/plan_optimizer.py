@@ -768,10 +768,13 @@ def _solve_greedy(
             # Demand-driven reorder: order only when projected demand over the
             # lead+interval window cannot be met from current stock + inbound.
             # Safety stock is a reporting target only — never drives a purchase.
+            # `running` is stock AFTER consuming day d's demand, and `rem` is
+            # any unmet demand from today.  Future demand starts at d+1 (day d
+            # is already consumed); we add `rem` to capture today's shortfall.
             cover_days = lead + reorder_interval + 1
             cover_end = min(n_days, d + _math.ceil(cover_days))
-            demand_to_cover = sum(
-                demand_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d, cover_end)
+            demand_to_cover = rem + sum(
+                demand_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d + 1, cover_end)
             )
             inbound_window = sum(
                 inbound_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d + 1, cover_end)
@@ -779,8 +782,8 @@ def _solve_greedy(
             needed = max(0.0, demand_to_cover - max(0.0, running) - inbound_window)
             if shelf_life:
                 exp_end = min(n_days, d + _math.ceil(min(shelf_life, cover_days)))
-                dbe = sum(
-                    demand_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d, exp_end)
+                dbe = rem + sum(
+                    demand_by_day.get(iid, {}).get(dd, 0.0) for dd in range(d + 1, exp_end)
                 )
                 if 0 < dbe < needed:
                     needed = dbe

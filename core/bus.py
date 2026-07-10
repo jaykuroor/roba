@@ -146,6 +146,18 @@ class SignalBus:
             return None
 
         expires_at = (now + ttl) if ttl is not None else None
+
+        # Capture the result and dispatch intent, but do NOT call _notify inside
+        # the session context.  The Signal is expunged (detached) before _notify,
+        # and every subscriber/record_delivery call opens its own session — so
+        # closing first is behaviour-preserving while eliminating the connection
+        # held across the entire synchronous dispatch subtree (prevents
+        # QueuePool exhaustion on deep signal cascades, e.g. emit → on_signal →
+        # build_procurement_plan → emit(REORDER_PLACED) → …).
+        _result: Optional["Signal"] = None
+        _do_notify: bool = False
+        _dispatch_subs: bool = True
+
         session = self.db_session_factory()
         try:
             if dedup_key:
@@ -172,50 +184,60 @@ class SignalBus:
                             )
                         session.refresh(existing)
                         session.expunge(existing)
-                        return existing
+                        _result = existing
+                        # identical dedup → no _notify
+                    else:
+                        # §14.3: payload changed -> refresh expiry + replace payload,
+                        # do NOT insert a duplicate (latest wins).
+                        existing.payload = payload_dict
+                        existing.expires_at = expires_at
+                        existing.priority = priority
+                        existing.groups = list(groups)
+                        existing.source = source
+                        if target_agents is not None:
+                            existing.target_agents = list(target_agents)
+                        session.commit()
+                        session.refresh(existing)
+                        session.expunge(existing)
+                        # A dedup-refresh updates an existing *live* signal in place
+                        # (same logical event). The frontend still wants the updated
+                        # payload/expiry, so we re-broadcast — but reactor callbacks
+                        # are action triggers and must fire once per genuine emit, so
+                        # they are NOT re-dispatched on a refresh (no double-acting).
+                        _result = existing
+                        _do_notify = True
+                        _dispatch_subs = False
 
-                    # §14.3: payload changed -> refresh expiry + replace payload,
-                    # do NOT insert a duplicate (latest wins).
-                    existing.payload = payload_dict
-                    existing.expires_at = expires_at
-                    existing.priority = priority
-                    existing.groups = list(groups)
-                    existing.source = source
-                    if target_agents is not None:
-                        existing.target_agents = list(target_agents)
-                    session.commit()
-                    session.refresh(existing)
-                    session.expunge(existing)
-                    # A dedup-refresh updates an existing *live* signal in place
-                    # (same logical event). The frontend still wants the updated
-                    # payload/expiry, so we re-broadcast — but reactor callbacks
-                    # are action triggers and must fire once per genuine emit, so
-                    # they are NOT re-dispatched on a refresh (no double-acting).
-                    self._notify(existing, dispatch_subscribers=False)
-                    return existing
-
-            signal = Signal(
-                signal_id=str(uuid.uuid4()),
-                type=sig_type.value,
-                source=source,
-                groups=list(groups),
-                priority=priority,
-                payload=payload_dict,
-                created_at=now,
-                expires_at=expires_at,
-                dedup_key=dedup_key,
-                status="live",
-                correlation_id=correlation_id,
-                target_agents=list(target_agents) if target_agents else None,
-            )
-            session.add(signal)
-            session.commit()
-            session.refresh(signal)
-            session.expunge(signal)
-            self._notify(signal)
-            return signal
+            if _result is None:
+                signal = Signal(
+                    signal_id=str(uuid.uuid4()),
+                    type=sig_type.value,
+                    source=source,
+                    groups=list(groups),
+                    priority=priority,
+                    payload=payload_dict,
+                    created_at=now,
+                    expires_at=expires_at,
+                    dedup_key=dedup_key,
+                    status="live",
+                    correlation_id=correlation_id,
+                    target_agents=list(target_agents) if target_agents else None,
+                )
+                session.add(signal)
+                session.commit()
+                session.refresh(signal)
+                session.expunge(signal)
+                _result = signal
+                _do_notify = True
+                _dispatch_subs = True
         finally:
             session.close()
+
+        # Dispatch AFTER the session is closed so subscriber callbacks never run
+        # while the emit connection is checked out of the pool.
+        if _do_notify and _result is not None:
+            self._notify(_result, dispatch_subscribers=_dispatch_subs)
+        return _result
 
     # -- query / lifecycle --------------------------------------------------
 
