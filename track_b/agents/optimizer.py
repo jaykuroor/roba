@@ -789,12 +789,22 @@ class InventoryOptimizer(BaseAgent):
                         superseded_ids.add(row.id)
 
             # B (R1): Reconciliation gate — never persist a new or kept planned row
-            # when an open real PO already covers that ingredient's demand (any supplier).
-            # W4 (sizing, above) prevents the MILP from over-ordering, but it does not
-            # remove PlannedOrder rows that a pending-approval PO has already addressed.
-            # Key change from the original: keyed on ingredient_id only (not
-            # ingredient+supplier) so a cross-supplier PO still suppresses the plan row,
-            # preventing the "at_risk plan row + proposed PO on different supplier" duplicate.
+            # when open real POs cover ADDITIONAL demand beyond what the solver already
+            # credited via inbound_by_day.
+            #
+            # Netting rule: inbound_by_day already credited every non-overdue open PO
+            # into the solver's arrivals, so plan-row quantities are already net of
+            # pipeline.  R1 must compare against the RESIDUAL — PO qty not yet seen by
+            # the solver — to avoid double-subtracting the same supply.
+            #
+            # residual[iid] = max(0, total_open_PO_qty[iid] - inbound_credited[iid])
+            #   ≈ 0  for any PO credited by inbound_by_day (same status filter, same
+            #         overdue exclusion) → R1 does not cancel the legitimate top-up.
+            #   > 0  only when a brand-new PO was placed *after* inbound snapshot and
+            #         before this R1 check → still suppresses genuine duplicates.
+            #
+            # Keyed on ingredient_id only (not ingredient+supplier) so a cross-supplier
+            # PO still suppresses the plan row.
             try:
                 from sqlalchemy import func as _sa_func_r1  # local import; avoids top-level dep
                 _open_po_coverage: Dict[int, float] = {}   # {ingredient_id: total_qty}
@@ -813,17 +823,28 @@ class InventoryOptimizer(BaseAgent):
                         _open_po_coverage.get(int(_r1_ing), 0.0) + float(_r1_qty or 0.0)
                     )
 
+                # How much of each ingredient the solver already credited (inbound_by_day
+                # uses the same status/overdue filter as the open-PO query above).
+                _inbound_credited: Dict[int, float] = {
+                    iid: sum(day_map.values())
+                    for iid, day_map in inbound_by_day.items()
+                    if day_map
+                }
+
                 if _open_po_coverage:
                     _r1_filtered: List[Dict] = []
                     for _od in final_new_orders:
                         _r1_iid = int(_od["ingredient_id"])
                         _r1_need = float(_od["qty"] or 0.0)
-                        _r1_covered = _open_po_coverage.get(_r1_iid, 0.0)
-                        if _r1_covered >= _r1_need:
+                        _r1_gross = _open_po_coverage.get(_r1_iid, 0.0)
+                        # Residual = PO qty the solver did NOT already net
+                        _r1_residual = max(0.0, _r1_gross - _inbound_credited.get(_r1_iid, 0.0))
+                        if _r1_residual >= _r1_need:
                             logger.info(
                                 "R1: suppressing planned row ingredient=%s "
-                                "(open PO qty %.1f across all suppliers ≥ needed %.1f).",
-                                _r1_iid, _r1_covered, _r1_need,
+                                "(residual PO qty %.1f — gross %.1f minus credited %.1f — ≥ needed %.1f).",
+                                _r1_iid, _r1_residual, _r1_gross,
+                                _inbound_credited.get(_r1_iid, 0.0), _r1_need,
                             )
                         else:
                             _r1_filtered.append(_od)
@@ -835,12 +856,13 @@ class InventoryOptimizer(BaseAgent):
                             continue
                         _r1_iid = int(_r1_krow.ingredient_id)
                         _r1_need = float(_r1_krow.qty or 0.0)
-                        _r1_covered = _open_po_coverage.get(_r1_iid, 0.0)
-                        if _r1_covered >= _r1_need:
+                        _r1_gross = _open_po_coverage.get(_r1_iid, 0.0)
+                        _r1_residual = max(0.0, _r1_gross - _inbound_credited.get(_r1_iid, 0.0))
+                        if _r1_residual >= _r1_need:
                             logger.info(
                                 "R1: superseding kept planned row %s ingredient=%s "
-                                "(open PO qty %.1f across all suppliers covers demand).",
-                                _r1_row_id, _r1_iid, _r1_covered,
+                                "(residual PO qty %.1f covers needed %.1f).",
+                                _r1_row_id, _r1_iid, _r1_residual, _r1_need,
                             )
                             kept_ids.discard(_r1_row_id)
                             superseded_ids.add(_r1_row_id)
@@ -859,13 +881,76 @@ class InventoryOptimizer(BaseAgent):
             n_superseded = len(superseded_ids)
             total_active = n_new + n_kept
 
+            # Fix 2: Recompute coverage against the RECONCILED plan (after R1 /
+            # hysteresis / pack-rounding).  The raw solver result (plan_coverage_ok /
+            # plan_total_short) reflects what the solver *intended* before these
+            # post-processing steps and may claim full coverage even when a plan row
+            # was suppressed by R1.  We replace it with an honest per-ingredient check
+            # so that the stored ProcurementPlanRun.coverage_ok / .total_short match
+            # what the UI actually shows.
+            #
+            # Available supply per ingredient over the horizon:
+            #   on_hand  (from ingredients_data)
+            # + inbound_by_day arrivals (already-placed POs credited into the solver)
+            # + persisted plan-row totals (final_new_orders + kept rows at their qty)
+            _reconciled_total_short = 0.0
+            try:
+                # Qty the final persisted plan adds per ingredient.
+                _plan_qty_by_ing: Dict[int, float] = {}
+                for _rod in final_new_orders:
+                    _rid = int(_rod["ingredient_id"])
+                    _plan_qty_by_ing[_rid] = (
+                        _plan_qty_by_ing.get(_rid, 0.0) + float(_rod.get("qty") or 0.0)
+                    )
+                for _kr_id in kept_ids:
+                    _kr = session.get(PlannedOrder, _kr_id)
+                    if _kr is not None:
+                        _plan_qty_by_ing[_kr.ingredient_id] = (
+                            _plan_qty_by_ing.get(_kr.ingredient_id, 0.0)
+                            + float(_kr.qty or 0.0)
+                        )
+
+                for _chk_iid, _chk_data in ingredients_data.items():
+                    _total_demand = sum(
+                        per_day_demand.get(_chk_iid, {}).get(d, 0.0) for d in range(n_days)
+                    )
+                    if _total_demand <= 0:
+                        continue
+                    _available = (
+                        _chk_data["on_hand"]
+                        + sum(inbound_by_day.get(_chk_iid, {}).values())
+                        + _plan_qty_by_ing.get(_chk_iid, 0.0)
+                    )
+                    _short = max(0.0, _total_demand - _available)
+                    if _short > 0:
+                        logger.warning(
+                            "Reconciled coverage gap: ingredient %s still %.1f units short "
+                            "after R1/hysteresis (demand %.1f, available %.1f).",
+                            _chk_iid, _short, _total_demand, _available,
+                        )
+                    _reconciled_total_short += _short
+            except Exception:  # noqa: BLE001
+                # Fall back to raw solver value if recompute fails.
+                _reconciled_total_short = plan_total_short
+                logger.warning(
+                    "build_procurement_plan: reconciled coverage recompute failed; "
+                    "falling back to solver total_short=%.1f.", plan_total_short,
+                )
+            _reconciled_coverage_ok = _reconciled_total_short <= 1.0
+            if not _reconciled_coverage_ok and plan_coverage_ok:
+                logger.warning(
+                    "Coverage gap INTRODUCED by post-solver reconciliation: "
+                    "%.1f units uncoverable after R1/hysteresis (solver claimed full coverage).",
+                    _reconciled_total_short,
+                )
+
             run = ProcurementPlanRun(
                 created_at=now,
                 horizon_days=horizon_days,
                 items_planned=total_active,
                 method=plan_method,
-                coverage_ok=1 if plan_coverage_ok else 0,
-                total_short=plan_total_short,
+                coverage_ok=1 if _reconciled_coverage_ok else 0,
+                total_short=_reconciled_total_short,
             )
             session.add(run)
             session.flush()
