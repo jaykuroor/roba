@@ -1211,6 +1211,16 @@ class ProcurementPlanRun(Base):
     method = mapped_column(String)         # "projection"
     coverage_ok = mapped_column(Integer, default=1)      # 0 => a forecasted-demand gap exists
     total_short = mapped_column(Float, default=0.0)      # un-coverable forecasted demand (base units)
+    # Two-pass reliability premium fields (added with bounded-premium refactor).
+    # reliability_premium: extra cash cost (currency) the stress pass spent vs the
+    #   cash-optimal plan; 0.0 when pass 2 was skipped or produced no improvement.
+    # exposed_value_baseline: contribution-margin value of forecast demand at risk under
+    #   a one-day universal delay using the cash-optimal (pass 1) plan.
+    # exposed_value_protected: same metric for the chosen (pass 2) plan; the difference
+    #   (baseline − protected) is the value the premium actually bought.
+    reliability_premium = mapped_column(Float, default=0.0)
+    exposed_value_baseline = mapped_column(Float, default=0.0)
+    exposed_value_protected = mapped_column(Float, default=0.0)
 
     def __repr__(self):
         return (f"<ProcurementPlanRun id={self.id} horizon_days={self.horizon_days} "

@@ -28,6 +28,29 @@ only when cheap (lightly, value-scaled ``safety_short``).  Any demand that is
 physically impossible to cover (early days before any delivery can arrive, or
 all suppliers out) is surfaced as ``at_risk`` — never hidden.
 
+Reliability handling — two-pass lexicographic solve
+----------------------------------------------------
+Rather than folding a per-gram risk penalty into the cost objective (which
+drowns real cash savings), the solver runs two passes against the same model:
+
+  Pass 1 — cash-optimal.
+    Objective = real economic cost (goods + delivery − discounts − rebates)
+    plus the existing internal penalty terms for coverage, spoilage and safety.
+    Records the optimal cash cost C0.
+
+  Pass 2 — buy down one-day-delay exposure within a cash cap.
+    Adds a hard constraint ``cash_real_expr <= C0 * (1 + tolerance)`` and
+    swaps the objective to minimise a margin-weighted exposure lever:
+      sum_i sum_{s,d}  margin_per_unit[i] * (1-reliability[s]) * lead_factor[s] * x[i,s,d]
+    which directionally favours shorter lead-times and more reliable suppliers
+    when they can be had within the cash cap.  Coverage / spoilage / safety
+    penalties remain in the objective so all hard-coverage invariants hold.
+
+  Post-solve: compute the honest one-day-delay exposure for both plans using a
+    pure-Python projection (_one_day_delay_exposure) — arrivals shifted +1 day,
+    day-by-day lot accounting.  Report extra_cash = C1_real − C0 and the
+    protected margin value.
+
 This eliminates the fragmented per-ingredient-per-day POs produced by the
 old greedy path, naturally consolidates across days (delivery charges drive
 fewer supplier-day openings), satisfies MOV as a hard constraint (never needs
@@ -80,6 +103,11 @@ class PlanSolution:
     rationale: str = ""
     total_short: float = 0.0  # total un-coverable forecasted demand (base units)
     coverage_ok: bool = True  # False when any forecasted demand is left uncovered
+    # Reliability premium fields (two-pass MILP only; 0.0 for greedy / pass-1-only)
+    cash_cost: float = 0.0              # actual invoice cost of the chosen plan
+    reliability_premium: float = 0.0   # extra cash vs the cash-optimal plan
+    exposed_value_baseline: float = 0.0  # margin exposed under 1-day delay, no-plan baseline
+    exposed_value_plan: float = 0.0    # margin exposed under 1-day delay, chosen plan
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +143,6 @@ def solve_time_phased_plan(
     ``on_hand``        -- current on-hand cached qty per ingredient.
     ``safety_stock``   -- target floor per ingredient.
     ``params``         -- optional overrides:
-                            lead_risk_lambda (default 0.3)
                             spoilage_penalty_multiplier (default 2.0)
                             slack_penalty (default 1000.0)          -- demand
                             safety_penalty_multiplier (default 1.5) -- soft buffer
@@ -124,6 +151,16 @@ def solve_time_phased_plan(
                               exp_day_offset counts days from now (>= n_days or
                               missing => never expires within horizon).  Absent
                               => a single never-expiring lot equal to on_hand.
+                            reliability_cash_tolerance (default 0.01)
+                              max extra fraction of cash-optimal cost permitted
+                              for the stress pass.  0.0 = pure cash-optimal.
+                            stress_enabled (default True)
+                              when False, skip pass 2 entirely.
+                            margin_by_ing: {ing_id: margin_per_base_unit}
+                              contribution margin per base unit; used as weights
+                              in the pass-2 exposure lever and in the post-solve
+                              one-day-delay projection.  Falls back to unit_price
+                              when absent or <= 0 for an ingredient.
     """
     p = params or {}
     if _PULP_AVAILABLE:
@@ -158,6 +195,95 @@ def solve_time_phased_plan(
 
 
 # ---------------------------------------------------------------------------
+# One-day-delay exposure projection (pure Python; used for honest trade-off)
+# ---------------------------------------------------------------------------
+
+def _one_day_delay_exposure(
+    orders: List[PlanOrder],
+    demand_by_day: Dict[int, Dict[int, float]],
+    on_hand: Dict[int, float],
+    inbound_by_day: Dict[int, Dict[int, float]],
+    lots_by_ing: Dict[int, List[List[float]]],
+    margin_by_ing: Dict[int, float],
+    n_days: int,
+    ingredient_ids: List[int],
+    ing_by_id: Dict[int, Dict],
+) -> float:
+    """Margin-weighted demand shortfall under a universal one-day arrival delay.
+
+    Simulates each ingredient's stock day-by-day with:
+      - on-hand opening stock (lot-aware for perishables)
+      - inbound POs arriving one day later than scheduled
+      - plan orders arriving one day later than their delivery_day
+
+    Returns sum(margin_per_unit[i] * shortfall[i]) over the horizon.
+    """
+    _LOT_NEVER = float(_INF_DAY)
+
+    # Group plan orders by ingredient and day for fast lookup
+    plan_by_ing: Dict[int, Dict[int, float]] = {}
+    for o in orders:
+        if (o.qty or 0) > 0:
+            plan_by_ing.setdefault(o.ingredient_id, {})
+            plan_by_ing[o.ingredient_id][o.delivery_day] = (
+                plan_by_ing[o.ingredient_id].get(o.delivery_day, 0.0) + o.qty
+            )
+
+    total_exposed = 0.0
+    for iid in ingredient_ids:
+        ing = ing_by_id.get(iid, {})
+        shelf_life = (
+            float(ing.get("shelf_life_days") or 0.0)
+            if ing.get("perishable")
+            else None
+        )
+        weight = max(float(margin_by_ing.get(iid, 0.0)), 0.0)
+        if weight <= 0.0:
+            continue  # no margin weight → exclude
+
+        # Seed opening lots
+        raw_lots = lots_by_ing.get(iid)
+        if raw_lots:
+            lots: List[List[float]] = [[float(qq), float(ee)] for qq, ee in raw_lots]
+        else:
+            lots = [[float(on_hand.get(iid, 0.0)), _LOT_NEVER]]
+
+        for d in range(n_days):
+            # Inbound POs arrive one day late: credit arrivals planned for (d-1) on day d.
+            # Expiry is based on original arrival day ((d-1) + shelf_life), not the delayed day.
+            inb_orig = inbound_by_day.get(iid, {}).get(d - 1, 0.0) if d >= 1 else 0.0
+            if inb_orig > 0:
+                exp = (d - 1) + (shelf_life if shelf_life else _LOT_NEVER)
+                lots.append([inb_orig, exp])
+
+            # Plan orders arrive one day late: credit deliveries planned for (d-1) on day d.
+            plan_orig = plan_by_ing.get(iid, {}).get(d - 1, 0.0) if d >= 1 else 0.0
+            if plan_orig > 0:
+                exp = (d - 1) + (shelf_life if shelf_life else _LOT_NEVER)
+                lots.append([plan_orig, exp])
+
+            # Expire lots
+            lots = [l for l in lots if l[1] > d]
+            lots.sort(key=lambda l: l[1])
+
+            # Consume demand (FIFO by expiry)
+            dem = demand_by_day.get(iid, {}).get(d, 0.0)
+            rem = dem
+            for lot in lots:
+                take = min(lot[0], rem)
+                lot[0] -= take
+                rem -= take
+                if rem <= 0:
+                    break
+            lots = [l for l in lots if l[0] > 1e-9]
+
+            if rem > 0.5:
+                total_exposed += weight * rem
+
+    return total_exposed
+
+
+# ---------------------------------------------------------------------------
 # MILP solver
 # ---------------------------------------------------------------------------
 
@@ -175,11 +301,13 @@ def _solve_milp(
 ) -> PlanSolution:
     import pulp
 
-    lead_risk_lambda = float(params.get("lead_risk_lambda", 0.3))
     spoil_pen_mult = float(params.get("spoilage_penalty_multiplier", 2.0))
     slack_penalty = float(params.get("slack_penalty", 1000.0))            # demand (hard)
     safety_pen_mult = float(params.get("safety_penalty_multiplier", 1.5))  # buffer (soft)
     lots_by_ing: Dict[int, List[List[float]]] = params.get("lots_by_ing") or {}
+    reliability_cash_tolerance = float(params.get("reliability_cash_tolerance", 0.01))
+    stress_enabled = bool(params.get("stress_enabled", True))
+    margin_by_ing: Dict[int, float] = dict(params.get("margin_by_ing") or {})
 
     ing_by_id: Dict[int, Dict] = {int(i["id"]): i for i in ingredients}
     sup_by_id: Dict[int, Dict] = {int(s["id"]): s for s in suppliers}
@@ -214,8 +342,7 @@ def _solve_milp(
     all_sup_ids = list({int(s["id"]) for s in suppliers})
 
     # Cheapest available unit price per ingredient — used to value-scale the
-    # soft safety-buffer and waste penalties (so they never justify a dedicated
-    # delivery just to top up a buffer, but are filled when piggybacking).
+    # soft safety-buffer and waste penalties.
     ref_price: Dict[int, float] = {}
     for iid in active_ids:
         prices = [
@@ -330,14 +457,23 @@ def _solve_milp(
         return pulp.lpSum(terms) + inbound_by_day.get(iid, {}).get(d, 0.0)
 
     # ------------------------------------------------------------------
-    # Objective
+    # Build expression components
+    #
+    # cash_real_terms  : the actual invoice (goods + delivery − discounts − rebates)
+    # penalty_terms    : internal penalty terms (coverage, spoilage, safety)
+    # exposure_terms   : pass-2 margin-weighted exposure lever
     # ------------------------------------------------------------------
-    obj_terms = []
+    cash_real_terms = []
+    penalty_terms = []
+    exposure_terms = []
 
     for iid in active_ids:
         ing = ing_by_id.get(iid, {})
         perishable = bool(ing.get("perishable"))
         p_ref = ref_price.get(iid, 0.0)
+        # Contribution margin weight: prefer margin_by_ing; fall back to unit price.
+        ing_margin = float(margin_by_ing.get(iid, 0.0))
+        margin_weight = ing_margin if ing_margin > 0 else p_ref
 
         for s_id in all_sup_ids:
             if (iid, s_id) not in cat_by_is:
@@ -347,8 +483,13 @@ def _solve_milp(
             p = float(c.get("current_price") or 0.0)
             lead = float(sup.get("lead_time_days") or 1.0)
             reliability = float(sup.get("reliability_score") or 1.0)
-            risk_coeff = lead_risk_lambda * lead * (1.0 - reliability)
             disc_tiers = c.get("discount") or []
+
+            # Pass-2 lever: penalises unreliable/long-lead suppliers proportionally
+            # to margin value.  lead_factor caps the lead penalty (floor at 0.5 for
+            # 1-day lead) so very-short leads don't become free passes.
+            lead_factor = min(lead, 2.0) / 2.0
+            exposure_coeff = margin_weight * (1.0 - reliability) * lead_factor
 
             ld = lead_ceil[s_id]
             for d in range(ld, n_days):
@@ -356,34 +497,32 @@ def _solve_milp(
                     continue
                 x_var = _x(iid, s_id, d)
 
-                # (1) Base item cost
-                obj_terms.append(p * x_var)
+                # (1) Base item cost → real cash
+                cash_real_terms.append(p * x_var)
 
-                # (5) Lead-time x reliability risk
-                if risk_coeff > 0:
-                    obj_terms.append(risk_coeff * x_var)
-
-                # (6) Per-item quantity-discount savings
+                # (2) Per-item quantity-discount savings → real cash (negative)
                 if disc_tiers:
                     tier = disc_tiers[0]
                     disc_p = float(tier.get("unit_price") or p)
                     if disc_p < p:
-                        obj_terms.append(-(p - disc_p) * x_disc.get((iid, s_id, d), 0.0))
+                        cash_real_terms.append(-(p - disc_p) * x_disc.get((iid, s_id, d), 0.0))
 
-        # Coverage penalties + spoilage
+                # (3) Exposure lever (used in pass-2 objective only)
+                if exposure_coeff > 0:
+                    exposure_terms.append(exposure_coeff * x_var)
+
+        # Coverage penalties + spoilage → internal penalties
         for d in range(n_days):
-            # (3a) Hard demand-coverage shortfall — dominates all cost terms.
-            obj_terms.append(slack_penalty * demand_short[iid, d])
-            # (3b) Soft safety-buffer shortfall — only added to objective when
-            #      safety_pen_mult > 0.  When the caller sets it to 0.0, the safety
-            #      buffer becomes a pure reporting target and never drives a purchase.
+            # (4a) Hard demand-coverage shortfall — dominates all cost terms.
+            penalty_terms.append(slack_penalty * demand_short[iid, d])
+            # (4b) Soft safety-buffer shortfall — only added when multiplier > 0.
             if safety_pen_mult > 0:
-                obj_terms.append(safety_pen_mult * max(p_ref, 1e-6) * safety_short[iid, d])
-            # (4) Spoilage / waste penalty (perishables carry real waste vars).
+                penalty_terms.append(safety_pen_mult * max(p_ref, 1e-6) * safety_short[iid, d])
+            # (5) Spoilage / waste penalty (perishables carry real waste vars).
             if perishable:
-                obj_terms.append(spoil_pen_mult * max(p_ref, 1e-6) * waste[iid, d])
+                penalty_terms.append(spoil_pen_mult * max(p_ref, 1e-6) * waste[iid, d])
 
-    # (2) Delivery charges — one per supplier-day
+    # (6) Delivery charges → real cash (one per supplier-day)
     for s_id in all_sup_ids:
         sup = sup_by_id.get(s_id, {})
         dc = float(sup.get("delivery_charge") or 0.0)
@@ -392,9 +531,9 @@ def _solve_milp(
         ld = lead_ceil[s_id]
         for d in range(ld, n_days):
             if (s_id, d) in deliver:
-                obj_terms.append(dc * deliver[s_id, d])
+                cash_real_terms.append(dc * deliver[s_id, d])
 
-    # (7) Supplier-level volume-discount rebates (per delivery day)
+    # (7) Supplier-level volume-discount rebates → real cash (negative)
     for s_id in all_sup_ids:
         sup = sup_by_id.get(s_id, {})
         vd = sup.get("volume_discount") or []
@@ -402,7 +541,6 @@ def _solve_milp(
         for d in range(ld, n_days):
             if (s_id, d) not in deliver:
                 continue
-            # order value for supplier s on day d
             ov_terms = []
             for iid in active_ids:
                 if (iid, s_id, d) not in q:
@@ -420,20 +558,21 @@ def _solve_milp(
                 vt = vol_tier.get((s_id, d, ti))
                 if vt is None:
                     continue
-                # Tier reached iff order value >= threshold
+                # Conservative rebate approximation (same as sourcing.py)
                 prob += ov >= threshold * vt, f"vol_tier_lb_{s_id}_{d}_{ti}"
                 prob += ov <= threshold + M_val * vt, f"vol_tier_ub_{s_id}_{d}_{ti}"
-                # Conservative rebate approximation (same as sourcing.py:481-483)
                 rebate = (disc_pct / 100.0) * threshold * vt
-                obj_terms.append(-rebate)
+                cash_real_terms.append(-rebate)
 
-    prob += pulp.lpSum(obj_terms)
+    cash_real_expr = pulp.lpSum(cash_real_terms)
+
+    # Pass-1 objective: real cash + internal penalties
+    prob += pulp.lpSum([cash_real_expr] + penalty_terms)
 
     # ------------------------------------------------------------------
-    # Constraints
+    # Constraints (shared by both passes)
     # ------------------------------------------------------------------
 
-    # Inventory balance + coverage + perishable held-stock cap
     for iid in active_ids:
         ing = ing_by_id.get(iid, {})
         shelf_life = float(ing.get("shelf_life_days") or 0.0)
@@ -445,17 +584,12 @@ def _solve_milp(
             demand_d = demand_by_day.get(iid, {}).get(d, 0.0)
             prev = initial_total[iid] if d == 0 else inv[iid, d - 1]
 
-            # Stock balance:
-            #   inv[d] = prev + arrivals[d] - demand[d] - waste[d] + demand_short[d]
-            # demand_short bumps inv to >= 0 when demand cannot be met (lost
-            # sales — backlog is not carried).  waste disposes aged stock.
             prob += (
                 inv[iid, d]
                 == prev + _arrivals(iid, d) - demand_d - waste[iid, d] + demand_short[iid, d],
                 f"inv_bal_{iid}_{d}",
             )
 
-            # Soft safety-buffer target (relaxed to 0 on the last horizon day).
             target_ss = ss if d < n_days - 1 else 0.0
             prob += (
                 inv[iid, d] + safety_short[iid, d] >= target_ss,
@@ -463,10 +597,6 @@ def _solve_milp(
             )
 
             if perishable:
-                # Held-stock expiry cap: what is on hand at end of day d cannot
-                # exceed stock that arrived within the last `sl` days plus the
-                # opening stock still unexpired at day d.  This never blocks
-                # ordering a whole pack; it just forces disposal of aged stock.
                 window_arrivals = pulp.lpSum(
                     _arrivals(iid, dd)
                     for dd in range(max(0, d - sl + 1), d + 1)
@@ -476,10 +606,9 @@ def _solve_milp(
                     f"expiry_hold_{iid}_{d}",
                 )
             else:
-                # Non-perishables never spoil.
                 prob += waste[iid, d] == 0, f"no_waste_{iid}_{d}"
 
-    # Link q → deliver: can only order on an open delivery day
+    # Link q → deliver
     for iid in active_ids:
         for s_id in all_sup_ids:
             if (iid, s_id) not in cat_by_is:
@@ -492,7 +621,7 @@ def _solve_milp(
                     continue
                 prob += q[iid, s_id, d] <= M * deliver[s_id, d], f"link_del_{iid}_{s_id}_{d}"
 
-    # MOV: if a supplier delivers on day d, order value must meet min_order_value
+    # MOV
     for s_id in all_sup_ids:
         sup = sup_by_id.get(s_id, {})
         mov = float(sup.get("min_order_value") or 0.0)
@@ -546,12 +675,12 @@ def _solve_milp(
                     prob += x_disc[iid, s_id, d] == 0, f"no_xdisc2_{iid}_{s_id}_{d}"
 
     # ------------------------------------------------------------------
-    # Solve
+    # Pass 1 — cash-optimal solve
     # ------------------------------------------------------------------
     solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=30)
     prob.solve(solver)
 
-    if prob.status != 1:  # 1 = Optimal
+    if prob.status != 1:
         status_name = pulp.LpStatus.get(prob.status, "unknown")
         logger.warning(
             "Time-phased MILP non-optimal (status=%d/%s); falling back to greedy.",
@@ -559,27 +688,60 @@ def _solve_milp(
         )
         raise RuntimeError(f"MILP non-optimal: {status_name}")
 
+    cash_optimal = float(pulp.value(cash_real_expr) or 0.0)
+    logger.debug("Pass 1 (cash-optimal): C0 = %.4f", cash_optimal)
+
+    # ------------------------------------------------------------------
+    # Pass 2 — buy down one-day-delay exposure within cash cap
+    # ------------------------------------------------------------------
+    # Only run if stress is enabled, tolerance > 0, there are exposure terms
+    # (at least one supplier has reliability < 1 with a margin-positive ingredient),
+    # and the cash baseline is positive.
+    run_pass2 = (
+        stress_enabled
+        and reliability_cash_tolerance > 0.0
+        and bool(exposure_terms)
+        and cash_optimal > 0.0
+    )
+
+    if run_pass2:
+        cash_cap = cash_optimal * (1.0 + reliability_cash_tolerance)
+        prob += cash_real_expr <= cash_cap, "reliability_cash_cap"
+        # New objective: minimize margin-weighted exposure + penalties
+        prob += pulp.lpSum(exposure_terms + penalty_terms)
+        prob.solve(solver)
+        if prob.status != 1:
+            # Pass 2 infeasible / non-optimal: restore pass-1 result.
+            logger.warning(
+                "Pass 2 (stress) non-optimal (status=%d); using pass-1 cash-optimal plan.",
+                prob.status,
+            )
+            prob.constraints.pop("reliability_cash_cap", None)
+            prob += pulp.lpSum([cash_real_expr] + penalty_terms)
+            prob.solve(solver)
+            run_pass2 = False
+
+    cash_final = float(pulp.value(cash_real_expr) or 0.0)
+
     # ------------------------------------------------------------------
     # Extract solution
     # ------------------------------------------------------------------
-    orders: List[PlanOrder] = []
-    total_cost = 0.0
-
-    # Per-ingredient hard shortfall (uncoverable forecasted demand).
     short_by_ing: Dict[int, float] = {}
     short_days_by_ing: Dict[int, List[int]] = {}
     for iid in active_ids:
-        days = []
+        days_short = []
         tot = 0.0
         for d in range(n_days):
             v = pulp.value(demand_short.get((iid, d))) or 0.0
             if v > 0.5:
                 tot += v
-                days.append(d)
+                days_short.append(d)
         short_by_ing[iid] = tot
-        short_days_by_ing[iid] = days
+        short_days_by_ing[iid] = days_short
     total_short = sum(short_by_ing.values())
 
+    orders: List[PlanOrder] = []
+    total_cost = 0.0
     ordered_ings: set = set()
     for iid in active_ids:
         ing = ing_by_id.get(iid, {})
@@ -598,8 +760,6 @@ def _solve_milp(
                 if q_val is None or q_val < 0.5:
                     continue
                 qty = round(q_val) * pack_size
-                # at_risk if a hard demand shortfall exists on/before this
-                # delivery day (early demand that cannot be filled in time).
                 at_risk = any(dd <= d for dd in short_days_by_ing.get(iid, []))
                 reason = (
                     f"MILP: {ing.get('name', iid)} from supplier {s_id} "
@@ -618,14 +778,12 @@ def _solve_milp(
                 total_cost += qty * p
                 ordered_ings.add(iid)
 
-    # Never drop an ingredient silently: any ingredient with uncoverable
-    # forecasted demand but no order line gets an explicit at_risk marker.
+    # Never drop an ingredient silently: explicit at_risk marker for uncoverable demand.
     for iid in active_ids:
         if short_by_ing.get(iid, 0.0) <= 1.0 or iid in ordered_ings:
             continue
         ing = ing_by_id.get(iid, {})
         unit = ing.get("base_unit", "g")
-        # Pick the cheapest catalog supplier (for context) even if unusable.
         cand: Optional[Tuple[int, float]] = None
         for s_id in all_sup_ids:
             if (iid, s_id) in cat_by_is:
@@ -635,8 +793,8 @@ def _solve_milp(
         s_id = cand[0] if cand else 0
         price = cand[1] if cand else 0.0
         ld = lead_ceil.get(s_id, 1)
-        days = short_days_by_ing.get(iid, [])
-        deliver_day = min(max(ld, min(days) if days else 0), n_days - 1)
+        days_short = short_days_by_ing.get(iid, [])
+        deliver_day = min(max(ld, min(days_short) if days_short else 0), n_days - 1)
         orders.append(PlanOrder(
             ingredient_id=iid,
             supplier_id=s_id,
@@ -648,7 +806,7 @@ def _solve_milp(
             reason=(
                 f"uncovered: {ing.get('name', iid)} short "
                 f"{short_by_ing.get(iid, 0.0):.0f}{unit} on day(s) "
-                f"{','.join(str(x) for x in days)} — no lead-feasible / in-stock supply"
+                f"{','.join(str(x) for x in days_short)} — no lead-feasible / in-stock supply"
             ),
         ))
 
@@ -665,18 +823,75 @@ def _solve_milp(
                 total_cost += dc
 
     coverage_ok = total_short <= 1.0
+
+    # ------------------------------------------------------------------
+    # Compute honest one-day-delay exposure for the chosen plan
+    # ------------------------------------------------------------------
+    reliability_premium = 0.0
+    exposed_value_baseline = 0.0
+    exposed_value_plan = 0.0
+
+    if run_pass2:
+        reliability_premium = max(0.0, cash_final - cash_optimal)
+        try:
+            # Exposure for the chosen (pass-2) plan
+            exposed_value_plan = _one_day_delay_exposure(
+                orders=orders,
+                demand_by_day=demand_by_day,
+                on_hand=on_hand,
+                inbound_by_day=inbound_by_day,
+                lots_by_ing=lots_by_ing,
+                margin_by_ing=margin_by_ing,
+                n_days=n_days,
+                ingredient_ids=active_ids,
+                ing_by_id=ing_by_id,
+            )
+            # Baseline: exposure if no plan orders arrive at all (worst-case reference,
+            # requires no re-solve and is the correct conservative bound).
+            exposed_value_baseline = _one_day_delay_exposure(
+                orders=[],
+                demand_by_day=demand_by_day,
+                on_hand=on_hand,
+                inbound_by_day=inbound_by_day,
+                lots_by_ing=lots_by_ing,
+                margin_by_ing=margin_by_ing,
+                n_days=n_days,
+                ingredient_ids=active_ids,
+                ing_by_id=ing_by_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "plan_optimizer: one-day-delay exposure computation failed; trade-off set to 0."
+            )
+            reliability_premium = 0.0
+            exposed_value_baseline = 0.0
+            exposed_value_plan = 0.0
+
+    rationale = (
+        f"Time-phased MILP: {len(orders)} order lines across "
+        f"{len({(o.supplier_id, o.delivery_day) for o in orders if o.qty > 0})} "
+        f"supplier-days."
+    )
+    if not coverage_ok:
+        rationale += f" COVERAGE GAP: {total_short:.0f} base units uncoverable."
+    if run_pass2 and reliability_premium > 0.01:
+        protected = max(0.0, exposed_value_baseline - exposed_value_plan)
+        rationale += (
+            f" Reliability pass: extra cash €{reliability_premium:.2f}, "
+            f"forecast value protected under one-day delay €{protected:.2f}."
+        )
+
     return PlanSolution(
         orders=orders,
         total_cost=total_cost,
         method="milp",
         total_short=total_short,
         coverage_ok=coverage_ok,
-        rationale=(
-            f"Time-phased MILP: {len(orders)} order lines across "
-            f"{len({(o.supplier_id, o.delivery_day) for o in orders if o.qty > 0})} "
-            f"supplier-days."
-            + ("" if coverage_ok else f" COVERAGE GAP: {total_short:.0f} base units uncoverable.")
-        ),
+        rationale=rationale,
+        cash_cost=cash_final,
+        reliability_premium=reliability_premium,
+        exposed_value_baseline=exposed_value_baseline,
+        exposed_value_plan=exposed_value_plan,
     )
 
 
@@ -812,9 +1027,11 @@ def _solve_greedy(
             lots.append([qty, exp])
             running += qty
 
+    cash = sum(o.qty * o.unit_price for o in orders)
     return PlanSolution(
         orders=orders,
-        total_cost=sum(o.qty * o.unit_price for o in orders),
+        total_cost=cash,
+        cash_cost=cash,
         method="greedy",
         rationale=f"Greedy fallback: {len(orders)} order lines.",
     )

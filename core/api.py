@@ -2883,6 +2883,9 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
         "generated_at": float(latest_run.created_at) if latest_run else 0.0,
         "coverage_ok": bool(getattr(latest_run, "coverage_ok", 1)) if latest_run else True,
         "total_short": float(getattr(latest_run, "total_short", 0.0) or 0.0) if latest_run else 0.0,
+        "reliability_premium": float(getattr(latest_run, "reliability_premium", 0.0) or 0.0) if latest_run else 0.0,
+        "exposed_value_baseline": float(getattr(latest_run, "exposed_value_baseline", 0.0) or 0.0) if latest_run else 0.0,
+        "exposed_value_protected": float(getattr(latest_run, "exposed_value_protected", 0.0) or 0.0) if latest_run else 0.0,
         "items": result,
     }
 

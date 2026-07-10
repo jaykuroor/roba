@@ -78,6 +78,9 @@ interface PlanResponse {
   generated_at: number;
   coverage_ok: boolean;
   total_short: number;
+  reliability_premium: number;
+  exposed_value_baseline: number;
+  exposed_value_protected: number;
   items: PlanItem[];
 }
 
@@ -553,6 +556,7 @@ const PAGE_SIZE = 10;
 export function ProcurementPanel() {
   const procurementPlanVersion = useProcurementPlanVersion();
   const [planItems, setPlanItems] = useState<PlanItem[]>([]);
+  const [planMeta, setPlanMeta] = useState<Omit<PlanResponse, "items"> | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [replanning, setReplanning] = useState(false);
   const [ordered, setOrdered] = useState<PurchaseOrder[]>([]);
@@ -580,7 +584,9 @@ export function ProcurementPanel() {
     setPlanLoading(true);
     try {
       const res = await apiGet<PlanResponse>("/api/track-b/procurement/plan");
-      setPlanItems(res.items);
+      const { items, ...meta } = res;
+      setPlanItems(items);
+      setPlanMeta(meta);
     } catch {
       /* ignore */
     } finally {
@@ -691,6 +697,21 @@ export function ProcurementPanel() {
               </span>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Reliability trade-off summary */}
+      {planMeta && planMeta.reliability_premium > 0.005 && planMeta.exposed_value_protected > 0 && (
+        <div className="rounded-lg border border-muted/40 bg-surface/60 px-3 py-2 text-xs text-text/70">
+          <span className="font-medium text-text">Selected safer plan</span>
+          {" · "}Extra cash{" "}
+          <span className="font-medium text-text">
+            €{planMeta.reliability_premium.toFixed(2)}
+          </span>
+          {" · "}Forecast value protected under one-day delay{" "}
+          <span className="font-medium text-text">
+            €{Math.max(0, planMeta.exposed_value_baseline - planMeta.exposed_value_protected).toFixed(2)}
+          </span>
         </div>
       )}
 

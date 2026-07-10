@@ -604,3 +604,91 @@ def test_greedy_no_safety_purchase_when_demand_covered():
         f"Expected no greedy orders when demand is covered and safety is non-cost-bearing, "
         f"got: {sol.orders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests 15-18: Two-pass reliability premium
+# ---------------------------------------------------------------------------
+
+def _two_suppliers_scenario(reliability_cash_tolerance=0.01, stress_enabled=True,
+                             margin_by_ing=None, n=7):
+    """Two suppliers with identical price but different reliability / lead time.
+
+    Supplier 1: reliable=0.99, lead=1 day  (the 'safe' choice)
+    Supplier 2: reliable=0.70, lead=2 days (the 'risky' choice — arrives later,
+                fails 30% of the time)
+
+    Both offer the same unit price (€0.01/g) so the cash-optimal plan may split
+    between them or choose either.  With a reliability cash tolerance > 0, the
+    pass-2 objective should prefer supplier 1 (shorter lead, higher reliability)
+    when the cash cap allows it.
+    """
+    ingredients = [_ing(1)]
+    catalog = [
+        _cat(1, 1, price=0.01, pack=100.0, is_default=0),  # reliable / fast
+        _cat(2, 1, price=0.01, pack=100.0, is_default=0),  # unreliable / slow
+    ]
+    suppliers = [
+        _sup(1, lead=1.0, reliability=0.99),
+        _sup(2, lead=2.0, reliability=0.70),
+    ]
+    demand = {1: {d: 100.0 for d in range(n)}}
+    params = {
+        "slack_penalty": 1000.0,
+        "safety_penalty_multiplier": 0.0,
+        "reliability_cash_tolerance": reliability_cash_tolerance,
+        "stress_enabled": stress_enabled,
+        "margin_by_ing": margin_by_ing or {1: 5.0},  # €5 margin per gram of ingredient
+    }
+    return _run(
+        ingredients=ingredients,
+        catalog=catalog,
+        suppliers=suppliers,
+        demand_by_day=demand,
+        on_hand={1: 100.0},  # cover day-0 demand; lead≥1 means no supplier can deliver day 0
+        safety_stock={1: 0.0},
+        n_days=n,
+        params=params,
+    )
+
+
+def test_reliability_premium_cash_cap_holds():
+    """Extra cash spent on reliability must never exceed tolerance × C0."""
+    sol = _two_suppliers_scenario(reliability_cash_tolerance=0.01)
+    # reliability_premium ≤ 0 or within 1% of cash_cost
+    if sol.reliability_premium > 0.0:
+        cap = sol.cash_cost * 0.01
+        assert sol.reliability_premium <= cap + 1e-3, (
+            f"Premium €{sol.reliability_premium:.4f} exceeds 1% cap on "
+            f"cash cost €{sol.cash_cost:.4f} (cap=€{cap:.4f})"
+        )
+
+
+def test_tolerance_zero_means_cash_optimal_no_premium():
+    """With tolerance=0, no extra cash is spent and premium is 0."""
+    sol = _two_suppliers_scenario(reliability_cash_tolerance=0.0)
+    assert sol.reliability_premium == 0.0, (
+        f"tolerance=0 should produce zero premium; got {sol.reliability_premium:.4f}"
+    )
+
+
+def test_stress_disabled_skips_pass2():
+    """stress_enabled=False produces a single-pass plan with zero premium."""
+    sol = _two_suppliers_scenario(stress_enabled=False, reliability_cash_tolerance=0.05)
+    assert sol.reliability_premium == 0.0, (
+        f"stress_enabled=False should skip pass 2; got premium={sol.reliability_premium:.4f}"
+    )
+
+
+def test_stress_pass_produces_solution_fields():
+    """With stress enabled and margin data, PlanSolution carries the expected fields."""
+    sol = _two_suppliers_scenario(reliability_cash_tolerance=0.05, margin_by_ing={1: 5.0})
+    # Fields always present (even if premium is 0 on this small test instance)
+    assert hasattr(sol, "reliability_premium"), "Missing reliability_premium field"
+    assert hasattr(sol, "exposed_value_baseline"), "Missing exposed_value_baseline field"
+    assert hasattr(sol, "exposed_value_plan"), "Missing exposed_value_plan field"
+    assert sol.reliability_premium >= 0.0, "Premium must be non-negative"
+    assert sol.exposed_value_baseline >= 0.0, "Baseline exposure must be non-negative"
+    assert sol.exposed_value_plan >= 0.0, "Plan exposure must be non-negative"
+    # Coverage must remain fully intact
+    assert sol.coverage_ok, f"Coverage must hold after stress pass; total_short={sol.total_short}"

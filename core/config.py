@@ -142,6 +142,18 @@ OPTIMIZER_LLM_AUTO_MODE = os.getenv("OPTIMIZER_LLM_AUTO_MODE", "0").lower() in {
 }
 PROMO_SLOW_MOVER_PCT = int(os.getenv("PROMO_SLOW_MOVER_PCT", "15"))
 
+# Procurement reliability premium (two-pass MILP)
+# RELIABILITY_CASH_TOLERANCE: maximum fraction of the cash-optimal plan cost that may
+# be spent to buy down one-day-delay exposure.  0.01 = 1%.  Set to 0 to force pure
+# cash-optimal ordering (reliability has no influence on supplier selection or timing).
+RELIABILITY_CASH_TOLERANCE = float(os.getenv("RELIABILITY_CASH_TOLERANCE", "0.01"))
+# RELIABILITY_STRESS_ENABLED: when True, run the two-pass lexicographic solve (pass 1
+# = cash-optimal, pass 2 = minimize one-day-delay exposure within the cash cap).
+# Set to "0" / "false" to fall back to single-pass cash-optimal (same as tolerance=0).
+RELIABILITY_STRESS_ENABLED = os.getenv("RELIABILITY_STRESS_ENABLED", "1").lower() in {
+    "1", "true", "yes", "on"
+}
+
 # Vertex AI Live API (Stream B5)
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio")
 GEMINI_LIVE_CALL_MODEL = os.getenv("GEMINI_LIVE_CALL_MODEL", "gemini-live-2.5-flash-native-audio")

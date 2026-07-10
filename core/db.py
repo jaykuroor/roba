@@ -123,6 +123,10 @@ def _ensure_columns() -> None:
         ("procurement_plan_runs", "total_short",       "REAL DEFAULT 0.0"),
         # PO urgency label carried from the source planned row (at_risk/uncoverable/None)
         ("purchase_orders",       "urgency",            "TEXT"),
+        # Reliability premium fields (added with bounded-premium / two-pass MILP refactor)
+        ("procurement_plan_runs", "reliability_premium",       "REAL DEFAULT 0.0"),
+        ("procurement_plan_runs", "exposed_value_baseline",    "REAL DEFAULT 0.0"),
+        ("procurement_plan_runs", "exposed_value_protected",   "REAL DEFAULT 0.0"),
     ]
     conn = engine.raw_connection()
     try:

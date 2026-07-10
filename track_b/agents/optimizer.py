@@ -519,6 +519,9 @@ class InventoryOptimizer(BaseAgent):
         plan_coverage_ok = True
         plan_total_short = 0.0
         _ing_name_by_id: Dict[int, str] = {}  # populated by MILP path; used by emit block
+        plan_reliability_premium = 0.0
+        plan_exposed_value_baseline = 0.0
+        plan_exposed_value_protected = 0.0
 
         # -- Gather full catalog + all suppliers for every active ingredient --
         if ingredients_data:
@@ -610,6 +613,67 @@ class InventoryOptimizer(BaseAgent):
             # lot expiries (fresh-initial) rather than a single never-expiring lot.
             _lots_map = {iid: data["lots"] for iid, data in ingredients_data.items()}
 
+            # Compute contribution margin per base unit for each active ingredient.
+            # Margin = menu selling price − recipe cost (cheapest catalog price per
+            # ingredient × recipe qty).  Used as weights in the pass-2 reliability
+            # exposure lever; falls back to unit price in the solver when 0.
+            _margin_by_ing: Dict[int, float] = {}
+            try:
+                # Cheapest available catalog price per ingredient.
+                _cheap_price: Dict[int, float] = {}
+                for _cc in milp_catalog:
+                    _ciid = int(_cc["ingredient_id"])
+                    _cp = float(_cc.get("current_price") or 0.0)
+                    if _ciid not in _cheap_price or _cp < _cheap_price[_ciid]:
+                        _cheap_price[_ciid] = _cp
+
+                # Selling prices for menu items that appear in our recipe_qty map.
+                _sess_m = self.db_session_factory()
+                try:
+                    _mid_ids = list(recipe_qty.keys())
+                    _menu_price_rows = (
+                        _sess_m.query(MenuItem.id, MenuItem.dine_in_price)
+                        .filter(MenuItem.id.in_(_mid_ids))
+                        .all()
+                    ) if _mid_ids else []
+                finally:
+                    _sess_m.close()
+                _price_by_mid: Dict[int, float] = {
+                    int(_m): float(_p or 0.0) for _m, _p in _menu_price_rows
+                }
+
+                # Margin per base unit of each ingredient, averaged across dishes.
+                _margin_sum: Dict[int, float] = {}
+                _margin_cnt: Dict[int, int] = {}
+                for _mid, _ing_map in recipe_qty.items():
+                    _sell = _price_by_mid.get(_mid, 0.0)
+                    if _sell <= 0:
+                        continue
+                    _rcost = sum(
+                        float(_qty) * _cheap_price.get(_iid, 0.0)
+                        for _iid, _qty in _ing_map.items()
+                    )
+                    _margin = max(0.0, _sell - _rcost)
+                    if _margin <= 0:
+                        continue
+                    for _iid, _qty in _ing_map.items():
+                        if (_qty or 0) <= 0:
+                            continue
+                        _mpunit = _margin / float(_qty)
+                        _margin_sum[_iid] = _margin_sum.get(_iid, 0.0) + _mpunit
+                        _margin_cnt[_iid] = _margin_cnt.get(_iid, 0) + 1
+                _margin_by_ing = {
+                    _iid: _margin_sum[_iid] / _margin_cnt[_iid]
+                    for _iid in _margin_sum
+                    if _margin_cnt.get(_iid, 0) > 0
+                }
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "build_procurement_plan: margin_by_ing computation failed; "
+                    "reliability pass will fall back to unit-price weights."
+                )
+                _margin_by_ing = {}
+
             _solution = _solve_time_phased(
                 n_days=n_days,
                 ingredients=milp_ingredients,
@@ -620,17 +684,22 @@ class InventoryOptimizer(BaseAgent):
                 on_hand=_on_hand_map,
                 safety_stock=_safety_map,
                 params={
-                    "lead_risk_lambda": 0.3,
                     "spoilage_penalty_multiplier": 2.0,
                     "slack_penalty": 1000.0,
                     "safety_penalty_multiplier": 0.0,  # safety buffer is a reporting target only; never drives a goods purchase
                     "reorder_interval_days": config.REORDER_INTERVAL_DAYS,
                     "lots_by_ing": _lots_map,
+                    "reliability_cash_tolerance": config.RELIABILITY_CASH_TOLERANCE,
+                    "stress_enabled": config.RELIABILITY_STRESS_ENABLED,
+                    "margin_by_ing": _margin_by_ing,
                 },
             )
             plan_method = _solution.method
             plan_coverage_ok = bool(getattr(_solution, "coverage_ok", True))
             plan_total_short = float(getattr(_solution, "total_short", 0.0))
+            plan_reliability_premium = float(getattr(_solution, "reliability_premium", 0.0))
+            plan_exposed_value_baseline = float(getattr(_solution, "exposed_value_baseline", 0.0))
+            plan_exposed_value_protected = float(getattr(_solution, "exposed_value_plan", 0.0))
             logger.info(
                 "Time-phased plan: method=%s, %d orders, total_cost=%.2f, "
                 "coverage_ok=%s, total_short=%.1f — %s",
@@ -951,6 +1020,9 @@ class InventoryOptimizer(BaseAgent):
                 method=plan_method,
                 coverage_ok=1 if _reconciled_coverage_ok else 0,
                 total_short=_reconciled_total_short,
+                reliability_premium=plan_reliability_premium,
+                exposed_value_baseline=plan_exposed_value_baseline,
+                exposed_value_protected=plan_exposed_value_protected,
             )
             session.add(run)
             session.flush()
