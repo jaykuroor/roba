@@ -160,6 +160,19 @@ RELIABILITY_CASH_TOLERANCE = float(os.getenv("RELIABILITY_CASH_TOLERANCE", "0.01
 RELIABILITY_STRESS_ENABLED = os.getenv("RELIABILITY_STRESS_ENABLED", "1").lower() in {
     "1", "true", "yes", "on"
 }
+# RELIABILITY_ROBUST_HARD_DELAY: when True, run a pass-3 solve that hard-constrains
+# demand coverage even if qualifying (unreliable) suppliers' deliveries slip one day.
+# Default OFF — the banner reports delay exposure honestly regardless of this flag.
+# Enabling raises cost and may force earlier or more-reliable-supplier orders.
+# Falls back gracefully to pass-2 plan if the delay scenario is infeasible.
+RELIABILITY_ROBUST_HARD_DELAY = os.getenv("RELIABILITY_ROBUST_HARD_DELAY", "0").lower() in {
+    "1", "true", "yes", "on"
+}
+# RELIABILITY_ROBUST_MIN_RELIABILITY: reliability_score threshold below which a
+# supplier qualifies for the delay scenario in robust mode (default 0.95).
+RELIABILITY_ROBUST_MIN_RELIABILITY = float(
+    os.getenv("RELIABILITY_ROBUST_MIN_RELIABILITY", "0.95")
+)
 
 # Vertex AI Live API (Stream B5)
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio")

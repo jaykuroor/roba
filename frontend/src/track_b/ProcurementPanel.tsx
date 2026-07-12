@@ -242,7 +242,7 @@ function SupplierCard({
                             title="Cannot be sourced — no lead-feasible / in-stock supply"
                           >
                             <AlertOctagon size={10} />
-                            uncoverable
+                            Uncoverable
                           </span>
                         )}
                         {item.at_risk && !item.uncoverable && (
@@ -251,7 +251,7 @@ function SupplierCard({
                             title={atRiskTitle}
                           >
                             <AlertTriangle size={10} />
-                            at-risk
+                            Delay-exposed
                           </span>
                         )}
                       </div>
@@ -740,35 +740,70 @@ export function ProcurementPanel() {
         </div>
       )}
 
-      {/* Reliability trade-off summary */}
-      {planMeta && planMeta.reliability_premium > 0.005 && planMeta.exposed_value_protected > 0 && (
-        <div className="rounded-lg border border-muted/40 bg-surface/60 px-3 py-2 text-xs text-text/70">
-          <span className="font-medium text-text">Selected safer plan</span>
-          {" · "}Extra cash{" "}
-          <span className="font-medium text-text">
-            €{planMeta.reliability_premium.toFixed(2)}
-          </span>
-          {" · "}Forecast value protected under one-day delay{" "}
-          <span className="font-medium text-text">
-            €{Math.max(0, planMeta.exposed_value_baseline - planMeta.exposed_value_protected).toFixed(2)}
-          </span>
-        </div>
-      )}
+      {/* Coverage status panel — three orthogonal labeled lines */}
+      {planMeta && (
+        <div className="rounded-lg border border-muted/30 bg-surface/60 px-3 py-2.5 space-y-1.5 text-xs">
+          {/* COVERAGE axis */}
+          <div className="flex items-baseline gap-2">
+            <span className="font-semibold text-text/50 uppercase tracking-wide text-[10px] w-20 shrink-0">
+              Coverage
+            </span>
+            {planMeta.forecast_coverage_ok ? (
+              <span className="text-success font-medium">Fully covered</span>
+            ) : (
+              <span className="text-danger font-medium flex items-center gap-1">
+                <AlertOctagon size={11} />
+                {planMeta.total_short.toFixed(0)} units short even with planned orders
+              </span>
+            )}
+          </div>
 
-      {/* Coverage quality banner — only shown when coverage is plan-dependent or fragile */}
-      {planMeta && planMeta.forecast_coverage_ok && planMeta.coverage_depends_on_planned_orders && (
-        <div className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
-          <AlertTriangle size={12} className="inline mr-1 shrink-0" />
-          Forecast covered — conditional on planned orders being placed.
-          {!planMeta.late_delivery_coverage_ok && " Not robust to a late delivery."}
-        </div>
-      )}
-      {planMeta && !planMeta.forecast_coverage_ok && planMeta.total_short > 0 && (
-        <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
-          <AlertOctagon size={12} className="inline mr-1 shrink-0" />
-          Demand not fully covered —{" "}
-          <span className="font-medium">{planMeta.total_short.toFixed(0)} units short</span>
-          {" "}even with planned orders.
+          {/* TO CONFIRM axis — only shown when coverage depends on unplaced orders */}
+          {planMeta.coverage_depends_on_planned_orders && (() => {
+            const pendingCount = planMeta.items.filter(
+              (it) => it.status === "planned" || it.status === "at_risk"
+            ).length;
+            return (
+              <div className="flex items-baseline gap-2">
+                <span className="font-semibold text-text/50 uppercase tracking-wide text-[10px] w-20 shrink-0">
+                  To confirm
+                </span>
+                <span className="text-warning font-medium flex items-center gap-1">
+                  <AlertTriangle size={11} />
+                  {pendingCount} proposed order{pendingCount !== 1 ? "s" : ""} must be placed
+                </span>
+              </div>
+            );
+          })()}
+
+          {/* DELAY RISK axis — always shown when plan exists */}
+          <div className="flex items-baseline gap-2">
+            <span className="font-semibold text-text/50 uppercase tracking-wide text-[10px] w-20 shrink-0">
+              Delay risk
+            </span>
+            {planMeta.late_delivery_coverage_ok ? (
+              <span className="text-text/60">Survives a 1-day delivery delay</span>
+            ) : (() => {
+              // Find the item with the worst shortage_if_late for a concrete headline
+              const worst = planMeta.items
+                .filter((it) => (it.shortage_if_late ?? 0) > 0.5)
+                .sort((a, b) => (b.shortage_if_late ?? 0) - (a.shortage_if_late ?? 0))[0];
+              const reliabilityNote = planMeta.reliability_premium > 0.005 && planMeta.exposed_value_protected > 0
+                ? ` · safer plan active (+€${planMeta.reliability_premium.toFixed(2)})`
+                : "";
+              return (
+                <span className="text-warning font-medium flex items-center gap-1">
+                  <AlertTriangle size={11} />
+                  {worst
+                    ? `${worst.ingredient_name} ${worst.shortage_if_late?.toFixed(0)} ${worst.unit} short if a delivery slips 1 day`
+                    : "Not robust to a 1-day delivery delay"}
+                  {reliabilityNote && (
+                    <span className="font-normal text-text/50">{reliabilityNote}</span>
+                  )}
+                </span>
+              );
+            })()}
+          </div>
         </div>
       )}
 

@@ -426,6 +426,10 @@ class InventoryOptimizer(BaseAgent):
         # arrival day so the projection never re-flags covered shortages.
         # ----------------------------------------------------------------
         inbound_by_day: Dict[int, Dict[int, float]] = {ing_id: {} for ing_id in ingredient_ids}
+        # scheduled_supplier_days: already-in-transit supplier-days whose delivery charge is sunk.
+        # The MILP pre-opens those deliver binaries and skips charge/MOV for them so incremental
+        # lines can piggyback without triggering a new delivery fee or MOV enforcement.
+        scheduled_supplier_days: set = set()
         if ingredient_ids:
             from sqlalchemy import func as _sa_func  # local import; avoids top-level sqlalchemy dep
             session = self.db_session_factory()
@@ -433,6 +437,7 @@ class InventoryOptimizer(BaseAgent):
                 in_transit = (
                     session.query(
                         PurchaseOrderLine.ingredient_id,
+                        PurchaseOrder.supplier_id,
                         PurchaseOrder.expected_delivery,
                         _sa_func.sum(PurchaseOrderLine.qty).label("total_qty"),
                     )
@@ -442,10 +447,14 @@ class InventoryOptimizer(BaseAgent):
                         PurchaseOrder.status.in_(("proposed", "approved", "placed")),
                         PurchaseOrder.expected_delivery.isnot(None),
                     )
-                    .group_by(PurchaseOrderLine.ingredient_id, PurchaseOrder.expected_delivery)
+                    .group_by(
+                        PurchaseOrderLine.ingredient_id,
+                        PurchaseOrder.supplier_id,
+                        PurchaseOrder.expected_delivery,
+                    )
                     .all()
                 )
-                for ing_id_t, exp_delivery, total_qty in in_transit:
+                for ing_id_t, sup_id_t, exp_delivery, total_qty in in_transit:
                     if exp_delivery is None:
                         continue
                     arr_day = int(float(exp_delivery) // SECONDS_PER_DAY) - now_day
@@ -465,6 +474,9 @@ class InventoryOptimizer(BaseAgent):
                         inbound_by_day[ing_id_t][arr_day] = (
                             inbound_by_day[ing_id_t].get(arr_day, 0.0) + float(total_qty or 0.0)
                         )
+                    # Track the supplier-day as already scheduled
+                    if sup_id_t is not None:
+                        scheduled_supplier_days.add((int(sup_id_t), arr_day))
 
                 # W4: Also credit POs awaiting approval (proposed/approved, expected_delivery=None).
                 # estimate arrival = created_at + supplier lead_time so they count as pipeline
@@ -472,6 +484,7 @@ class InventoryOptimizer(BaseAgent):
                 null_transit = (
                     session.query(
                         PurchaseOrderLine.ingredient_id,
+                        PurchaseOrder.supplier_id,
                         PurchaseOrder.created_at,
                         Supplier.lead_time_days,
                         _sa_func.sum(PurchaseOrderLine.qty).label("total_qty"),
@@ -485,12 +498,13 @@ class InventoryOptimizer(BaseAgent):
                     )
                     .group_by(
                         PurchaseOrderLine.ingredient_id,
+                        PurchaseOrder.supplier_id,
                         PurchaseOrder.created_at,
                         Supplier.lead_time_days,
                     )
                     .all()
                 )
-                for ing_id_t, created_at, lead_days, total_qty in null_transit:
+                for ing_id_t, sup_id_t, created_at, lead_days, total_qty in null_transit:
                     lead = float(lead_days or 1.0)
                     est_delivery = float(created_at or now) + lead * SECONDS_PER_DAY
                     arr_day = int(est_delivery // SECONDS_PER_DAY) - now_day
@@ -501,6 +515,8 @@ class InventoryOptimizer(BaseAgent):
                         inbound_by_day[ing_id_t][arr_day] = (
                             inbound_by_day[ing_id_t].get(arr_day, 0.0) + float(total_qty or 0.0)
                         )
+                    if sup_id_t is not None:
+                        scheduled_supplier_days.add((int(sup_id_t), arr_day))
             finally:
                 session.close()
 
@@ -698,6 +714,9 @@ class InventoryOptimizer(BaseAgent):
                     "stress_enabled": config.RELIABILITY_STRESS_ENABLED,
                     "margin_by_ing": _margin_by_ing,
                     "production_start_hour": config.PRODUCTION_START_HOUR,
+                    "scheduled_supplier_days": scheduled_supplier_days,
+                    "robust_hard_delay": config.RELIABILITY_ROBUST_HARD_DELAY,
+                    "robust_min_reliability": config.RELIABILITY_ROBUST_MIN_RELIABILITY,
                 },
             )
             plan_method = _solution.method
@@ -706,14 +725,17 @@ class InventoryOptimizer(BaseAgent):
             plan_reliability_premium = float(getattr(_solution, "reliability_premium", 0.0))
             plan_exposed_value_baseline = float(getattr(_solution, "exposed_value_baseline", 0.0))
             plan_exposed_value_protected = float(getattr(_solution, "exposed_value_plan", 0.0))
+            plan_robust_applied = bool(getattr(_solution, "robust_applied", False))
+            plan_robust_status = str(getattr(_solution, "robust_status", ""))
             logger.info(
                 "Time-phased plan: method=%s, %d orders, total_cost=%.2f, "
-                "coverage_ok=%s, total_short=%.1f — %s",
+                "coverage_ok=%s, total_short=%.1f, robust=%s — %s",
                 _solution.method,
                 len(_solution.orders),
                 _solution.total_cost,
                 plan_coverage_ok,
                 plan_total_short,
+                plan_robust_status or "off",
                 _solution.rationale,
             )
             if not plan_coverage_ok:

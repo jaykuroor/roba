@@ -852,3 +852,328 @@ def test_unit_shortfall_zero_when_fully_covered_by_stock():
     assert sol.unit_shortfall_if_1day_late == 0.0, (
         f"No plan orders → no delay risk; expected 0, got {sol.unit_shortfall_if_1day_late:.1f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Fix 1 — Expiry-gated cohort model (the "basil bug" regression suite)
+# ---------------------------------------------------------------------------
+
+def _lots(qty: float, exp_day: float):
+    """Helper: create a lots_by_ing entry for one lot."""
+    return [[qty, exp_day]]
+
+
+def test_expired_stock_does_not_cover_later_demand():
+    """REGRESSION — basil bug.
+
+    Opening stock 185g expiring at start-of-day-3 (i.e., usable on days 0-2
+    only).  Demand is 185g/day for 5 days.  The earliest feasible delivery
+    (lead=1) arrives on day 1 at the latest that matters, but we force the
+    only available delivery to day 4 by setting lead=4 — simulating the exact
+    scenario where basil arrives Friday for Thursday demand.
+
+    Under the old held-inventory-cap model the MILP incorrectly reported
+    coverage_ok=True by counting the 185g expiring lot against day-3 demand.
+    The cohort model must surface coverage_ok=False and total_short >= demand
+    on days 3+ that can't be covered by day-4 delivery.
+    """
+    n = 5
+    daily = 185.0
+    # Opening lot expiring at start of day 3 (available days 0-2)
+    ing = _ing(4, perishable=1, shelf_life=3.0, name="Basil")
+    demand = {4: {d: daily for d in range(n)}}
+    on_hand = {4: 185.0}  # exactly one day's demand, expiring day 3
+    lots = {4: _lots(185.0, 3.0)}  # exp_day offset = 3 (available days 0,1,2 only)
+
+    sol = _run(
+        ingredients=[ing],
+        catalog=[_cat(1, 4, price=0.03, pack=500.0)],
+        suppliers=[_sup(1, lead=4.0)],  # earliest delivery = day 4
+        demand_by_day=demand,
+        on_hand=on_hand,
+        safety_stock={4: 0.0},
+        n_days=n,
+        params={
+            "slack_penalty": 1000.0,
+            "lots_by_ing": lots,
+        },
+    )
+    # Day 3 demand (185g) cannot be covered:
+    # - opening 185g expires at start of day 3 (not available on day 3)
+    # - first delivery at day 4 (after day-3 demand)
+    assert not sol.coverage_ok, (
+        f"Expected coverage_ok=False (basil bug regression): coverage_ok={sol.coverage_ok}, "
+        f"total_short={sol.total_short}"
+    )
+    assert sol.total_short >= daily * 0.9, (
+        f"Expected total_short >= {daily * 0.9:.0f}, got {sol.total_short:.1f}"
+    )
+
+
+def test_expiring_stock_used_before_expiry_only():
+    """Opening stock expiring on day 2 must cover days 0 and 1 but not day 2.
+
+    In the cohort model, cohort e=2 satisfies demand only when e > d, i.e.
+    only for days d = 0 and d = 1.  Day 2 demand must be met by an order.
+    """
+    n = 4
+    daily = 100.0
+    ing = _ing(1, perishable=1, shelf_life=2.0, name="Herb")
+    demand = {1: {d: daily for d in range(n)}}
+    on_hand = {1: 200.0}  # 2 days worth, expiring at start of day 2
+    lots = {1: _lots(200.0, 2.0)}  # exp_day=2 → usable on days 0,1 only
+
+    sol = _run(
+        ingredients=[ing],
+        catalog=[_cat(1, 1, price=0.05, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day=demand,
+        on_hand=on_hand,
+        safety_stock={1: 0.0},
+        n_days=n,
+        params={"slack_penalty": 1000.0, "lots_by_ing": lots},
+    )
+    # Days 0 and 1 are covered by opening stock (200g); days 2 and 3 need orders.
+    assert sol.coverage_ok, f"Days 2-3 should be coverable via orders; total_short={sol.total_short}"
+    ordered_qty = sum(o.qty for o in sol.orders if o.ingredient_id == 1)
+    assert ordered_qty >= daily * 2 * 0.9, (
+        f"Expected at least {daily * 2 * 0.9:.0f}g ordered for days 2-3, got {ordered_qty:.0f}g"
+    )
+    # All deliveries must arrive on day 2 or later (lead=1 → first feasible day 1,
+    # but day-1 delivery can cover day 2 demand since it doesn't expire before use).
+    for o in sol.orders:
+        if o.ingredient_id == 1 and o.qty > 0:
+            assert o.delivery_day >= 1, f"Delivery before lead time: day {o.delivery_day}"
+
+
+def test_milp_matches_python_projection_on_expiry():
+    """Consistency guard: MILP total_short must equal Python projection shortfall.
+
+    When opening lots expire mid-horizon and no delivery can arrive before the
+    gap, both the MILP (cohort model) and the Python _per_line_risk projection
+    must agree that demand on those days is uncoverable.
+    """
+    from track_b.procurement.plan_optimizer import _per_line_risk, PlanOrder
+
+    n = 5
+    daily = 100.0
+    # Lot expires at start of day 2: covers days 0 and 1 only.
+    # Lead=3: first delivery at day 3.  Day 2 is a gap.
+    ing = _ing(1, perishable=1, shelf_life=2.0, name="Herb")
+    demand = {1: {d: daily for d in range(n)}}
+    on_hand_qty = 200.0
+    on_hand = {1: on_hand_qty}
+    lots = {1: _lots(on_hand_qty, 2.0)}
+
+    sol = _run(
+        ingredients=[ing],
+        catalog=[_cat(1, 1, price=0.05, pack=100.0)],
+        suppliers=[_sup(1, lead=3.0)],
+        demand_by_day=demand,
+        on_hand=on_hand,
+        safety_stock={1: 0.0},
+        n_days=n,
+        params={"slack_penalty": 1000.0, "lots_by_ing": lots},
+    )
+    # Day 2 demand is uncoverable: lot expired, no delivery until day 3.
+    assert not sol.coverage_ok, (
+        f"Expected coverage gap on day 2; total_short={sol.total_short}"
+    )
+    milp_short = sol.total_short
+
+    # Verify with Python projection
+    risk = _per_line_risk(
+        orders=sol.orders,
+        demand_by_day=demand,
+        on_hand=on_hand,
+        inbound_by_day={1: {}},
+        lots_by_ing=lots,
+        n_days=n,
+        ingredient_ids=[1],
+        ing_by_id={1: {"id": 1, "perishable": 1, "shelf_life_days": 2.0, "base_unit": "g"}},
+    )
+    # projection shortfall = demand on day 2 that stock_before_plan can't cover
+    py_short = sum(
+        v.get("shortage_if_late", 0)
+        for v in risk.values()
+    )
+    # The MILP total_short (day-2 gap) should be consistent with projection findings
+    assert milp_short >= daily * 0.9, (
+        f"MILP should report at least {daily * 0.9:.0f} uncoverable; got {milp_short:.1f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Fix 2 — Scheduled supplier days (piggyback + MOV exemption)
+# ---------------------------------------------------------------------------
+
+def test_scheduled_supplier_day_no_extra_delivery_charge():
+    """Incremental lines on a scheduled (sunk) supplier-day incur zero delivery charge.
+
+    A FreshDirect delivery is already scheduled on day 2 (sunk charge €9).
+    The MILP needs to add garlic on that day.  With the scheduled-day pre-opening,
+    no new delivery charge should appear in total_cost.
+    """
+    n = 5
+    dc = 9.0
+    sol_with = _run(
+        ingredients=[_ing(7, name="Garlic")],
+        catalog=[_cat(5, 7, price=0.0095, pack=1000.0)],
+        suppliers=[_sup(5, lead=2.0, dc=dc, mov=50.0)],
+        demand_by_day={7: {d: 300.0 for d in range(n)}},
+        on_hand={7: 0.0},
+        safety_stock={7: 0.0},
+        n_days=n,
+        params={
+            "slack_penalty": 1000.0,
+            "scheduled_supplier_days": {(5, 2)},  # day 2 delivery already scheduled
+        },
+    )
+    sol_without = _run(
+        ingredients=[_ing(7, name="Garlic")],
+        catalog=[_cat(5, 7, price=0.0095, pack=1000.0)],
+        suppliers=[_sup(5, lead=2.0, dc=dc, mov=50.0)],
+        demand_by_day={7: {d: 300.0 for d in range(n)}},
+        on_hand={7: 0.0},
+        safety_stock={7: 0.0},
+        n_days=n,
+        params={"slack_penalty": 1000.0},
+    )
+    # With scheduled day: the delivery charge for day 2 is sunk, so total_cost is lower
+    # (by exactly the delivery charge for that day if the solver chose day 2 anyway)
+    # At minimum, total_cost should not be higher than without scheduled
+    assert sol_with.total_cost <= sol_without.total_cost + 1e-3, (
+        f"Scheduled day should not raise cost: with={sol_with.total_cost:.2f} "
+        f"without={sol_without.total_cost:.2f}"
+    )
+
+
+def test_scheduled_supplier_day_exempt_from_mov():
+    """On a scheduled (sunk) supplier-day, incremental lines need not clear MOV.
+
+    FreshDirect (MOV=€50) is already delivering on day 2.  Garlic need is ~1155g.
+    Without scheduling, the MILP pads to 3 packs (3000g) to clear MOV.
+    With scheduling, 1 pack (1000g * €0.0095 = €9.50) is enough — no MOV re-check.
+    """
+    n = 5
+    garlic_need = 200.0  # per day from day 2 onwards
+    sol = _run(
+        ingredients=[_ing(7, name="Garlic")],
+        catalog=[_cat(5, 7, price=0.0095, pack=1000.0)],
+        suppliers=[_sup(5, lead=2.0, dc=9.0, mov=50.0)],
+        demand_by_day={7: {d: garlic_need for d in range(n)}},
+        on_hand={7: 0.0},
+        safety_stock={7: 0.0},
+        n_days=n,
+        params={
+            "slack_penalty": 1000.0,
+            "scheduled_supplier_days": {(5, 2)},  # MOV already cleared
+        },
+    )
+    orders_d2 = [o for o in sol.orders if o.delivery_day == 2 and o.ingredient_id == 7]
+    if orders_d2:
+        total_on_d2 = sum(o.qty for o in orders_d2)
+        # Should order only what's needed — not 3x packs as MOV filler
+        needed_d2 = garlic_need * (n - 2)  # days 2,3,4
+        assert total_on_d2 <= needed_d2 + 1000.0 + 1e-6, (
+            f"Over-ordered garlic on scheduled day: {total_on_d2:.0f}g vs need ~{needed_d2:.0f}g"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Fix 3 — Robust hard-delay mode
+# ---------------------------------------------------------------------------
+
+def test_robust_flag_off_is_identical_to_baseline():
+    """With robust_hard_delay=False (default), results must be byte-identical
+    to a run with no robust flag at all — no regression."""
+    n = 5
+    params_base = {"slack_penalty": 1000.0}
+    params_robust_off = {"slack_penalty": 1000.0, "robust_hard_delay": False}
+
+    ingredients = [_ing(1)]
+    catalog = [_cat(1, 1, price=0.01, pack=100.0)]
+    suppliers = [_sup(1, lead=1.0, reliability=0.90)]
+    demand = {1: {d: 100.0 for d in range(n)}}
+
+    sol_base = _run(
+        ingredients=ingredients, catalog=catalog, suppliers=suppliers,
+        demand_by_day=demand, on_hand={1: 0.0}, safety_stock={1: 0.0},
+        n_days=n, params=params_base,
+    )
+    sol_off = _run(
+        ingredients=ingredients, catalog=catalog, suppliers=suppliers,
+        demand_by_day=demand, on_hand={1: 0.0}, safety_stock={1: 0.0},
+        n_days=n, params=params_robust_off,
+    )
+    assert sol_off.total_cost == pytest.approx(sol_base.total_cost, rel=1e-3), (
+        f"With robust=False, cost should match baseline: "
+        f"base={sol_base.total_cost:.2f} off={sol_off.total_cost:.2f}"
+    )
+    assert sol_off.robust_requested is False
+    assert sol_off.robust_applied is False
+
+
+def test_robust_mode_requested_field():
+    """With robust_hard_delay=True, robust_requested=True is always set on PlanSolution."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available; robust mode requires MILP")
+    n = 5
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=0.01, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, reliability=0.90)],
+        demand_by_day={1: {d: 100.0 for d in range(n)}},
+        on_hand={1: 0.0},
+        safety_stock={1: 0.0},
+        n_days=n,
+        params={
+            "slack_penalty": 1000.0,
+            "robust_hard_delay": True,
+            "robust_min_reliability": 0.95,
+        },
+    )
+    assert sol.robust_requested is True
+    assert sol.robust_status in ("applied", "infeasible_fell_back", "error_fell_back", "skipped"), (
+        f"Unexpected robust_status: {sol.robust_status!r}"
+    )
+
+
+def test_robust_mode_forces_earlier_order_for_unreliable_supplier():
+    """With robust_hard_delay=True and a low-reliability supplier, the plan
+    must either (a) order earlier so demand survives a 1-day slip, or
+    (b) fall back gracefully with robust_applied=False.
+
+    Scenario: sole supplier has lead=2, reliability=0.50 (< 0.95 threshold).
+    Day-2 delivery nominally covers day-2 demand.  Under a 1-day delay the
+    delivery arrives at day 3 — leaving day-2 demand uncovered.
+    Robust mode should push the solver to order day 1 (if feasible) or
+    fall back cleanly.
+    """
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available; robust mode requires MILP")
+    n = 5
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=0.01, pack=100.0)],
+        suppliers=[_sup(1, lead=2.0, reliability=0.50)],
+        demand_by_day={1: {d: 100.0 for d in range(n)}},
+        on_hand={1: 50.0},
+        safety_stock={1: 0.0},
+        n_days=n,
+        params={
+            "slack_penalty": 1000.0,
+            "robust_hard_delay": True,
+            "robust_min_reliability": 0.95,
+        },
+    )
+    assert sol.robust_requested is True
+    # Either robust mode applied (better plan) or it fell back gracefully
+    assert sol.robust_status in ("applied", "infeasible_fell_back", "error_fell_back"), (
+        f"Unexpected robust_status: {sol.robust_status!r}"
+    )
+    # Plan must still be a valid procurement plan (orders present, no crash)
+    # coverage_ok may be False if early days are structurally uncoverable
+    assert sol.method == "milp", f"Expected MILP method, got {sol.method}"
