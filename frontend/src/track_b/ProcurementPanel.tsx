@@ -760,7 +760,7 @@ export function ProcurementPanel() {
 
           {/* TO CONFIRM axis — only shown when coverage depends on unplaced orders */}
           {planMeta.coverage_depends_on_planned_orders && (() => {
-            const pendingCount = planMeta.items.filter(
+            const pendingCount = planItems.filter(
               (it) => it.status === "planned" || it.status === "at_risk"
             ).length;
             return (
@@ -785,7 +785,7 @@ export function ProcurementPanel() {
               <span className="text-text/60">Survives a 1-day delivery delay</span>
             ) : (() => {
               // Find the item with the worst shortage_if_late for a concrete headline
-              const worst = planMeta.items
+              const worst = planItems
                 .filter((it) => (it.shortage_if_late ?? 0) > 0.5)
                 .sort((a, b) => (b.shortage_if_late ?? 0) - (a.shortage_if_late ?? 0))[0];
               const reliabilityNote = planMeta.reliability_premium > 0.005 && planMeta.exposed_value_protected > 0
