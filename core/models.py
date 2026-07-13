@@ -362,6 +362,10 @@ class PurchaseOrderLine(Base):
     unit = mapped_column(String)
     unit_price = mapped_column(Float)
     line_total = mapped_column(Float)
+    # Identity link to the PlannedOrder row that produced this line; NULL for
+    # manually-created POs.  Used by execute_due_planned_orders for identity-based
+    # netting so same-tick POs never cancel a legitimate top-up order.
+    planned_order_id = mapped_column(Integer, ForeignKey("planned_orders.id"), nullable=True)
 
     def __repr__(self):
         return (f"<PurchaseOrderLine id={self.id} po_id={self.po_id} "

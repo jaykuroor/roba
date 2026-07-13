@@ -124,6 +124,172 @@ class PlanSolution:
 
 
 # ---------------------------------------------------------------------------
+# FEFO coverage validator  (WS2 — authoritative post-solve coverage check)
+# ---------------------------------------------------------------------------
+
+def project_fefo_coverage(
+    *,
+    n_days: int,
+    demand_by_day: Dict[int, Dict[int, float]],
+    on_hand: Dict[int, float],
+    lots_by_ing: Dict[int, List[List[float]]],
+    open_po_arrivals_by_day: Dict[int, Dict[int, float]],
+    plan_arrivals_by_day: Dict[int, Dict[int, float]],
+    safety_stock: Dict[int, float],
+    ingredient_shelf_life: Optional[Dict[int, Optional[float]]] = None,
+) -> Dict[str, Any]:
+    """Day-by-day FEFO inventory simulation — the single source of truth for
+    coverage after all netting, R1 reconciliation, and hysteresis is done.
+
+    Parameters
+    ----------
+    n_days:                 planning horizon length.
+    demand_by_day:          {iid: {day: qty}} — forecast demand per ingredient per day.
+    on_hand:                {iid: float}      — current on-hand quantity.
+    lots_by_ing:            {iid: [[qty, exp_day_offset]]} — dated opening lots; exp_day_offset
+                            is the day number at which the lot expires (NOT available on that day:
+                            a lot with exp_day=3 is usable on days 0,1,2 only).
+                            Use [[on_hand, _INF_DAY]] when no lot data is available.
+    open_po_arrivals_by_day: {iid: {day: qty}} — already-placed PO arrivals, keyed by
+                            FEFO arrival day (deduped by PO id upstream).
+    plan_arrivals_by_day:   {iid: {day: qty}} — new planned-order arrivals that have NOT yet
+                            been converted to a real PO (i.e. non-superseded planned rows).
+    safety_stock:           {iid: float}      — soft buffer target (informational only here).
+    ingredient_shelf_life:  {iid: shelf_life_days or None} — for perishables arriving as new
+                            lots; None / absent means non-perishable (treated as infinite).
+
+    Returns
+    -------
+    Dict with keys:
+      coverage_ok          bool   — True iff every ingredient's demand is fully met every day.
+      total_short          float  — sum of all daily shortfalls across all ingredients.
+      short_by_ing         dict   — {iid: total_shortfall} for every short ingredient.
+      coverage_depends_on_planned bool — True when committed supply (on_hand + open POs alone)
+                                   cannot cover demand for at least one ingredient.
+      late_delivery_coverage_ok   bool — True when shifting all planned arrivals +1 day still
+                                   covers demand (conservative: open POs also shifted).
+    """
+    _sl = ingredient_shelf_life or {}
+
+    # ---- helpers ----
+
+    def _initial_lots(iid: int) -> List[List[float]]:
+        """Return a list of [qty, exp_day] pairs for the opening stock of iid."""
+        raw = lots_by_ing.get(iid)
+        if raw:
+            return [[float(q), float(e)] for q, e in raw]
+        return [[float(on_hand.get(iid, 0.0)), float(_INF_DAY)]]
+
+    def _simulate(
+        arrivals_by_day: Dict[int, Dict[int, float]],  # merged open-PO + plan arrivals
+        demand_map: Dict[int, Dict[int, float]],
+    ) -> tuple:
+        """Run the day-by-day FEFO sim.
+
+        Returns (total_short, short_by_ing).  Arrivals create new lots whose
+        expiry is derived from ingredient_shelf_life (non-perishable → _INF_DAY).
+        """
+        total_short = 0.0
+        short_by_ing: Dict[int, float] = {}
+
+        all_iids = set(demand_map.keys()) | set(arrivals_by_day.keys())
+        for iid in all_iids:
+            d_map = demand_map.get(iid) or {}
+            arr_map = arrivals_by_day.get(iid) or {}
+
+            if not any(v > 0 for v in d_map.values()):
+                continue  # no demand for this ingredient → skip
+
+            sl = _sl.get(iid)  # shelf life in days, or None
+
+            # Start with opening lots
+            lots: List[List[float]] = _initial_lots(iid)
+
+            ing_short = 0.0
+            for d in range(n_days):
+                # 1. Expire lots that cannot be used on day d (exp_day <= d)
+                lots = [[q, e] for q, e in lots if e > d]
+
+                # 2. Add arrivals landing on day d (new lots with computed expiry)
+                arr_qty = float(arr_map.get(d, 0.0))
+                if arr_qty > 0:
+                    if sl is not None and sl > 0:
+                        exp = d + int(math.ceil(sl))
+                    else:
+                        exp = _INF_DAY
+                    lots.append([arr_qty, float(exp)])
+
+                # 3. Consume demand FEFO (shortest-expiry first)
+                demand = float(d_map.get(d, 0.0))
+                if demand <= 0:
+                    continue
+                lots.sort(key=lambda x: x[1])  # sort by expiry (earliest first)
+                remaining = demand
+                consumed_lots: List[List[float]] = []
+                for lot in lots:
+                    q, e = lot
+                    if remaining <= 0:
+                        consumed_lots.append([q, e])
+                    elif q <= remaining:
+                        remaining -= q
+                        # lot fully consumed
+                    else:
+                        consumed_lots.append([q - remaining, e])
+                        remaining = 0.0
+                lots = consumed_lots
+
+                if remaining > 1e-6:
+                    ing_short += remaining
+
+            if ing_short > 1e-6:
+                short_by_ing[iid] = ing_short
+                total_short += ing_short
+
+        return total_short, short_by_ing
+
+    # ---- on-time simulation ----
+
+    def _merge(a: Dict[int, Dict[int, float]], b: Dict[int, Dict[int, float]]) -> Dict[int, Dict[int, float]]:
+        merged: Dict[int, Dict[int, float]] = {}
+        for iid in set(a) | set(b):
+            merged[iid] = {}
+            for d, q in (a.get(iid) or {}).items():
+                merged[iid][d] = merged[iid].get(d, 0.0) + q
+            for d, q in (b.get(iid) or {}).items():
+                merged[iid][d] = merged[iid].get(d, 0.0) + q
+        return merged
+
+    all_arrivals = _merge(open_po_arrivals_by_day, plan_arrivals_by_day)
+    total_short, short_by_ing = _simulate(all_arrivals, demand_by_day)
+
+    # ---- committed-only (without new planned orders) for coverage_depends_on_planned ----
+    committed_short, _ = _simulate(
+        {iid: dict(d_map) for iid, d_map in open_po_arrivals_by_day.items()},
+        demand_by_day,
+    )
+    coverage_depends_on_planned = committed_short > 1.0
+
+    # ---- +1-day delay simulation (shift ALL arrivals one day later) ----
+    def _shift_one_day(src: Dict[int, Dict[int, float]]) -> Dict[int, Dict[int, float]]:
+        shifted: Dict[int, Dict[int, float]] = {}
+        for iid, d_map in src.items():
+            shifted[iid] = {d + 1: q for d, q in d_map.items()}
+        return shifted
+
+    late_arrivals = _merge(_shift_one_day(open_po_arrivals_by_day), _shift_one_day(plan_arrivals_by_day))
+    late_short, _ = _simulate(late_arrivals, demand_by_day)
+    late_delivery_coverage_ok = late_short <= 1.0
+
+    return {
+        "coverage_ok": total_short <= 1.0,
+        "total_short": total_short,
+        "short_by_ing": short_by_ing,
+        "coverage_depends_on_planned": coverage_depends_on_planned,
+        "late_delivery_coverage_ok": late_delivery_coverage_ok,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public entry-point
 # ---------------------------------------------------------------------------
 

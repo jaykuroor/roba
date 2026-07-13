@@ -43,6 +43,7 @@ from track_b.agents.optimizer import InventoryOptimizer
 class _FakeProcurement:
     def __init__(self):
         self.calls = []
+        self.merge_calls = []
 
     def create_po(self, supplier_id, lines, created_by="optimizer", planned_delivery=None, delivery_charge=0.0, urgency=None):
         self.calls.append({
@@ -55,6 +56,12 @@ class _FakeProcurement:
         })
         # Return a SimpleNamespace mimicking a PurchaseOrder so callers don't crash.
         return SimpleNamespace(id=9999, status="placed")
+
+    def add_lines_to_po(self, po_id, lines, created_by="optimizer"):
+        """WS4: cross-sweep consolidation stub — always returns False in tests so
+        the caller falls back to create_po (no open PO exists in unit tests)."""
+        self.merge_calls.append({"po_id": po_id, "lines": lines})
+        return False
 
 
 def _seed_ingredient(session_factory, perishable=0, shelf_life_days=None, on_hand=0.0,

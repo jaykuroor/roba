@@ -174,6 +174,14 @@ RELIABILITY_ROBUST_MIN_RELIABILITY = float(
     os.getenv("RELIABILITY_ROBUST_MIN_RELIABILITY", "0.95")
 )
 
+# PROCUREMENT_JITTER_FRACTION: fraction of total horizon demand used as the
+# anti-jitter threshold for top-up orders.  When a re-plan would create a top-up
+# (existing pipeline already covers part of demand), the unrounded shortfall must
+# exceed (JITTER_FRACTION × total_demand) before the top-up is persisted.
+# 0.0 (default) disables the filter — every solver-determined top-up is kept.
+# Suggested range: 0.05–0.15 for moderate jitter suppression.
+PROCUREMENT_JITTER_FRACTION = float(os.getenv("PROCUREMENT_JITTER_FRACTION", "0.0"))
+
 # Vertex AI Live API (Stream B5)
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio")
 GEMINI_LIVE_CALL_MODEL = os.getenv("GEMINI_LIVE_CALL_MODEL", "gemini-live-2.5-flash-native-audio")

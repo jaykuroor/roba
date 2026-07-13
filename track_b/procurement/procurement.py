@@ -192,6 +192,7 @@ class Procurement:
                         unit=line.get("unit") or "each",
                         unit_price=float(line["unit_price"] or 0.0),
                         line_total=float(line["qty"]) * float(line["unit_price"] or 0.0),
+                        planned_order_id=line.get("planned_order_id"),
                     )
                 )
             session.commit()
@@ -310,6 +311,72 @@ class Procurement:
             f"PO #{po_id} placed with supplier {supplier_id}, ETA {expected_delivery:.0f} (total ${total:.2f}).",
             {"po_id": po_id, "supplier_id": supplier_id, "eta": expected_delivery},
         )
+
+    # -- cross-sweep consolidation (WS4) ------------------------------------
+
+    def add_lines_to_po(
+        self,
+        po_id: int,
+        lines: List[Dict[str, Any]],
+        created_by: str = "optimizer",
+    ) -> bool:
+        """Append new lines to an existing PO without adding a second delivery fee.
+
+        Used when ``execute_due_planned_orders`` finds an open PO for the same
+        (supplier_id, delivery_day) so all items going to the same supplier on
+        the same day share one consolidated delivery.
+
+        Re-computes ``total_cost`` as goods_subtotal (with discounts) plus the
+        original delivery charge already embedded in the PO.  Returns ``True``
+        when the lines were successfully appended, ``False`` on error or if the
+        PO no longer exists / is already delivered/cancelled.
+        """
+        session = self.db_session_factory()
+        try:
+            po = session.get(PurchaseOrder, po_id)
+            if po is None or po.status in ("delivered", "cancelled"):
+                return False
+            supplier_id = int(po.supplier_id)
+
+            # Derive the existing delivery charge from the current total_cost by
+            # subtracting the goods portion.  Re-add it unchanged so the delivery fee
+            # is only ever charged once regardless of how many sweeps add lines.
+            existing_lines = (
+                session.query(PurchaseOrderLine)
+                .filter(PurchaseOrderLine.po_id == po_id)
+                .all()
+            )
+            existing_goods = sum(float(l.line_total or 0.0) for l in existing_lines)
+            delivery_charge = float(po.total_cost or 0.0) - existing_goods
+
+            for line in lines:
+                session.add(
+                    PurchaseOrderLine(
+                        po_id=po_id,
+                        ingredient_id=line["ingredient_id"],
+                        qty=float(line["qty"]),
+                        unit=line.get("unit") or "each",
+                        unit_price=float(line["unit_price"] or 0.0),
+                        line_total=float(line["qty"]) * float(line["unit_price"] or 0.0),
+                        planned_order_id=line.get("planned_order_id"),
+                    )
+                )
+
+            # Recompute total cost: all goods (existing + new) with discounts + delivery.
+            all_lines = [
+                {"ingredient_id": l.ingredient_id, "qty": float(l.qty), "unit_price": float(l.unit_price or 0.0)}
+                for l in existing_lines
+            ] + lines
+            new_goods = self._discounted_goods_total(supplier_id, all_lines)
+            po.total_cost = new_goods + delivery_charge
+
+            session.commit()
+            return True
+        except Exception:  # noqa: BLE001
+            session.rollback()
+            return False
+        finally:
+            session.close()
 
     # -- delivery (§B4.4) -----------------------------------------------------
 

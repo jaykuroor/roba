@@ -822,6 +822,47 @@ class InventoryOptimizer(BaseAgent):
             logger.warning("build_procurement_plan: failed to emit INGREDIENT_UNCOVERABLE signals")
 
         # ----------------------------------------------------------------
+        # WS5: Anti-jitter filter for top-up orders.
+        #
+        # When PROCUREMENT_JITTER_FRACTION > 0 and there is existing pipeline
+        # for an ingredient (inbound_by_day sum > 0), suppress the top-up order
+        # if the unrounded shortfall is below JITTER_FRACTION × total_demand.
+        # This prevents forecast noise from triggering churn on orders that are
+        # already substantially covered.
+        #
+        # First-time orders (zero existing pipeline) are NEVER suppressed.
+        # Default JITTER_FRACTION = 0.0 — disabled unless explicitly configured.
+        # ----------------------------------------------------------------
+        _jitter_frac = float(getattr(config, "PROCUREMENT_JITTER_FRACTION", 0.0))
+        if _jitter_frac > 0 and new_orders:
+            _filtered_orders: List[Dict] = []
+            for _jod in new_orders:
+                _jiid = int(_jod["ingredient_id"])
+                _existing_pipeline = sum(inbound_by_day.get(_jiid, {}).values())
+                if _existing_pipeline > 0:
+                    # Top-up path: check anti-jitter threshold.
+                    _total_demand_j = sum(
+                        per_day_demand.get(_jiid, {}).get(d, 0.0) for d in range(n_days)
+                    )
+                    _on_hand_j = (ingredients_data.get(_jiid) or {}).get("on_hand", 0.0)
+                    _unrounded_short = max(0.0, _total_demand_j - _on_hand_j - _existing_pipeline)
+                    _jitter_threshold = _jitter_frac * max(1.0, _total_demand_j)
+                    if _unrounded_short < _jitter_threshold:
+                        logger.debug(
+                            "build_procurement_plan: anti-jitter suppressing top-up for "
+                            "ingredient %s (unrounded shortfall %.1f < threshold %.1f).",
+                            _jiid, _unrounded_short, _jitter_threshold,
+                        )
+                        continue  # skip this top-up — within jitter tolerance
+                _filtered_orders.append(_jod)
+            if len(_filtered_orders) < len(new_orders):
+                logger.info(
+                    "build_procurement_plan: anti-jitter suppressed %d top-up order(s).",
+                    len(new_orders) - len(_filtered_orders),
+                )
+            new_orders = _filtered_orders
+
+        # ----------------------------------------------------------------
         # Phase 3: Hysteresis + persist
         # ----------------------------------------------------------------
         session = self.db_session_factory()
@@ -995,99 +1036,87 @@ class InventoryOptimizer(BaseAgent):
             n_superseded = len(superseded_ids)
             total_active = n_new + n_kept
 
-            # Fix 2: Recompute coverage against the RECONCILED plan (after R1 /
-            # hysteresis / pack-rounding).  The raw solver result (plan_coverage_ok /
-            # plan_total_short) reflects what the solver *intended* before these
-            # post-processing steps and may claim full coverage even when a plan row
-            # was suppressed by R1.  We replace it with an honest per-ingredient check
-            # so that the stored ProcurementPlanRun.coverage_ok / .total_short match
-            # what the UI actually shows.
-            #
-            # Available supply per ingredient over the horizon:
-            #   on_hand  (from ingredients_data)
-            # + inbound_by_day arrivals (already-placed POs credited into the solver)
-            # + persisted plan-row totals (final_new_orders + kept rows at their qty)
-            _reconciled_total_short = 0.0
+            # WS2/WS3: Authoritative FEFO coverage check — replaces the aggregate
+            # horizon-sum recompute with a day-by-day FEFO inventory simulation that
+            # is independent of the solver's netting.  Inputs are deduped by identity:
+            #   • open_po_arrivals = inbound_by_day (keyed by PO, already deduped)
+            #   • plan_arrivals    = final_new_orders + kept rows (post-R1, post-hysteresis)
+            # This correctly catches coverage gaps that the solver introduced or missed
+            # during reconciliation (the mascarpone double-net → false coverage_ok=True).
+            _reconciled_total_short = plan_total_short  # fallback
+            _reconciled_coverage_ok = plan_coverage_ok
+            _coverage_depends_on_planned = False
+            _late_delivery_coverage_ok = (
+                float(getattr(_solution, "unit_shortfall_if_1day_late", 0.0) or 0.0) <= 1.0
+            )
             try:
-                # Qty the final persisted plan adds per ingredient.
-                _plan_qty_by_ing: Dict[int, float] = {}
-                for _rod in final_new_orders:
-                    _rid = int(_rod["ingredient_id"])
-                    _plan_qty_by_ing[_rid] = (
-                        _plan_qty_by_ing.get(_rid, 0.0) + float(_rod.get("qty") or 0.0)
+                from track_b.procurement.plan_optimizer import (  # noqa: PLC0415
+                    project_fefo_coverage as _fefo_check,
+                )
+
+                # Build plan_arrivals_by_day from final persisted orders.
+                _plan_arr_by_day: Dict[int, Dict[int, float]] = {}
+                for _pao in final_new_orders:
+                    _pa_iid = int(_pao["ingredient_id"])
+                    _pa_dd = int(float(_pao.get("delivery_date") or 0.0) // SECONDS_PER_DAY) - now_day
+                    _pa_dd = max(_pa_dd, 0)
+                    _plan_arr_by_day.setdefault(_pa_iid, {})
+                    _plan_arr_by_day[_pa_iid][_pa_dd] = (
+                        _plan_arr_by_day[_pa_iid].get(_pa_dd, 0.0)
+                        + float(_pao.get("qty") or 0.0)
                     )
                 for _kr_id in kept_ids:
                     _kr = session.get(PlannedOrder, _kr_id)
                     if _kr is not None:
-                        _plan_qty_by_ing[_kr.ingredient_id] = (
-                            _plan_qty_by_ing.get(_kr.ingredient_id, 0.0)
+                        _kr_iid = int(_kr.ingredient_id)
+                        _kr_dd = int(float(_kr.delivery_date or 0.0) // SECONDS_PER_DAY) - now_day
+                        _kr_dd = max(_kr_dd, 0)
+                        _plan_arr_by_day.setdefault(_kr_iid, {})
+                        _plan_arr_by_day[_kr_iid][_kr_dd] = (
+                            _plan_arr_by_day[_kr_iid].get(_kr_dd, 0.0)
                             + float(_kr.qty or 0.0)
                         )
 
-                for _chk_iid, _chk_data in ingredients_data.items():
-                    _total_demand = sum(
-                        per_day_demand.get(_chk_iid, {}).get(d, 0.0) for d in range(n_days)
-                    )
-                    if _total_demand <= 0:
-                        continue
-                    _available = (
-                        _chk_data["on_hand"]
-                        + sum(inbound_by_day.get(_chk_iid, {}).values())
-                        + _plan_qty_by_ing.get(_chk_iid, 0.0)
-                    )
-                    _short = max(0.0, _total_demand - _available)
-                    if _short > 0:
+                # Ingredient shelf life map for arrival-lot expiry calculation.
+                _fefo_sl: Dict[int, Optional[float]] = {
+                    iid: data.get("shelf_life")
+                    for iid, data in ingredients_data.items()
+                }
+
+                _fefo_result = _fefo_check(
+                    n_days=n_days,
+                    demand_by_day=per_day_demand,
+                    on_hand={iid: d["on_hand"] for iid, d in ingredients_data.items()},
+                    lots_by_ing={iid: d["lots"] for iid, d in ingredients_data.items()},
+                    open_po_arrivals_by_day=inbound_by_day,
+                    plan_arrivals_by_day=_plan_arr_by_day,
+                    safety_stock={iid: d["safety_stock"] for iid, d in ingredients_data.items()},
+                    ingredient_shelf_life=_fefo_sl,
+                )
+                _reconciled_total_short = float(_fefo_result["total_short"])
+                _reconciled_coverage_ok = bool(_fefo_result["coverage_ok"])
+                _coverage_depends_on_planned = bool(_fefo_result["coverage_depends_on_planned"])
+                _late_delivery_coverage_ok = bool(_fefo_result["late_delivery_coverage_ok"])
+
+                if not _reconciled_coverage_ok:
+                    _short_ings = _fefo_result.get("short_by_ing") or {}
+                    for _si_iid, _si_qty in _short_ings.items():
                         logger.warning(
-                            "Reconciled coverage gap: ingredient %s still %.1f units short "
-                            "after R1/hysteresis (demand %.1f, available %.1f).",
-                            _chk_iid, _short, _total_demand, _available,
+                            "FEFO coverage gap: ingredient %s is %.1f units short after "
+                            "full reconciliation (on_hand + inbound + plan).",
+                            _si_iid, _si_qty,
                         )
-                    _reconciled_total_short += _short
+                    if plan_coverage_ok:
+                        logger.warning(
+                            "Coverage gap INTRODUCED by post-solver reconciliation: "
+                            "%.1f units uncoverable after R1/hysteresis (solver claimed full coverage).",
+                            _reconciled_total_short,
+                        )
             except Exception:  # noqa: BLE001
-                # Fall back to raw solver value if recompute fails.
-                _reconciled_total_short = plan_total_short
                 logger.warning(
-                    "build_procurement_plan: reconciled coverage recompute failed; "
+                    "build_procurement_plan: FEFO coverage check failed; "
                     "falling back to solver total_short=%.1f.", plan_total_short,
                 )
-            _reconciled_coverage_ok = _reconciled_total_short <= 1.0
-            if not _reconciled_coverage_ok and plan_coverage_ok:
-                logger.warning(
-                    "Coverage gap INTRODUCED by post-solver reconciliation: "
-                    "%.1f units uncoverable after R1/hysteresis (solver claimed full coverage).",
-                    _reconciled_total_short,
-                )
-
-            # Coverage-semantics flags:
-            # coverage_depends_on_planned: True when committed supply (on_hand + inbound POs)
-            #   alone cannot cover demand — the plan leans on not-yet-placed orders.
-            # late_delivery_coverage_ok: True when all deliveries slipping +1 day still
-            #   covers demand (derived from the MILP's unit-shortfall projection).
-            _coverage_depends_on_planned = False
-            try:
-                for _chk_iid, _chk_data in ingredients_data.items():
-                    _total_demand_c = sum(
-                        per_day_demand.get(_chk_iid, {}).get(d, 0.0) for d in range(n_days)
-                    )
-                    if _total_demand_c <= 0:
-                        continue
-                    _committed = (
-                        _chk_data["on_hand"]
-                        + sum(inbound_by_day.get(_chk_iid, {}).values())
-                    )
-                    _with_plan = _committed + _plan_qty_by_ing.get(_chk_iid, 0.0)
-                    if _total_demand_c > _committed and _total_demand_c <= _with_plan:
-                        _coverage_depends_on_planned = True
-                        break
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "build_procurement_plan: coverage_depends_on_planned_orders recompute failed."
-                )
-
-            _unit_shortfall_late = float(
-                getattr(_solution, "unit_shortfall_if_1day_late", 0.0) or 0.0
-            )
-            _late_delivery_coverage_ok = _unit_shortfall_late <= 1.0
 
             run = ProcurementPlanRun(
                 created_at=now,
@@ -1206,44 +1235,78 @@ class InventoryOptimizer(BaseAgent):
         # marked 'superseded' so they never linger as zombie at_risk duplicates.
         resolved_ids: List[int] = []
         for (supplier_id, _delivery_day), group in groups.items():
-            # A5: For each ingredient, compute in-flight qty and only place the shortfall.
+            # WS1/WS4/WS5: Identity-based netting + cross-sweep consolidation.
+            #
+            # NETTING RULE (replaces created_at >= plan_built_at):
+            #   1. If PurchaseOrderLine.planned_order_id == this planned order's id,
+            #      a PO line already exists for this exact row → resolved (FK check).
+            #   2. Otherwise, only net POs created STRICTLY AFTER the plan was built
+            #      (created_at > plan_built_at, not >=).  Same-tick POs were already
+            #      credited by inbound_by_day in the MILP and must NOT be double-netted.
+            #
+            # CONSOLIDATION (WS4): before creating a new PO, look for an existing open
+            # PO for the same (supplier_id, delivery_day).  If found, append lines to it
+            # (no second delivery charge).  If not found, create a new PO with one fee.
             lines = []
             placed_ids = []
             for po_data in group:
                 ing_id = po_data["ingredient_id"]
-                # A: Net once, correctly.  The plan already credited open POs that
-                # existed at plan-build time via inbound_by_day (MILP arrivals).
-                # Only subtract POs created AFTER the plan ran — those are genuinely
-                # new pipeline the plan hadn't accounted for.
-                # If plan_run_id/created_at is unknown, assume plan credited nothing
-                # (order full qty) to avoid re-introducing the double subtraction.
+                planned_order_id = int(po_data["id"])
+
+                # --- FK identity check (bulletproof, same-tick safe) ---
+                session2 = self.db_session_factory()
+                try:
+                    _already_linked = (
+                        session2.query(PurchaseOrderLine)
+                        .filter(PurchaseOrderLine.planned_order_id == planned_order_id)
+                        .first()
+                    )
+                finally:
+                    session2.close()
+
+                if _already_linked is not None:
+                    # A PO line already exists for this planned order — no duplicate.
+                    resolved_ids.append(planned_order_id)
+                    logger.debug(
+                        "execute_due_planned_orders: planned row %s already has a PO line "
+                        "(po_id=%s) — resolving without new order.",
+                        planned_order_id, _already_linked.po_id,
+                    )
+                    continue
+
+                # --- Timestamp net for POs placed strictly AFTER the plan ran ---
                 _run_id = po_data.get("plan_run_id")
                 _plan_built_at = _run_created_at.get(_run_id) if _run_id else None
 
-                session2 = self.db_session_factory()
+                session2b = self.db_session_factory()
                 try:
                     _inbound_q = (
-                        session2.query(_sa_func.sum(PurchaseOrderLine.qty))
+                        session2b.query(_sa_func.sum(PurchaseOrderLine.qty))
                         .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
                         .filter(
                             PurchaseOrderLine.ingredient_id == ing_id,
                             PurchaseOrder.status.in_(("proposed", "approved", "placed")),
+                            # Null planned_order_id only — lines linked to a planned order
+                            # are accounted via the FK check above.
+                            PurchaseOrderLine.planned_order_id.is_(None),
                         )
                     )
                     if _plan_built_at is not None:
-                        # Only count POs placed AFTER the plan was built.
+                        # Strict >: same-tick POs were already credited by inbound_by_day
+                        # in the MILP; re-netting them here was the primary cause of the
+                        # mascarpone drop (planned top-up order suppressed when plan-build
+                        # and PO creation share a sim tick).
                         _inbound_q = _inbound_q.filter(
-                            PurchaseOrder.created_at >= _plan_built_at
+                            PurchaseOrder.created_at > _plan_built_at
                         )
                     inbound_qty_row = _inbound_q.scalar()
                 finally:
-                    session2.close()
+                    session2b.close()
                 inbound_qty = float(inbound_qty_row or 0.0)
                 shortfall = float(po_data["qty"] or 0.0) - inbound_qty
                 if shortfall <= 0:
-                    # Already covered by an in-flight PO — resolve this planned row
-                    # instead of leaving it dangling (was: silent `continue` → zombie).
-                    resolved_ids.append(po_data["id"])
+                    # Covered by a truly-new post-plan PO (not from this planned row).
+                    resolved_ids.append(planned_order_id)
                     continue
 
                 # Fall back to catalog for unit / price if the PlannedOrder row lacks them.
@@ -1273,11 +1336,12 @@ class InventoryOptimizer(BaseAgent):
 
                 lines.append({
                     "ingredient_id": ing_id,
-                    "qty": shortfall,  # A5: only order the net shortfall
+                    "qty": shortfall,
                     "unit": unit,
                     "unit_price": float(unit_price),
+                    "planned_order_id": planned_order_id,  # WS1: identity link
                 })
-                placed_ids.append(po_data["id"])
+                placed_ids.append(planned_order_id)
 
             if not lines:
                 continue
@@ -1303,6 +1367,67 @@ class InventoryOptimizer(BaseAgent):
                 _group_urgency = "at_risk"
             else:
                 _group_urgency = None
+
+            # WS4: Cross-sweep consolidation — if an open PO already exists for this
+            # (supplier, delivery_day), merge into it rather than creating a new PO
+            # (which would add a second delivery charge for the same arrival slot).
+            _existing_po_id: Optional[int] = None
+            try:
+                _s_lookup = self.db_session_factory()
+                try:
+                    _existing_po = (
+                        _s_lookup.query(PurchaseOrder)
+                        .filter(
+                            PurchaseOrder.supplier_id == supplier_id,
+                            PurchaseOrder.status.in_(("proposed", "approved", "placed")),
+                            PurchaseOrder.expected_delivery.isnot(None),
+                        )
+                        .all()
+                    )
+                    for _ep in _existing_po:
+                        _ep_day = int(float(_ep.expected_delivery or 0.0) // SECONDS_PER_DAY)
+                        if _ep_day == _delivery_day:
+                            _existing_po_id = int(_ep.id)
+                            break
+                finally:
+                    _s_lookup.close()
+            except Exception:  # noqa: BLE001
+                logger.warning("execute_due_planned_orders: consolidation lookup failed; will create new PO.")
+
+            if _existing_po_id is not None:
+                # Merge into existing PO — no second delivery charge.
+                logger.info(
+                    "execute_due_planned_orders: consolidating %d line(s) into existing PO #%s "
+                    "(supplier %s, delivery_day %s) — no additional delivery fee.",
+                    len(lines), _existing_po_id, supplier_id, _delivery_day,
+                )
+                merged_ok = self.procurement.add_lines_to_po(
+                    po_id=_existing_po_id,
+                    lines=lines,
+                    created_by=self.name,
+                )
+                if not merged_ok:
+                    logger.warning(
+                        "execute_due_planned_orders: merge into PO #%s failed; falling back to new PO.",
+                        _existing_po_id,
+                    )
+                    _existing_po_id = None  # fall through to create_po below
+
+                if merged_ok:
+                    # Mark source planned rows as placed (merged into existing PO).
+                    for row_id in placed_ids:
+                        _s_mark = self.db_session_factory()
+                        try:
+                            _row = _s_mark.get(PlannedOrder, row_id)
+                            if _row:
+                                _row.status = "placed"
+                                _s_mark.commit()
+                        except Exception:  # noqa: BLE001
+                            _s_mark.rollback()
+                        finally:
+                            _s_mark.close()
+                    count += 1
+                    continue  # don't fall through to create_po
 
             try:
                 created_po = self.procurement.create_po(

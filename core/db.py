@@ -137,6 +137,8 @@ def _ensure_columns() -> None:
         # Granular coverage flags on plan runs (plan-review fix: honest coverage)
         ("procurement_plan_runs", "coverage_depends_on_planned_orders", "INTEGER DEFAULT 0"),
         ("procurement_plan_runs", "late_delivery_coverage_ok",          "INTEGER DEFAULT 1"),
+        # Identity link: PO line → source PlannedOrder (identity-based netting, anti-double-net fix)
+        ("purchase_order_lines", "planned_order_id", "INTEGER REFERENCES planned_orders(id)"),
     ]
     conn = engine.raw_connection()
     try:
