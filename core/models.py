@@ -1109,8 +1109,8 @@ class SupplierTerm(Base):
     id = _pk()
     supplier_id = mapped_column(Integer, ForeignKey("suppliers.id"))
     ingredient_id = mapped_column(Integer, ForeignKey("ingredients.id"), nullable=True)
-    term_type = mapped_column(String)            # price_override | discount
-    value = mapped_column(Float)                 # per-gram price or fraction
+    term_type = mapped_column(String)            # price_override | discount | threshold_discount | free_goods | unavailable | lead_time_override
+    value = mapped_column(Float)                 # per-gram price or fraction; 0.0 for free_goods
     unit_basis = mapped_column(String, nullable=True)  # unit the caller quoted, e.g. per_kg
     scope = mapped_column(String, default="ingredient")  # ingredient | all
     effective_at = mapped_column(Float)
@@ -1122,6 +1122,10 @@ class SupplierTerm(Base):
     verbatim_quote = mapped_column(Text, nullable=True)   # caller's exact words
     manager_change_id = mapped_column(Integer, nullable=True)  # linked ManagerChange.id
     created_at = mapped_column(Float)
+    # Threshold and free-goods fields (added with call-offer full-modeling)
+    min_order_value = mapped_column(Float, nullable=True)          # €-gate for threshold_discount / free_goods
+    free_ingredient_id = mapped_column(Integer, ForeignKey("ingredients.id"), nullable=True)  # free_goods: ingredient given free
+    free_qty_g = mapped_column(Float, nullable=True)               # free_goods: quantity in grams
 
     def __repr__(self):
         return (
@@ -1179,7 +1183,7 @@ class AppSettings(Base):
     __tablename__ = "app_settings"
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
-    auto_apply_supplier_changes = mapped_column(Integer, default=0)  # bool 0/1
+    auto_apply_supplier_changes = mapped_column(Integer, default=1)  # bool 0/1; default on
     sourcing_switching_cost = mapped_column(Float, default=5.0)
     sourcing_horizon_days = mapped_column(Float, default=7.0)
     # Restaurant identity (seeded from preset meta; nullable so upgrades are safe)

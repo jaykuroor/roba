@@ -139,6 +139,10 @@ def _ensure_columns() -> None:
         ("procurement_plan_runs", "late_delivery_coverage_ok",          "INTEGER DEFAULT 1"),
         # Identity link: PO line → source PlannedOrder (identity-based netting, anti-double-net fix)
         ("purchase_order_lines", "planned_order_id", "INTEGER REFERENCES planned_orders(id)"),
+        # Threshold-discount / free-goods offer fields (added with call-offer full-modeling)
+        ("supplier_terms", "min_order_value",    "REAL"),
+        ("supplier_terms", "free_ingredient_id", "INTEGER REFERENCES ingredients(id)"),
+        ("supplier_terms", "free_qty_g",         "REAL"),
     ]
     conn = engine.raw_connection()
     try:

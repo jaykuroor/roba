@@ -617,7 +617,7 @@ class Seeder:
             if app_settings is None:
                 app_settings = AppSettings(
                     id=1,
-                    auto_apply_supplier_changes=0,
+                    auto_apply_supplier_changes=1,
                     sourcing_switching_cost=5.0,
                     sourcing_horizon_days=7.0,
                     restaurant_title=meta.get("title") or meta.get("name"),

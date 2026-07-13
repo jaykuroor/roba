@@ -2346,7 +2346,7 @@ class AutoApplyBody(BaseModel):
 def get_auto_apply(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
     """Return the current auto-apply-supplier-changes setting."""
     settings = db_session.get(models.AppSettings, 1)
-    enabled = bool(settings.auto_apply_supplier_changes) if settings else False
+    enabled = bool(settings.auto_apply_supplier_changes) if settings else True
     return {"auto_apply": enabled}
 
 
