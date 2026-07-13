@@ -4,6 +4,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../../api";
 import type { EntityRow } from "../../types";
 import { SectionHeading } from "./shared";
+import { CopyStateButton } from "./CopyState";
 
 const ENTITY_RESOURCES = [
   "menu", "recipes", "recipe-lines", "staff", "suppliers", "supplier-catalog",
@@ -89,6 +90,15 @@ export function AdvancedEntities() {
 
   return (
     <div className="space-y-4">
+      <div className="space-y-2">
+        <SectionHeading>Copy State</SectionHeading>
+        <p className="text-[10px] text-text/40">
+          Copies the current weekly forecast, inventory with expiry, and the procurement plan &amp; orders
+          to the clipboard as a formatted text report.
+        </p>
+        <CopyStateButton />
+      </div>
+
       <div className="flex items-center gap-3">
         <SectionHeading>Raw Entity Editor</SectionHeading>
         <select
