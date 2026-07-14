@@ -638,7 +638,23 @@ class InventoryOptimizer(BaseAgent):
                 }
                 for s in _all_sup_rows
             ]
-            _lead_by_sup = {int(s.id): float(s.lead_time_days or 1.0) for s in _all_sup_rows}
+            # Apply active SupplierTerms (discounts, price overrides, threshold discounts,
+            # free goods, unavailability, lead-time overrides) to the raw catalog and
+            # supplier lists.  This is the same logic used by run_sourcing_plan so both
+            # planners see the same term-adjusted prices.  threshold_discount terms are
+            # appended as volume_discount tiers; free_goods are returned separately for
+            # the MILP objective.
+            from track_b.procurement.terms import apply_supplier_terms as _apply_st  # noqa: PLC0415
+            _terms_session = self.db_session_factory()
+            try:
+                _applied = _apply_st(_terms_session, milp_catalog, milp_suppliers, now)
+            finally:
+                _terms_session.close()
+            milp_catalog = _applied.catalog
+            milp_suppliers = _applied.suppliers
+            _milp_free_goods = _applied.free_goods_offers
+
+            _lead_by_sup = {s["id"]: float(s.get("lead_time_days") or 1.0) for s in milp_suppliers}
             _delivery_hour_by_sup = {
                 int(s.id): float(getattr(s, "delivery_hour", None) or 8.0)
                 for s in _all_sup_rows
@@ -746,6 +762,7 @@ class InventoryOptimizer(BaseAgent):
                         robust if robust is not None else config.RELIABILITY_ROBUST_HARD_DELAY
                     ),
                     "robust_min_reliability": config.RELIABILITY_ROBUST_MIN_RELIABILITY,
+                    "free_goods_offers": _milp_free_goods,
                 },
             )
             plan_method = _solution.method
@@ -2847,10 +2864,40 @@ class InventoryOptimizer(BaseAgent):
                     "min_order_value": float(s.min_order_value or 0.0),
                     "lead_time_days": _effective_lead_days(int(s.id), float(s.lead_time_days or 1.0)),
                     "reliability_score": float(s.reliability_score or 1.0),
-                    "volume_discount": getattr(s, "volume_discount", None),
+                    "volume_discount": list(getattr(s, "volume_discount", None) or []),
                 }
                 for s in supplier_rows
             ]
+
+            # Overlay active threshold_discount terms as extra volume_discount tiers,
+            # and collect free_goods offers for the solver (mirrors build_procurement_plan).
+            _sourcing_free_goods: list = []
+            for _sup_dict in suppliers:
+                _s_id = int(_sup_dict["id"])
+                _all_scope_terms = _term_map.get((_s_id, None), [])
+                for _t in _all_scope_terms:
+                    if _t.term_type == "threshold_discount":
+                        _disc_pct = round(float(_t.value) * 100.0, 4)
+                        _mov = float(_t.min_order_value or 0.0)
+                        if _disc_pct > 0 and _mov > 0:
+                            _sup_dict["volume_discount"].append({"min_value": _mov, "discount_pct": _disc_pct})
+                    elif _t.term_type == "free_goods":
+                        if _t.free_ingredient_id and _t.free_qty_g:
+                            try:
+                                from track_b.procurement.terms import FreeGoodsOffer as _FGO  # noqa: PLC0415
+                            except ImportError:
+                                from procurement.terms import FreeGoodsOffer as _FGO  # type: ignore[no-redef]
+                            _sourcing_free_goods.append(_FGO(
+                                supplier_id=_s_id,
+                                free_ingredient_id=int(_t.free_ingredient_id),
+                                free_qty_g=float(_t.free_qty_g),
+                                min_order_value=float(_t.min_order_value or 0.0),
+                                remaining_orders=_t.remaining_orders,
+                                term_id=int(_t.id),
+                            ))
+                # Normalise: keep None when list is empty (solver expects None or list)
+                if not _sup_dict["volume_discount"]:
+                    _sup_dict["volume_discount"] = None
 
             # Pull reliability scores from memory
             mem_rows = (

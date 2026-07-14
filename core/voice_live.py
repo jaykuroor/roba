@@ -131,9 +131,10 @@ async def _safe_send_json(websocket: Any, payload: Dict[str, Any]) -> bool:
 @dataclass
 class _BridgeState:
     """Mutable state shared between the two relay tasks and the reconnect loop."""
-    handle: Optional[str] = field(default=None)  # latest session-resumption handle from Gemini
-    client_gone: bool = field(default=False)       # browser WS closed → stop looping
-    resume_wanted: bool = field(default=False)     # upstream session ended → reconnect
+    handle: Optional[str] = field(default=None)   # latest session-resumption handle from Gemini
+    client_gone: bool = field(default=False)        # browser WS closed → stop looping
+    resume_wanted: bool = field(default=False)      # upstream session ended → reconnect
+    opener_sent: bool = field(default=False)        # greeting already injected → skip on reconnect
 
 
 class _GoAway(Exception):
@@ -635,8 +636,8 @@ _RECORD_SUPPLIER_UPDATE_DECL: dict = {
                 "properties": {
                     "update_type": {
                         "type": "string",
-                        "enum": ["price_change", "discount", "availability", "lead_time", "other"],
-                        "description": "The type of update.",
+                        "enum": ["price_change", "discount", "threshold_discount", "free_goods", "availability", "lead_time", "other"],
+                        "description": "The type of update. Use 'threshold_discount' for a percentage discount that applies only when the order value exceeds a threshold (e.g. '20% off orders over €100'). Use 'free_goods' for a free item given with qualifying orders (e.g. 'free 1kg tomato on orders over €100').",
                     },
                     "scope": {
                         "type": "string",
@@ -672,6 +673,22 @@ _RECORD_SUPPLIER_UPDATE_DECL: dict = {
                     "n": {
                         "type": "integer",
                         "description": "Number of orders (required when expiry='for_n_orders').",
+                    },
+                    "min_order_value": {
+                        "type": "number",
+                        "description": "The minimum order value (in €) required for the offer to apply. Use for 'threshold_discount' and 'free_goods' offer types (e.g. 100 for 'orders over €100'). Omit when not conditional on order value.",
+                    },
+                    "free_ingredient_name": {
+                        "type": "string",
+                        "description": "The ingredient given for free (for update_type='free_goods'). E.g. 'tomato'. Required for free_goods offers.",
+                    },
+                    "free_qty": {
+                        "type": "number",
+                        "description": "The quantity of the free ingredient given (for update_type='free_goods'). Exactly as stated, e.g. 1 for '1kg'.",
+                    },
+                    "free_unit": {
+                        "type": "string",
+                        "description": "The unit of the free quantity (for update_type='free_goods'). E.g. 'kg', 'g', 'litre'. Required for free_goods offers.",
                     },
                     "verbatim_quote": {
                         "type": "string",
@@ -1232,25 +1249,65 @@ async def live_bridge(
         fail_streak = 0
 
         # For call-bound sessions, register the hint queue and inject an opener.
+        # IMPORTANT: the opener greeting is only injected on the very first connect.
+        # On reconnects (bridge.opener_sent is True) we inject a silent context-restore
+        # instead so the model picks up mid-conversation without re-greeting.
         if call_id is not None:
             hint_queue = register_call_session(call_id)
             try:
                 _inbound_roles = ("inbound_supplier_call", "inbound_competitor_call")
-                if role in _inbound_roles:
-                    _opener_text = (
-                        "(The phone is ringing -- you are the restaurant manager and a caller is coming through. "
-                        "Answer with a brief professional greeting identifying your restaurant, then wait for the caller to explain why they rang.)"
+                if not bridge.opener_sent:
+                    # First connect — greet and start the call.
+                    if role in _inbound_roles:
+                        _opener_text = (
+                            "(The phone is ringing -- you are the restaurant manager and a caller is coming through. "
+                            "Answer with a brief professional greeting identifying your restaurant, then wait for the caller to explain why they rang.)"
+                        )
+                    else:
+                        _opener_text = (
+                            "(Begin the call now. You called them -- speak first with a professional greeting and state your purpose.)"
+                        )
+                    await session.send_client_content(
+                        turns={"parts": [{"text": _opener_text}]},
+                        turn_complete=True,
                     )
-                else:
-                    _opener_text = (
-                        "(Begin the call now. You called them -- speak first with a professional greeting and state your purpose.)"
+                    bridge.opener_sent = True
+                elif bridge.handle is None:
+                    # Reconnected without a session-resumption handle — Gemini gave us a
+                    # brand-new context window. Re-prime the model from the mirrored
+                    # transcript so it remembers the conversation so far and does NOT
+                    # re-greet or repeat itself.
+                    _ctx_parts: list[str] = []
+                    if calls is not None:
+                        try:
+                            _loaded = await asyncio.to_thread(calls._load, call_id)
+                            if _loaded is not None:
+                                for _turn in (_loaded.transcript or []):
+                                    _r = _turn.get("role", "unknown")
+                                    _t = _turn.get("text", "")
+                                    if _t:
+                                        _ctx_parts.append(f"{_r}: {_t}")
+                        except Exception as _ctx_exc:  # noqa: BLE001
+                            logger.warning("context-restore transcript load failed: %s", _ctx_exc)
+                    if _ctx_parts:
+                        _restore_text = (
+                            "(Session resumed. The call so far — do NOT re-greet or repeat yourself; "
+                            "just continue naturally from where you left off:\n"
+                            + "\n".join(_ctx_parts)
+                            + "\n)"
+                        )
+                    else:
+                        _restore_text = (
+                            "(Session resumed mid-call. Continue naturally without re-greeting.)"
+                        )
+                    await session.send_client_content(
+                        turns={"parts": [{"text": _restore_text}]},
+                        turn_complete=False,
                     )
-                await session.send_client_content(
-                    turns={"parts": [{"text": _opener_text}]},
-                    turn_complete=True,
-                )
+                # If bridge.handle is set, Gemini's session-resumption already preserved
+                # the full context — no injection needed.
             except Exception as _oe:  # noqa: BLE001
-                logger.warning("call opener inject failed: %s", _oe)
+                logger.warning("call opener/context-restore inject failed: %s", _oe)
         else:
             hint_queue = None
 
@@ -1886,6 +1943,10 @@ async def _execute_tool(
                 date_text=str(args.get("date_text") or ""),
                 n=args.get("n"),
                 verbatim_quote=str(args.get("verbatim_quote") or ""),
+                min_order_value=args.get("min_order_value"),
+                free_ingredient_name=str(args.get("free_ingredient_name") or ""),
+                free_qty=args.get("free_qty"),
+                free_unit=str(args.get("free_unit") or ""),
             )
 
 

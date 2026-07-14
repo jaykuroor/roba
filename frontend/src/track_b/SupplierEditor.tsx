@@ -20,13 +20,10 @@ import {
   Phone,
   PhoneCall,
   Plus,
-  Radio,
   X,
 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 import { wsClient } from "../ws";
-import { useActiveCall } from "../store";
-import { SpectateOverlay } from "../shell/SpectateOverlay";
 import type { SignalEnvelope } from "../types";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -515,8 +512,6 @@ function SuppliersSection({
 
 export function SupplierEditor() {
   const [overview, setOverview] = useState<OverviewData | null>(null);
-  const [spectating, setSpectating] = useState(false);
-  const activeCall = useActiveCall();
 
   function reload() {
     apiGet<OverviewData>("/api/track-b/suppliers/overview")
@@ -542,19 +537,11 @@ export function SupplierEditor() {
     };
   }, []);
 
-  // Clear spectate overlay when call ends.
-  useEffect(() => {
-    if (!activeCall) setSpectating(false);
-  }, [activeCall]);
-
   const totalCurrent = overview?.current.length ?? 0;
   const totalAlternate = overview?.alternate.length ?? 0;
 
-  // Only show live-call banner for supplier calls.
-  const liveSupplierCall =
-    activeCall?.status === "active" && activeCall.counterparty_type === "supplier"
-      ? activeCall
-      : null;
+  // Live-call indicator and spectate overlay are rendered by DashboardView
+  // (the parent tab container) — no duplicate banner needed here.
 
   return (
     <div
@@ -562,25 +549,6 @@ export function SupplierEditor() {
       data-panel="Suppliers"
       className="flex h-full flex-col gap-4 overflow-auto rounded-lg bg-surface/40 p-4"
     >
-      {spectating && <SpectateOverlay onClose={() => setSpectating(false)} />}
-
-      {/* Live supplier call banner */}
-      {liveSupplierCall && !spectating && (
-        <div className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2">
-          <Radio size={13} className="text-accent animate-pulse shrink-0" />
-          <span className="flex-1 text-xs font-medium text-accent">
-            Live supplier call in progress
-            {liveSupplierCall.purpose ? ` — ${liveSupplierCall.purpose}` : ""}
-          </span>
-          <button
-            onClick={() => setSpectating(true)}
-            className="rounded bg-accent/20 px-2 py-0.5 text-xs font-medium text-accent hover:bg-accent/30"
-          >
-            Spectate
-          </button>
-        </div>
-      )}
-
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold text-text">Suppliers</h2>
         <div className="flex items-center gap-3 text-xs text-text/40">

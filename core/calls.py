@@ -869,7 +869,7 @@ class CallSubsystem:
                             "properties": {
                                 "update_type": {
                                     "type": "string",
-                                    "description": "price_change | discount | availability | lead_time | other",
+                                    "description": "price_change | discount | threshold_discount | free_goods | availability | lead_time | other",
                                 },
                                 "scope": {
                                     "type": "string",
@@ -902,6 +902,22 @@ class CallSubsystem:
                                 "expires_hint": {
                                     "type": "string",
                                     "description": "Natural-language expiry as stated, e.g. 'end of month', 'for 2 orders'. Omit if none.",
+                                },
+                                "min_order_value": {
+                                    "type": "number",
+                                    "description": "Minimum order value (€) required for the offer to apply. Required for threshold_discount and free_goods types (e.g. 100 for 'orders over €100').",
+                                },
+                                "free_ingredient_name": {
+                                    "type": "string",
+                                    "description": "Ingredient given for free (for free_goods type only). E.g. 'tomato'.",
+                                },
+                                "free_qty": {
+                                    "type": "number",
+                                    "description": "Quantity of the free ingredient as stated (for free_goods). E.g. 1 for '1kg'.",
+                                },
+                                "free_unit": {
+                                    "type": "string",
+                                    "description": "Unit of the free quantity (for free_goods). E.g. 'kg', 'g', 'litre'.",
                                 },
                                 "verbatim_quote": {
                                     "type": "string",
@@ -1055,6 +1071,9 @@ class CallSubsystem:
         expires_at: Optional[float],
         remaining_orders: Optional[int],
         verbatim_quote: str,
+        min_order_value: Optional[float] = None,
+        free_ingredient_id: Optional[int] = None,
+        free_qty_g: Optional[float] = None,
     ) -> Optional["SupplierTerm"]:
         """Upsert a SupplierTerm and create a ManagerChange desk card.
 
@@ -1093,6 +1112,10 @@ class CallSubsystem:
             if ingredient_id is not None:
                 ing = session.get(Ingredient, ingredient_id)
                 ing_name = ing.name if ing else f"ingredient #{ingredient_id}"
+            free_ing_name = ""
+            if free_ingredient_id is not None:
+                free_ing = session.get(Ingredient, free_ingredient_id)
+                free_ing_name = free_ing.name if free_ing else f"ingredient #{free_ingredient_id}"
 
             # Build human-readable summary
             if term_type == "unavailable":
@@ -1114,6 +1137,30 @@ class CallSubsystem:
                 if expiry_kind == "date" and expires_at:
                     days_left = max(1, round((expires_at - now) / 86400))
                     summary += f" (for ~{days_left} days)"
+            elif term_type == "threshold_discount":
+                pct = round(abs(value) * 100, 1)
+                direction = "increase" if value < 0 else "discount"
+                scope_desc = "all items" if scope == "all" else ing_name
+                mov_str = f" (orders ≥ €{min_order_value:.0f})" if min_order_value else ""
+                summary = f"{pct}% {direction} on {scope_desc} from {sup_name}{mov_str}"
+                if expiry_kind == "orders":
+                    summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
+                elif expiry_kind == "date" and expires_at:
+                    days_left = max(1, round((expires_at - now) / 86400))
+                    summary += f" (expires in ~{days_left} days)"
+                else:
+                    summary += " (permanent)"
+            elif term_type == "free_goods":
+                qty_str = f"{(free_qty_g or 0) / 1000:.3g}kg" if free_qty_g else "?"
+                mov_str = f" (orders ≥ €{min_order_value:.0f})" if min_order_value else ""
+                summary = f"Free {qty_str} {free_ing_name or 'item'} from {sup_name}{mov_str}"
+                if expiry_kind == "orders":
+                    summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
+                elif expiry_kind == "date" and expires_at:
+                    days_left = max(1, round((expires_at - now) / 86400))
+                    summary += f" (expires in ~{days_left} days)"
+                else:
+                    summary += " (permanent)"
             elif term_type == "discount":
                 pct = round(abs(value) * 100, 1)
                 direction = "increase" if value < 0 else "discount"
@@ -1158,6 +1205,9 @@ class CallSubsystem:
                 source_call_id=call.id,
                 verbatim_quote=verbatim_quote,
                 created_at=now,
+                min_order_value=min_order_value,
+                free_ingredient_id=free_ingredient_id,
+                free_qty_g=free_qty_g,
             )
             session.add(term)
             session.flush()
@@ -1177,6 +1227,10 @@ class CallSubsystem:
                 "verbatim_quote": verbatim_quote,
                 "call_id": call.id,
                 "supplier_term_id": term.id,
+                "min_order_value": min_order_value,
+                "free_ingredient_id": free_ingredient_id,
+                "free_ingredient_name": free_ing_name or None,
+                "free_qty_g": free_qty_g,
             }
             change = _MC(
                 kind="supplier_term",
@@ -1260,6 +1314,10 @@ class CallSubsystem:
         date_text: str = "",
         n: Any = None,
         verbatim_quote: str,
+        min_order_value: Any = None,
+        free_ingredient_name: str = "",
+        free_qty: Any = None,
+        free_unit: str = "",
     ) -> Dict[str, Any]:
         """Synchronous handler for the ``record_supplier_update`` live voice tool.
 
@@ -1269,7 +1327,8 @@ class CallSubsystem:
 
         All numeric normalisation is deterministic Python; the LLM reports the raw
         values and we convert here.  update_type drives the term_type: availability
-        → unavailable, lead_time → lead_time_override, price/discount → existing path.
+        → unavailable, lead_time → lead_time_override, threshold_discount / free_goods
+        → new offer types, price/discount → existing path.
         """
         call = self._load(call_id)
         if call is None:
@@ -1278,7 +1337,7 @@ class CallSubsystem:
         now = float(self.bus.sim_time)
         utype = (update_type or "other").strip().lower()
 
-        # Resolve ingredient_id
+        # Resolve ingredient_id (for scoped offers)
         session = self.db_session_factory()
         try:
             ingredient_id: Optional[int] = None
@@ -1292,29 +1351,59 @@ class CallSubsystem:
                         "record_supplier_update: could not match ingredient %r for supplier %s",
                         ingredient_name, call.counterparty_id,
                     )
+            # Resolve free_ingredient_id for free_goods offers
+            free_ingredient_id: Optional[int] = None
+            if utype == "free_goods" and free_ingredient_name:
+                free_ingredient_id = self._fuzzy_match_ingredient(
+                    session, call.counterparty_id, free_ingredient_name
+                )
         finally:
             session.close()
 
-        # Branch on update_type: availability / lead_time bypass price normalisation
+        # Normalise min_order_value
+        _min_order_value: Optional[float] = float(min_order_value) if min_order_value is not None else None
+
+        # Normalise free_qty_g: convert stated qty+unit → grams
+        _free_qty_g: Optional[float] = None
+        if utype == "free_goods" and free_qty is not None:
+            _fq = float(free_qty)
+            _fu = (free_unit or "g").strip().lower()
+            if _fu in ("kg",):
+                _free_qty_g = _fq * 1000.0
+            elif _fu in ("litre", "liter", "l"):
+                _free_qty_g = _fq * 1000.0
+            else:
+                _free_qty_g = _fq  # already grams or each
+
+        # Branch on update_type
         if utype == "availability":
             term_type = "unavailable"
             value = 0.0
             # Use the caller's stated duration as the blackout window.
-            # If expiry is already "until_date", use it; otherwise treat date_text/n
-            # as the blackout duration.  Default to 2 weeks when nothing is stated.
             expiry_hint = expiry if expiry else "until_date"
             hint_text = date_text or verbatim_quote or "2 weeks"
             expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
                 expiry_hint, hint_text, n, now
             )
             if expiry_kind_str == "none":
-                # Caller gave no usable duration — default 2-week blackout
                 expiry_kind_str = "date"
                 expires_at = now + 14 * 86400.0
         elif utype == "lead_time":
             term_type = "lead_time_override"
-            # value = new lead time in days; amount may carry days explicitly
             value = max(0.0, float(amount) if amount else 1.0)
+            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                expiry, date_text, n, now
+            )
+        elif utype == "threshold_discount":
+            # Percentage discount that applies only when order ≥ min_order_value
+            _, value = self._normalise_term_value(amount, amount_kind or "percent_discount", unit)
+            term_type = "threshold_discount"
+            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                expiry, date_text, n, now
+            )
+        elif utype == "free_goods":
+            term_type = "free_goods"
+            value = 0.0  # no price change; supply benefit captured via free_qty_g
             expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
                 expiry, date_text, n, now
             )
@@ -1338,6 +1427,9 @@ class CallSubsystem:
             expires_at=expires_at,
             remaining_orders=remaining_orders,
             verbatim_quote=(verbatim_quote or "").strip(),
+            min_order_value=_min_order_value,
+            free_ingredient_id=free_ingredient_id,
+            free_qty_g=_free_qty_g,
         )
 
         if term is None:
@@ -1354,6 +1446,14 @@ class CallSubsystem:
         elif term_type == "lead_time_override":
             item_desc = ingredient_name or "all items" if resolved_scope == "ingredient" else "all deliveries"
             summary = f"lead time updated to {value:.0f} day{'s' if value != 1 else ''} for {item_desc}"
+        elif term_type == "threshold_discount":
+            pct = round(abs(value) * 100, 1)
+            mov_str = f" on orders over €{_min_order_value:.0f}" if _min_order_value else ""
+            summary = f"{pct}% discount{mov_str} on {'all items' if resolved_scope == 'all' else ingredient_name or 'that item'}"
+        elif term_type == "free_goods":
+            qty_str = f"{(_free_qty_g or 0)/1000:.3g}kg" if _free_qty_g else "some"
+            mov_str = f" on orders over €{_min_order_value:.0f}" if _min_order_value else ""
+            summary = f"free {qty_str} {free_ingredient_name or 'item'}{mov_str}"
         elif term_type == "discount":
             pct = round(abs(value) * 100, 1)
             direction = "increase" if value < 0 else "discount"
@@ -1406,6 +1506,26 @@ class CallSubsystem:
                 verbatim_quote = update.get("verbatim_quote") or ""
                 expiry_kind_raw = update.get("expiry_kind") or "none"
                 expires_hint = update.get("expires_hint") or ""
+                # New offer fields
+                _ext_mov = update.get("min_order_value")
+                _ext_min_order_value: Optional[float] = float(_ext_mov) if _ext_mov is not None else None
+                _ext_free_ing_name = update.get("free_ingredient_name") or ""
+                _ext_free_qty_raw = update.get("free_qty")
+                _ext_free_unit = (update.get("free_unit") or "g").strip().lower()
+                _ext_free_qty_g: Optional[float] = None
+                if _ext_free_qty_raw is not None:
+                    _fq = float(_ext_free_qty_raw)
+                    if _ext_free_unit in ("kg",):
+                        _ext_free_qty_g = _fq * 1000.0
+                    elif _ext_free_unit in ("litre", "liter", "l"):
+                        _ext_free_qty_g = _fq * 1000.0
+                    else:
+                        _ext_free_qty_g = _fq
+                _ext_free_ingredient_id: Optional[int] = None
+                if utype == "free_goods" and _ext_free_ing_name:
+                    _ext_free_ingredient_id = self._fuzzy_match_ingredient(
+                        session, call.counterparty_id, _ext_free_ing_name
+                    )
 
                 if utype == "availability":
                     term_type = "unavailable"
@@ -1421,6 +1541,18 @@ class CallSubsystem:
                 elif utype == "lead_time":
                     term_type = "lead_time_override"
                     value = max(0.0, float(amount) if amount else 1.0)
+                    expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                        expiry_kind_raw, expires_hint, None, now
+                    )
+                elif utype == "threshold_discount":
+                    _, value = self._normalise_term_value(amount, amount_kind or "percent_discount", unit)
+                    term_type = "threshold_discount"
+                    expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                        expiry_kind_raw, expires_hint, None, now
+                    )
+                elif utype == "free_goods":
+                    term_type = "free_goods"
+                    value = 0.0
                     expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
                         expiry_kind_raw, expires_hint, None, now
                     )
@@ -1442,6 +1574,9 @@ class CallSubsystem:
                     expires_at=expires_at,
                     remaining_orders=remaining_orders,
                     verbatim_quote=verbatim_quote,
+                    min_order_value=_ext_min_order_value,
+                    free_ingredient_id=_ext_free_ingredient_id,
+                    free_qty_g=_ext_free_qty_g,
                 )
         finally:
             session.close()
