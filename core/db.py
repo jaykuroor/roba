@@ -143,6 +143,15 @@ def _ensure_columns() -> None:
         ("supplier_terms", "min_order_value",    "REAL"),
         ("supplier_terms", "free_ingredient_id", "INTEGER REFERENCES ingredients(id)"),
         ("supplier_terms", "free_qty_g",         "REAL"),
+        # Procurement redesign: unified coverage object + robust toggle + honest cost
+        ("procurement_plan_runs", "cash_optimal_cost",   "REAL DEFAULT 0.0"),
+        ("procurement_plan_runs", "robust_requested",    "INTEGER DEFAULT 0"),
+        ("procurement_plan_runs", "robust_applied",      "INTEGER DEFAULT 0"),
+        ("procurement_plan_runs", "robust_status",       "TEXT"),
+        ("procurement_plan_runs", "robust_premium",      "REAL DEFAULT 0.0"),
+        ("planned_orders",        "coverage_status",     "TEXT"),
+        ("planned_orders",        "short_nominal",       "REAL DEFAULT 0.0"),
+        ("planned_orders",        "short_delayed",       "REAL DEFAULT 0.0"),
     ]
     conn = engine.raw_connection()
     try:
