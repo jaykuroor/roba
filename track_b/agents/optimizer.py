@@ -233,12 +233,20 @@ class InventoryOptimizer(BaseAgent):
 
     # -- forward planner (WS4) -----------------------------------------------
 
-    def build_procurement_plan(self, horizon_days: Optional[float] = None) -> int:
+    def build_procurement_plan(
+        self,
+        horizon_days: Optional[float] = None,
+        robust: Optional[bool] = None,
+    ) -> int:
         """Build a time-phased forward procurement plan.
 
         Projects running inventory day-by-day using the DEMAND_FORECAST_HORIZON
         signal, schedules PlannedOrder rows for each ingredient that will dip
         below safety stock, and applies hysteresis to avoid churn.
+
+        robust: when True, override the env default and run pass-3 hard-delay
+                guarantee; when False, disable it regardless of env default;
+                when None, use the config default (RELIABILITY_ROBUST_HARD_DELAY).
 
         Returns the total count of active planned orders (new + kept).
         """
@@ -382,7 +390,6 @@ class InventoryOptimizer(BaseAgent):
                         continue
 
                 lead_days = float(lead_by_supplier.get(candidate["supplier_id"], 1.0))
-                on_hand = float(level.on_hand_cached or 0.0)
                 safety_stock = float(level.safety_stock or 0.0)
                 shelf_life = (
                     float(ing.shelf_life_days)
@@ -390,9 +397,12 @@ class InventoryOptimizer(BaseAgent):
                     else None
                 )
 
-                # A9: Gather dated lots for expiry-aware projection.  Each lot is
-                # stored as [qty, exp_day_offset] where exp_day_offset is days from
-                # now_day until the lot expires (999999 = never expires).
+                # Reconciled inventory snapshot: gather active lots and derive
+                # on_hand from their sum (lot-sum is the single source of truth).
+                # Falls back to on_hand_cached only when no lots exist at all.
+                # This prevents the MILP and FEFO validator from using different
+                # opening stocks (on_hand_cached can drift from lot-sum via the
+                # expiry-scan race fixed in ledger._expire_lot).
                 lots_raw = (
                     session.query(InventoryLot.qty_on_hand, InventoryLot.expiry_date)
                     .filter(
@@ -409,6 +419,23 @@ class InventoryOptimizer(BaseAgent):
                     else:
                         exp_day = 999999  # never expires
                     lot_data.append([float(lot_qty or 0.0), float(exp_day)])
+
+                if lot_data:
+                    # Lot-sum is the authoritative on-hand; cache may be stale.
+                    on_hand = sum(lq for lq, _ in lot_data)
+                    cached = float(level.on_hand_cached or 0.0)
+                    if abs(on_hand - cached) > 1.0:
+                        logger.warning(
+                            "Inventory drift for ingredient %s: lot-sum=%.1f vs "
+                            "on_hand_cached=%.1f — using lot-sum as truth.",
+                            ing_id, on_hand, cached,
+                        )
+                else:
+                    # No active lots: fall back to the cached scalar and synthesise
+                    # a single never-expiring lot so both MILP and FEFO agree.
+                    on_hand = float(level.on_hand_cached or 0.0)
+                    if on_hand > 0:
+                        lot_data = [[on_hand, 999999]]
 
                 ingredients_data[ing_id] = {
                     "candidate": candidate,
@@ -715,7 +742,9 @@ class InventoryOptimizer(BaseAgent):
                     "margin_by_ing": _margin_by_ing,
                     "production_start_hour": config.PRODUCTION_START_HOUR,
                     "scheduled_supplier_days": scheduled_supplier_days,
-                    "robust_hard_delay": config.RELIABILITY_ROBUST_HARD_DELAY,
+                    "robust_hard_delay": (
+                        robust if robust is not None else config.RELIABILITY_ROBUST_HARD_DELAY
+                    ),
                     "robust_min_reliability": config.RELIABILITY_ROBUST_MIN_RELIABILITY,
                 },
             )
@@ -797,29 +826,9 @@ class InventoryOptimizer(BaseAgent):
                     "latest_safe_arrival": _lsa_sim_s,
                 })
 
-        # E: Emit INGREDIENT_UNCOVERABLE signals for genuinely uncoverable rows.
-        # One live signal per ingredient (dedup_key), auto-pushed to the frontend
-        # via the orchestrator→WS signal_emitted bridge.  Future code queries:
-        #     bus.live(type=SignalType.INGREDIENT_UNCOVERABLE)
-        try:
-            from core.signals import IngredientUncoverablePayload  # noqa: PLC0415
-            for _uo in new_orders:
-                if _uo.get("status") == "uncoverable":
-                    _uo_iid = _uo["ingredient_id"]
-                    _uo_name = _ing_name_by_id.get(_uo_iid, str(_uo_iid))
-                    self.emit(
-                        SignalType.INGREDIENT_UNCOVERABLE,
-                        IngredientUncoverablePayload(
-                            ingredient_id=_uo_iid,
-                            ingredient_name=_uo_name,
-                            short_qty=float(plan_total_short),
-                            unit=_uo.get("unit") or "g",
-                            reason=_uo.get("reason") or "No lead-feasible / in-stock supply",
-                        ).model_dump(),
-                        dedup_key=f"uncoverable:{_uo_iid}",
-                    )
-        except Exception:  # noqa: BLE001
-            logger.warning("build_procurement_plan: failed to emit INGREDIENT_UNCOVERABLE signals")
+        # Signal emission is deferred to after the FEFO recheck so it uses
+        # per-ingredient coverage_by_ing (not the solver's delay metric).
+        # Placeholder; actual emission happens after the FEFO recheck block.
 
         # ----------------------------------------------------------------
         # WS5: Anti-jitter filter for top-up orders.
@@ -1047,8 +1056,9 @@ class InventoryOptimizer(BaseAgent):
             _reconciled_coverage_ok = plan_coverage_ok
             _coverage_depends_on_planned = False
             _late_delivery_coverage_ok = (
-                float(getattr(_solution, "unit_shortfall_if_1day_late", 0.0) or 0.0) <= 1.0
+                float(getattr(_solution, "unit_shortfall_if_1day_late", 0.0) or 0.0) <= config.COVERAGE_EPSILON
             )
+            _fefo_result: Dict[str, Any] = {}  # populated inside inner try; used after it
             try:
                 from track_b.procurement.plan_optimizer import (  # noqa: PLC0415
                     project_fefo_coverage as _fefo_check,
@@ -1085,7 +1095,11 @@ class InventoryOptimizer(BaseAgent):
 
                 _fefo_result = _fefo_check(
                     n_days=n_days,
-                    demand_by_day=per_day_demand,
+                    # Use the same robust demand the MILP optimised for (max of
+                    # forecast and baseline) so the coverage flag and the solve
+                    # measure the same demand.  per_day_demand (raw forecast) alone
+                    # would be inconsistent with a plan that targets the robust max.
+                    demand_by_day=_demand_map,
                     on_hand={iid: d["on_hand"] for iid, d in ingredients_data.items()},
                     lots_by_ing={iid: d["lots"] for iid, d in ingredients_data.items()},
                     open_po_arrivals_by_day=inbound_by_day,
@@ -1118,6 +1132,77 @@ class InventoryOptimizer(BaseAgent):
                     "falling back to solver total_short=%.1f.", plan_total_short,
                 )
 
+            # ----------------------------------------------------------------
+            # Post-FEFO: derive authoritative coverage_by_ing and update orders
+            # ----------------------------------------------------------------
+            _coverage_by_ing: Dict[int, Dict] = _fefo_result.get("coverage_by_ing", {})
+            # Patch coverage fields into new_orders before persistence.
+            for _od in final_new_orders:
+                _co_iid = int(_od.get("ingredient_id", 0))
+                _co = _coverage_by_ing.get(_co_iid, {})
+                _od["coverage_status"] = _co.get("status", "covered")
+                _od["short_nominal"] = float(_co.get("short_nominal", 0.0))
+                _od["short_delayed"] = float(_co.get("short_delayed", 0.0))
+                # Normalise unit to ingredient base_unit so qty and unit agree.
+                _co_ing = session.get(Ingredient, _co_iid)
+                if _co_ing and getattr(_co_ing, "base_unit", None):
+                    _od["unit"] = _co_ing.base_unit
+
+            # Anti-contradiction guard: coverage_ok cannot be True while any
+            # ingredient is nominal_uncoverable.  Fail-safe toward showing the gap.
+            _has_nominal_uncoverable = any(
+                v.get("status") == "nominal_uncoverable"
+                for v in _coverage_by_ing.values()
+            )
+            if _reconciled_coverage_ok and _has_nominal_uncoverable:
+                _n_unc = sum(
+                    1 for v in _coverage_by_ing.values()
+                    if v.get("status") == "nominal_uncoverable"
+                )
+                logger.error(
+                    "Contradiction: coverage_ok=True but %d ingredient(s) are nominal_uncoverable; "
+                    "forcing coverage_ok=False as fail-safe.",
+                    _n_unc,
+                )
+                _reconciled_coverage_ok = False
+
+            # Emit INGREDIENT_UNCOVERABLE signals driven by FEFO coverage_by_ing.
+            # Only nominal_uncoverable ingredients trigger the signal; delay-exposed
+            # items do NOT — this prevents false "coffee short 135ml"-style warnings.
+            # The short_qty is the per-ingredient nominal shortfall (not plan-wide total).
+            try:
+                from core.signals import IngredientUncoverablePayload  # noqa: PLC0415
+                _emitted_iids: set = set()
+                for _co_iid, _co_info in _coverage_by_ing.items():
+                    if _co_info.get("status") != "nominal_uncoverable":
+                        continue
+                    if _co_iid in _emitted_iids:
+                        continue
+                    _emitted_iids.add(_co_iid)
+                    _uo_name = _ing_name_by_id.get(_co_iid, str(_co_iid))
+                    _uo_unit = next(
+                        (_od.get("unit", "g") for _od in new_orders
+                         if int(_od.get("ingredient_id", 0)) == _co_iid),
+                        "g",
+                    )
+                    _sn = float(_co_info.get("short_nominal", 0.0))
+                    self.emit(
+                        SignalType.INGREDIENT_UNCOVERABLE,
+                        IngredientUncoverablePayload(
+                            ingredient_id=_co_iid,
+                            ingredient_name=_uo_name,
+                            short_qty=_sn,
+                            unit=_uo_unit,
+                            reason=(
+                                f"No lead-feasible / in-stock supply: "
+                                f"{_sn:.0f}{_uo_unit} short on time"
+                            ),
+                        ).model_dump(),
+                        dedup_key=f"uncoverable:{_co_iid}",
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("build_procurement_plan: failed to emit INGREDIENT_UNCOVERABLE signals")
+
             run = ProcurementPlanRun(
                 created_at=now,
                 horizon_days=horizon_days,
@@ -1130,6 +1215,11 @@ class InventoryOptimizer(BaseAgent):
                 exposed_value_protected=plan_exposed_value_protected,
                 coverage_depends_on_planned_orders=1 if _coverage_depends_on_planned else 0,
                 late_delivery_coverage_ok=1 if _late_delivery_coverage_ok else 0,
+                cash_optimal_cost=float(getattr(_solution, "cash_optimal_cost", 0.0) or 0.0),
+                robust_requested=1 if bool(getattr(_solution, "robust_requested", False)) else 0,
+                robust_applied=1 if bool(getattr(_solution, "robust_applied", False)) else 0,
+                robust_status=str(getattr(_solution, "robust_status", "") or ""),
+                robust_premium=float(getattr(_solution, "robust_premium", 0.0) or 0.0),
             )
             session.add(run)
             session.flush()
@@ -1141,6 +1231,11 @@ class InventoryOptimizer(BaseAgent):
                     for field, value in updates.items():
                         setattr(row, field, value)
                     row.plan_run_id = run.id
+                    # Update coverage fields from FEFO result.
+                    _co = _coverage_by_ing.get(int(row.ingredient_id), {})
+                    row.coverage_status = _co.get("status", "covered")
+                    row.short_nominal = float(_co.get("short_nominal", 0.0))
+                    row.short_delayed = float(_co.get("short_delayed", 0.0))
 
             for order_data in final_new_orders:
                 session.add(PlannedOrder(**order_data, plan_run_id=run.id, created_at=now))

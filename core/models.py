@@ -1232,6 +1232,16 @@ class ProcurementPlanRun(Base):
     # late_delivery_coverage_ok: True when coverage holds even if all deliveries slip +1 day.
     coverage_depends_on_planned_orders = mapped_column(Integer, default=0)
     late_delivery_coverage_ok = mapped_column(Integer, default=1)
+    # Robustness and honest-cost fields (procurement redesign)
+    # cash_optimal_cost: pass-1 cash-only cost before reliability premium is applied.
+    # robust_requested / robust_applied: whether pass-3 hard-delay solve was requested/successful.
+    # robust_status: "applied" | "infeasible_fell_back" | "skipped" | "".
+    # robust_premium: extra cash cost vs pass-2 plan when robust pass-3 was applied.
+    cash_optimal_cost = mapped_column(Float, default=0.0)
+    robust_requested = mapped_column(Integer, default=0)
+    robust_applied = mapped_column(Integer, default=0)
+    robust_status = mapped_column(String, nullable=True)
+    robust_premium = mapped_column(Float, default=0.0)
 
     def __repr__(self):
         return (f"<ProcurementPlanRun id={self.id} horizon_days={self.horizon_days} "
@@ -1270,6 +1280,14 @@ class PlannedOrder(Base):
     qty_needed_before = mapped_column(Float, default=0.0, nullable=True)        # cumulative demand up to delivery day
     shortage_if_late = mapped_column(Float, default=0.0, nullable=True)         # shortfall if this line arrives one day late
     latest_safe_arrival = mapped_column(Float, nullable=True)                   # sim-seconds; last arrival time before stockout
+    # FEFO-derived coverage status (procurement redesign — unified authoritative coverage)
+    # coverage_status: "covered" | "nominal_uncoverable" | "delay_exposed"
+    # short_nominal: per-ingredient shortfall on-time (g/ml/each)
+    # short_delayed: per-ingredient shortfall under universal +1-day delay
+    # unit: normalised to ingredient base_unit so qty and unit always agree
+    coverage_status = mapped_column(String, nullable=True)
+    short_nominal = mapped_column(Float, default=0.0, nullable=True)
+    short_delayed = mapped_column(Float, default=0.0, nullable=True)
 
     def __repr__(self):
         return (f"<PlannedOrder id={self.id} ingredient_id={self.ingredient_id} "

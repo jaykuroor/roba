@@ -76,6 +76,10 @@ interface PlanItem {
   qty_needed_before: number;
   shortage_if_late: number;
   latest_safe_arrival: number | null;
+  // FEFO-derived coverage (authoritative — drives badges and warnings)
+  coverage_status: "covered" | "nominal_uncoverable" | "delay_exposed";
+  short_nominal: number;   // per-ingredient on-time shortfall
+  short_delayed: number;   // per-ingredient shortfall under +1-day delay
 }
 
 interface PlanResponse {
@@ -89,6 +93,16 @@ interface PlanResponse {
   reliability_premium: number;
   exposed_value_baseline: number;
   exposed_value_protected: number;
+  // Honest cost: cash_optimal_cost = pass-1 baseline, reliability_premium = delta
+  cash_optimal_cost: number;
+  // Robustness
+  robust_requested: boolean;
+  robust_applied: boolean;
+  robust_status: string;
+  robust_premium: number;
+  // Coverage counts derived from items (used for banner cross-check)
+  nominal_uncoverable_count: number;
+  delay_exposed_count: number;
   items: PlanItem[];
 }
 
@@ -341,10 +355,14 @@ function PlanSection({
               unit_price: i.unit_price,
               order_date_label: i.order_date_label,
               delivery_date_label: i.delivery_date_label,
-              at_risk: i.status === "at_risk",
-              uncoverable: i.status === "uncoverable",
+              // Badges driven by FEFO coverage_status — not the solver's delay metric.
+              // "uncoverable" = no on-time supply; "delay_exposed" = covered on-time
+              // but short if a delivery slips 1 day.  These are orthogonal: a
+              // delay-exposed item is NOT uncoverable.
+              uncoverable: i.coverage_status === "nominal_uncoverable",
+              at_risk: i.coverage_status === "delay_exposed",
               delivery_charge_share: i.delivery_charge_share,
-              shortage_if_late: i.shortage_if_late,
+              shortage_if_late: i.short_delayed,  // per-ingredient delay shortfall
               projected_stock_before: i.projected_stock_before,
             }));
             return (
@@ -693,10 +711,14 @@ export function ProcurementPanel() {
     };
   }, [fetchPlan, fetchOrders, fetchWarnings, deliveredPage]);
 
-  async function replan() {
+  async function replan(robust?: boolean) {
     setReplanning(true);
     try {
-      await apiPost("/api/track-b/procurement/plan/run");
+      const url =
+        robust === undefined
+          ? "/api/track-b/procurement/plan/run"
+          : `/api/track-b/procurement/plan/run?robust=${robust}`;
+      await apiPost(url);
       await fetchPlan();
     } catch {
       /* ignore */
@@ -740,20 +762,21 @@ export function ProcurementPanel() {
         </div>
       )}
 
-      {/* Coverage status panel — three orthogonal labeled lines */}
+      {/* Coverage status panel — four orthogonal labeled axes */}
       {planMeta && (
         <div className="rounded-lg border border-muted/30 bg-surface/60 px-3 py-2.5 space-y-1.5 text-xs">
-          {/* COVERAGE axis */}
+          {/* COVERAGE axis — driven by nominal_uncoverable_count so banner and
+              badges cannot contradict (both come from FEFO coverage_by_ing) */}
           <div className="flex items-baseline gap-2">
             <span className="font-semibold text-text/50 uppercase tracking-wide text-[10px] w-20 shrink-0">
               Coverage
             </span>
-            {planMeta.forecast_coverage_ok ? (
+            {(planMeta.nominal_uncoverable_count ?? 0) === 0 ? (
               <span className="text-success font-medium">Fully covered</span>
             ) : (
               <span className="text-danger font-medium flex items-center gap-1">
                 <AlertOctagon size={11} />
-                {planMeta.total_short.toFixed(0)} units short even with planned orders
+                {planMeta.nominal_uncoverable_count} ingredient{planMeta.nominal_uncoverable_count !== 1 ? "s" : ""} cannot be sourced on time
               </span>
             )}
           </div>
@@ -776,34 +799,84 @@ export function ProcurementPanel() {
             );
           })()}
 
-          {/* DELAY RISK axis — always shown when plan exists */}
+          {/* DELAY RISK axis */}
           <div className="flex items-baseline gap-2">
             <span className="font-semibold text-text/50 uppercase tracking-wide text-[10px] w-20 shrink-0">
               Delay risk
             </span>
-            {planMeta.late_delivery_coverage_ok ? (
-              <span className="text-text/60">Survives a 1-day delivery delay</span>
+            {planMeta.robust_applied ? (
+              <span className="text-success font-medium">
+                Guaranteed to survive a 1-day delay
+                {(planMeta.robust_premium ?? 0) > 0.01 && (
+                  <span className="font-normal text-text/50"> (+€{planMeta.robust_premium.toFixed(2)} vs on-time plan)</span>
+                )}
+              </span>
+            ) : planMeta.late_delivery_coverage_ok ? (
+              <span className="text-text/60 flex items-center gap-1">
+                Survives a 1-day delivery delay
+                {!planMeta.robust_applied && (
+                  <button
+                    type="button"
+                    onClick={() => void replan(true)}
+                    disabled={replanning}
+                    className="ml-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-muted text-text/60 hover:bg-muted/70 disabled:opacity-50"
+                    title="Re-plan with pass-3 hard robustness guarantee"
+                  >
+                    Make robust
+                  </button>
+                )}
+              </span>
             ) : (() => {
-              // Find the item with the worst shortage_if_late for a concrete headline
+              // Find the worst delay-exposed ingredient for a concrete headline
               const worst = planItems
-                .filter((it) => (it.shortage_if_late ?? 0) > 0.5)
-                .sort((a, b) => (b.shortage_if_late ?? 0) - (a.shortage_if_late ?? 0))[0];
+                .filter((it) => (it.short_delayed ?? 0) > 0.5)
+                .sort((a, b) => (b.short_delayed ?? 0) - (a.short_delayed ?? 0))[0];
               const reliabilityNote = planMeta.reliability_premium > 0.005 && planMeta.exposed_value_protected > 0
                 ? ` · safer plan active (+€${planMeta.reliability_premium.toFixed(2)})`
                 : "";
               return (
-                <span className="text-warning font-medium flex items-center gap-1">
+                <span className="text-warning font-medium flex items-center gap-2">
                   <AlertTriangle size={11} />
-                  {worst
-                    ? `${worst.ingredient_name} ${worst.shortage_if_late?.toFixed(0)} ${worst.unit} short if a delivery slips 1 day`
-                    : "Not robust to a 1-day delivery delay"}
-                  {reliabilityNote && (
-                    <span className="font-normal text-text/50">{reliabilityNote}</span>
-                  )}
+                  <span>
+                    {worst
+                      ? `${worst.ingredient_name} ${formatQty(worst.short_delayed ?? 0, worst.unit)} short if a delivery slips 1 day`
+                      : "Not robust to a 1-day delivery delay"}
+                    {reliabilityNote && (
+                      <span className="font-normal text-text/50">{reliabilityNote}</span>
+                    )}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void replan(true)}
+                    disabled={replanning}
+                    className="rounded px-1.5 py-0.5 text-[10px] font-medium bg-muted text-text/60 hover:bg-muted/70 disabled:opacity-50 shrink-0"
+                    title="Re-plan with pass-3 hard robustness guarantee"
+                  >
+                    Make robust
+                  </button>
                 </span>
               );
             })()}
           </div>
+
+          {/* COST axis — honest: cash-optimal vs chosen (risk-adjusted) */}
+          {(planMeta.cash_optimal_cost ?? 0) > 0.01 && (
+            <div className="flex items-baseline gap-2">
+              <span className="font-semibold text-text/50 uppercase tracking-wide text-[10px] w-20 shrink-0">
+                Cost
+              </span>
+              {(planMeta.reliability_premium ?? 0) < 0.01 ? (
+                <span className="text-text/60">
+                  Cash-optimal €{planMeta.cash_optimal_cost.toFixed(2)}
+                </span>
+              ) : (
+                <span className="text-text/60">
+                  Cash-optimal €{planMeta.cash_optimal_cost.toFixed(2)}
+                  <span className="text-text/40"> · Chosen (reliability-adjusted) €{((planMeta.cash_optimal_cost ?? 0) + (planMeta.reliability_premium ?? 0)).toFixed(2)} (+€{planMeta.reliability_premium.toFixed(2)})</span>
+                </span>
+              )}
+            </div>
+          )}
         </div>
       )}
 

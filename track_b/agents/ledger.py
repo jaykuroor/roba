@@ -598,12 +598,16 @@ class InventoryLedger(BaseAgent):
         )
 
     def _expire_lot(self, spec: Dict[str, Any], now: float) -> None:
-        qty = spec["qty_on_hand"]
         session = self.db_session_factory()
         try:
             lot = session.get(InventoryLot, spec["id"])
             if lot is None or lot.status != "active":
                 return
+            # Re-read qty from the live lot row (not the snapshot) to avoid the
+            # scan_expiry/commit race: if the lot was partially depleted between
+            # scan_expiry's snapshot and this write, using spec["qty_on_hand"] would
+            # over-decrement on_hand_cached and cause it to drift from the lot sum.
+            qty = float(lot.qty_on_hand or 0.0)
             lot.status = "expired"
             level = self._get_or_create_level(session, spec["ingredient_id"])
             balance_after = float(level.on_hand_cached or 0.0) - qty

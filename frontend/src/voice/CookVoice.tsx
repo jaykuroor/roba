@@ -10,6 +10,7 @@ import { ForecastCard } from "./ForecastCard";
 import { ModeToggle } from "./ModeToggle";
 import { MicModeToggle } from "./MicModeToggle";
 import { apiGet, apiPost } from "../api";
+import { formatQty } from "../utils/units";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -242,7 +243,7 @@ function BatchCard({
                     <span className="text-text/30 w-4 shrink-0 text-right">{i + 1}.</span>
                     <span className={step.optional ? "text-text/40 italic" : "text-text/70"}>
                       {step.qty > 0 && (
-                        <span className="font-medium text-text/80">{step.qty} {step.unit} </span>
+                        <span className="font-medium text-text/80">{formatQty(step.qty, step.unit)} </span>
                       )}
                       {step.ingredient}
                       {step.optional && " (optional)"}

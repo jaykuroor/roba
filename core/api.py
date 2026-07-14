@@ -2828,7 +2828,8 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
         return f"Day {day} ({dow}) {hh:02d}:{mm:02d}{suffix}"
 
     # Current sim time (for overdue label).
-    now_sim = float(ctx.bus.sim_time) if ctx.bus is not None else 0.0
+    # When the bus is unavailable use None — unknown-now → do not label anything overdue.
+    now_sim = float(ctx.bus.sim_time) if ctx.bus is not None else None
 
     # Pre-load all referenced suppliers to compute delivery_charge_share.
     sup_ids = {o.supplier_id for o in orders if o.supplier_id}
@@ -2850,10 +2851,12 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
         ing = db_session.get(models.Ingredient, o.ingredient_id)
         sup = supplier_map.get(o.supplier_id) if o.supplier_id else None
         order_date_s = float(o.order_date or 0.0)
-        order_label = _day_time_label(
-            order_date_s,
-            overdue=(o.status == "at_risk" or order_date_s <= now_sim),
-        )
+        # "overdue" = order_date strictly in the past.  Never force it from
+        # status=="at_risk" (which is a delay-exposure label, not a time label).
+        # When now_sim is None (bus absent) disable labeling — unknown-now is
+        # not the same as now=0, which would wrongly mark every order overdue.
+        _is_overdue = (now_sim is not None) and (order_date_s <= now_sim)
+        order_label = _day_time_label(order_date_s, overdue=_is_overdue)
         delivery_day_idx = int(float(o.delivery_date or 0.0) // _SPD)
         n_in_group = group_counts.get((o.supplier_id, delivery_day_idx), 1)
         dc = float(sup.delivery_charge or 0.0) if sup else 0.0
@@ -2880,6 +2883,10 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
             "qty_needed_before": float(getattr(o, "qty_needed_before", 0.0) or 0.0),
             "shortage_if_late": float(getattr(o, "shortage_if_late", 0.0) or 0.0),
             "latest_safe_arrival": float(o.latest_safe_arrival) if getattr(o, "latest_safe_arrival", None) is not None else None,
+            # FEFO-derived coverage status (authoritative; derived from post-solve FEFO sim)
+            "coverage_status": getattr(o, "coverage_status", None) or "covered",
+            "short_nominal": float(getattr(o, "short_nominal", 0.0) or 0.0),
+            "short_delayed": float(getattr(o, "short_delayed", 0.0) or 0.0),
         })
 
     return {
@@ -2899,20 +2906,38 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
         "reliability_premium": float(getattr(latest_run, "reliability_premium", 0.0) or 0.0) if latest_run else 0.0,
         "exposed_value_baseline": float(getattr(latest_run, "exposed_value_baseline", 0.0) or 0.0) if latest_run else 0.0,
         "exposed_value_protected": float(getattr(latest_run, "exposed_value_protected", 0.0) or 0.0) if latest_run else 0.0,
+        # Honest cost: cash_optimal_cost = pass-1 cash-only reference;
+        # reliability_premium = extra cost for delay-exposure reduction.
+        "cash_optimal_cost": float(getattr(latest_run, "cash_optimal_cost", 0.0) or 0.0) if latest_run else 0.0,
+        # Robustness fields (pass-3 hard-delay mode)
+        "robust_requested": bool(getattr(latest_run, "robust_requested", 0)) if latest_run else False,
+        "robust_applied": bool(getattr(latest_run, "robust_applied", 0)) if latest_run else False,
+        "robust_status": str(getattr(latest_run, "robust_status", "") or "") if latest_run else "",
+        "robust_premium": float(getattr(latest_run, "robust_premium", 0.0) or 0.0) if latest_run else 0.0,
+        # Per-ingredient coverage counts (derived from items so banner/badges/warnings share source)
+        "nominal_uncoverable_count": sum(1 for r in result if r.get("coverage_status") == "nominal_uncoverable"),
+        "delay_exposed_count": sum(1 for r in result if r.get("coverage_status") == "delay_exposed"),
         "items": result,
     }
 
 
 @app.post("/api/track-b/procurement/plan/run")
-def run_procurement_plan() -> Dict[str, Any]:
-    """Manually trigger a procurement plan rebuild and execute any overdue orders."""
+def run_procurement_plan(
+    robust: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Manually trigger a procurement plan rebuild and execute any overdue orders.
+
+    robust: when True, run pass-3 hard-delay guarantee (costs more but is robust to
+            1-day supplier delays).  When False, disable regardless of env default.
+            When omitted, uses the RELIABILITY_ROBUST_HARD_DELAY env default.
+    """
     optimizer = (ctx.tracks.get("track_b") or {}).get("optimizer")
     if optimizer is None:
         raise HTTPException(status_code=503, detail="Optimizer not active")
     # Execute overdue planned orders first (converts at_risk / past-due rows into POs),
     # then rebuild the plan so the UI reflects the updated state.
     executed = optimizer.execute_due_planned_orders()
-    count = optimizer.build_procurement_plan()
+    count = optimizer.build_procurement_plan(robust=robust)
     return {"ok": True, "items_planned": count, "orders_executed": executed}
 
 

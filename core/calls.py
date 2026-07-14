@@ -570,13 +570,14 @@ class CallSubsystem:
             current_price = float(cat.current_price or 0.0)
 
             cat_unit = cat.unit or "g"
-            # Build human-readable price strings (per kg for display)
-            if cat_unit == "g":
-                before_disp = f"€{current_price * 1000:.2f}/kg"
-                after_disp = f"€{agreed_price * 1000:.2f}/kg"
-            else:
-                before_disp = f"€{current_price:.2f}/{cat_unit}"
-                after_disp = f"€{agreed_price:.2f}/{cat_unit}"
+            # Route through canonical formatter so all units (g, ml, each …) scale
+            # correctly.  The old hand-rolled "g" branch missed all non-gram units,
+            # producing "€0.00/ml" for low per-ml prices like tomato at €0.004/g.
+            from core.formatter import format_price_per_unit as _fpu  # noqa: PLC0415
+            _bp, _bu = _fpu(current_price, cat_unit)
+            _ap, _au = _fpu(agreed_price, cat_unit)
+            before_disp = f"€{_bp:.2f}/{_bu}"
+            after_disp = f"€{_ap:.2f}/{_au}"
 
             now_t = float(self.bus.sim_time)
 

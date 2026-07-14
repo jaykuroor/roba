@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { apiGet } from "../api";
 import { wsClient } from "../ws";
 import { useSimState } from "../store";
+import { formatQty } from "../utils/units";
 import type { Ingredient, InventoryLot, Promotion, SignalEnvelope } from "../types";
 
 export function ExpiryView() {
@@ -84,7 +85,7 @@ export function ExpiryView() {
               return (
                 <tr key={lot.id} className={"border-t border-muted " + (risky ? "bg-warning/10" : "")}>
                   <td className="py-1 font-medium text-text">{ingredientName(lot.ingredient_id)}</td>
-                  <td className="py-1 text-text/70">{lot.qty_on_hand.toFixed(1)} {lot.unit}</td>
+                  <td className="py-1 text-text/70">{formatQty(lot.qty_on_hand, lot.unit)}</td>
                   <td className="py-1 text-text/70">
                     {remaining != null ? `${(remaining / 3600).toFixed(1)}h` : "—"}
                   </td>

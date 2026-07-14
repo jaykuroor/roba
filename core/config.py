@@ -182,6 +182,12 @@ RELIABILITY_ROBUST_MIN_RELIABILITY = float(
 # Suggested range: 0.05–0.15 for moderate jitter suppression.
 PROCUREMENT_JITTER_FRACTION = float(os.getenv("PROCUREMENT_JITTER_FRACTION", "0.0"))
 
+# COVERAGE_EPSILON: tolerance for the "coverage_ok" aggregate shortfall gate.
+# Replaces the legacy flat <= 1.0 check (which masked real sub-gram shortages).
+# Default 0.01 base units (10 mg / 10 µL) is safely above float-arithmetic noise
+# (~1e-8) but below any operationally meaningful shortage (e.g. 1g flour).
+COVERAGE_EPSILON = float(os.getenv("COVERAGE_EPSILON", "0.01"))
+
 # Vertex AI Live API (Stream B5)
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio")
 GEMINI_LIVE_CALL_MODEL = os.getenv("GEMINI_LIVE_CALL_MODEL", "gemini-live-2.5-flash-native-audio")

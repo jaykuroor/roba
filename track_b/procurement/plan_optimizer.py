@@ -111,8 +111,9 @@ class PlanSolution:
     total_short: float = 0.0  # total un-coverable forecasted demand (base units)
     coverage_ok: bool = True  # False when any forecasted demand is left uncovered
     # Reliability premium fields (two-pass MILP only; 0.0 for greedy / pass-1-only)
-    cash_cost: float = 0.0              # actual invoice cost of the chosen plan
-    reliability_premium: float = 0.0   # extra cash vs the cash-optimal plan
+    cash_cost: float = 0.0              # actual invoice cost of the chosen plan (pass-2 or pass-1)
+    cash_optimal_cost: float = 0.0     # pass-1 cash-only cost (reference for honest cost display)
+    reliability_premium: float = 0.0   # extra cash vs the cash-optimal plan (cash_cost - cash_optimal_cost)
     exposed_value_baseline: float = 0.0  # margin exposed under 1-day delay, no-plan baseline
     exposed_value_plan: float = 0.0    # margin exposed under 1-day delay, chosen plan
     # Unit shortfall under a universal +1-day delay (always computed by MILP; 0 for greedy)
@@ -121,6 +122,7 @@ class PlanSolution:
     robust_requested: bool = False
     robust_applied: bool = False
     robust_status: str = ""  # "applied" | "infeasible_fell_back" | "skipped"
+    robust_premium: float = 0.0        # extra cash cost of pass-3 vs pass-2 plan
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +179,17 @@ def project_fefo_coverage(
         """Return a list of [qty, exp_day] pairs for the opening stock of iid."""
         raw = lots_by_ing.get(iid)
         if raw:
-            return [[float(q), float(e)] for q, e in raw]
+            lots_out = [[float(q), float(e)] for q, e in raw]
+            # Tripwire: log if lot-sum disagrees with on_hand (drift regression guard).
+            lot_sum = sum(q for q, _ in lots_out)
+            cache_val = float(on_hand.get(iid, 0.0))
+            if abs(lot_sum - cache_val) > 1.0:
+                logger.warning(
+                    "FEFO validator: inventory drift iid=%s lot_sum=%.1f vs on_hand=%.1f "
+                    "— using lot-sum. (Reconcile call should have prevented this.)",
+                    iid, lot_sum, cache_val,
+                )
+            return lots_out
         return [[float(on_hand.get(iid, 0.0)), float(_INF_DAY)]]
 
     def _simulate(
@@ -267,7 +279,8 @@ def project_fefo_coverage(
         {iid: dict(d_map) for iid, d_map in open_po_arrivals_by_day.items()},
         demand_by_day,
     )
-    coverage_depends_on_planned = committed_short > 1.0
+    from core.config import COVERAGE_EPSILON as _COV_EPS  # noqa: PLC0415
+    coverage_depends_on_planned = committed_short > _COV_EPS
 
     # ---- +1-day delay simulation (shift ALL arrivals one day later) ----
     def _shift_one_day(src: Dict[int, Dict[int, float]]) -> Dict[int, Dict[int, float]]:
@@ -277,13 +290,32 @@ def project_fefo_coverage(
         return shifted
 
     late_arrivals = _merge(_shift_one_day(open_po_arrivals_by_day), _shift_one_day(plan_arrivals_by_day))
-    late_short, _ = _simulate(late_arrivals, demand_by_day)
-    late_delivery_coverage_ok = late_short <= 1.0
+    late_short, short_by_ing_delayed = _simulate(late_arrivals, demand_by_day)
+    late_delivery_coverage_ok = late_short <= _COV_EPS
+
+    # ---- per-ingredient coverage status ----
+    # status ∈ "covered" | "nominal_uncoverable" | "delay_exposed"
+    # "nominal_uncoverable" = short on-time (genuine supply failure)
+    # "delay_exposed"       = covered on-time, short only under +1-day delay
+    coverage_by_ing: Dict[int, Dict[str, Any]] = {}
+    all_iids = set(short_by_ing.keys()) | set(short_by_ing_delayed.keys())
+    for iid in all_iids:
+        sn = float(short_by_ing.get(iid, 0.0))
+        sd = float(short_by_ing_delayed.get(iid, 0.0))
+        if sn > 1e-6:
+            status = "nominal_uncoverable"
+        elif sd > 1e-6:
+            status = "delay_exposed"
+        else:
+            status = "covered"
+        coverage_by_ing[iid] = {"status": status, "short_nominal": sn, "short_delayed": sd}
 
     return {
-        "coverage_ok": total_short <= 1.0,
+        "coverage_ok": total_short <= _COV_EPS,
         "total_short": total_short,
         "short_by_ing": short_by_ing,
+        "short_by_ing_delayed": short_by_ing_delayed,
+        "coverage_by_ing": coverage_by_ing,
         "coverage_depends_on_planned": coverage_depends_on_planned,
         "late_delivery_coverage_ok": late_delivery_coverage_ok,
     }
@@ -1582,7 +1614,8 @@ def _solve_milp(
             if dv is not None and dv > 0.5:
                 total_cost += dc
 
-    coverage_ok = total_short <= 1.0
+    from core.config import COVERAGE_EPSILON as _COV_EPS_M  # noqa: PLC0415
+    coverage_ok = total_short <= _COV_EPS_M
 
     # ------------------------------------------------------------------
     # Compute honest one-day-delay exposure for the chosen plan
@@ -1590,6 +1623,7 @@ def _solve_milp(
     reliability_premium = 0.0
     exposed_value_baseline = 0.0
     exposed_value_plan = 0.0
+    robust_premium_val = 0.0
 
     if run_pass2:
         reliability_premium = max(0.0, cash_final - cash_optimal)
@@ -1671,6 +1705,7 @@ def _solve_milp(
         coverage_ok=coverage_ok,
         rationale=rationale,
         cash_cost=cash_final,
+        cash_optimal_cost=cash_optimal,
         reliability_premium=reliability_premium,
         exposed_value_baseline=exposed_value_baseline,
         exposed_value_plan=exposed_value_plan,
@@ -1678,6 +1713,7 @@ def _solve_milp(
         robust_requested=robust_hard_delay,
         robust_applied=robust_applied,
         robust_status=robust_status,
+        robust_premium=robust_premium_val,
     )
 
 
