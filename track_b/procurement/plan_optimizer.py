@@ -79,6 +79,33 @@ except ImportError:
 _INF_DAY = 10 ** 9  # sentinel expiry-day offset for "never expires"
 
 
+def _incumbent_usable(status: int, q_values: List[Optional[float]]) -> bool:
+    """Decide whether a CBC solve result is usable as an incumbent plan.
+
+    Pure / unit-testable helper (no PuLP import needed at call time; status
+    codes and pulp.value() results are passed in explicitly).
+
+    * ``LpStatusInfeasible`` (-1) / ``LpStatusUnbounded`` (-2) → False.
+    * ``LpStatusOptimal`` (1) → True.
+    * ``LpStatusNotSolved`` (0) / ``LpStatusUndefined`` (-3) → True iff a
+      time-limited incumbent exists, i.e. every order (``q``) variable has a
+      non-None value (CBC populated a feasible-but-not-proven-optimal solution).
+    """
+    # Mirror pulp.constants values without importing at module scope.
+    LP_OPTIMAL = 1
+    LP_NOT_SOLVED = 0
+    LP_INFEASIBLE = -1
+    LP_UNBOUNDED = -2
+    LP_UNDEFINED = -3
+    if status in (LP_INFEASIBLE, LP_UNBOUNDED):
+        return False
+    if status == LP_OPTIMAL:
+        return True
+    if status in (LP_NOT_SOLVED, LP_UNDEFINED):
+        return bool(q_values) and all(v is not None for v in q_values)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public data types
 # ---------------------------------------------------------------------------
@@ -834,9 +861,9 @@ def _solve_milp(
     waste: Dict[Tuple[int, int], Any] = {}
     # volume-discount tier binaries per supplier-day
     vol_tier: Dict[Tuple[int, int, int], Any] = {}
-    # per-item qty-discount binaries and discount qty
-    b_disc: Dict[Tuple[int, int, int], Any] = {}
-    x_disc: Dict[Tuple[int, int, int], Any] = {}
+    # per-item multi-tier qty-discount binaries and discount qty, keyed by tier t
+    b_disc: Dict[Tuple[int, int, int, int], Any] = {}
+    x_disc: Dict[Tuple[int, int, int, int], Any] = {}
 
     for iid in active_ids:
         for d in range(n_days):
@@ -879,14 +906,28 @@ def _solve_milp(
     cons_rob: Dict[Tuple[int, int, int], Any] = {}
     waste_exp_rob: Dict[Tuple[int, int], Any] = {}
     demand_short_rob: Dict[Tuple[int, int], Any] = {}
+    # Non-perishable robust delay-scenario scalar inventory (mirrors nominal `inv`)
+    inv_rob: Dict[Tuple[int, int], Any] = {}
 
-    if robust_hard_delay:
+    # The delay-scenario variables are shared by pass-2 (soft delay-shortfall
+    # objective, R4) and pass-3 (hard ==0 robustness).  Build them when EITHER
+    # stress (pass-2) or robust hard-delay (pass-3) is active.
+    _build_delay_vars = stress_enabled or robust_hard_delay
+
+    if _build_delay_vars:
         for iid in active_ids:
             for d in range(n_days):
                 demand_short_rob[iid, d] = pulp.LpVariable(
                     f"dshort_rob_{iid}_{d}", lowBound=0, cat="Continuous"
                 )
             if iid not in cohort_expiry:
+                # Non-perishable: build a scalar robust inventory var per day
+                # (mirrors nominal `inv`) so the delay-scenario balance is real,
+                # not vacuous.
+                for d in range(n_days):
+                    inv_rob[iid, d] = pulp.LpVariable(
+                        f"invrob_{iid}_{d}", lowBound=0, cat="Continuous"
+                    )
                 continue  # non-perishable handled separately in robust constraints
             for e in cohort_expiry[iid]:
                 if e < n_days:
@@ -926,16 +967,19 @@ def _solve_milp(
             if (iid, s_id) not in cat_by_is:
                 continue
             ld = lead_ceil[s_id]
+            _disc_tiers = cat_by_is[(iid, s_id)].get("discount") or []
             for d in range(ld, n_days):
                 q[iid, s_id, d] = pulp.LpVariable(
                     f"q_{iid}_{s_id}_{d}", lowBound=0, cat="Integer"
                 )
-                b_disc[iid, s_id, d] = pulp.LpVariable(
-                    f"bdisc_{iid}_{s_id}_{d}", cat="Binary"
-                )
-                x_disc[iid, s_id, d] = pulp.LpVariable(
-                    f"xdisc_{iid}_{s_id}_{d}", lowBound=0, cat="Continuous"
-                )
+                # One (b_disc, x_disc) pair per discount tier.
+                for ti in range(len(_disc_tiers)):
+                    b_disc[iid, s_id, d, ti] = pulp.LpVariable(
+                        f"bdisc_{iid}_{s_id}_{d}_{ti}", cat="Binary"
+                    )
+                    x_disc[iid, s_id, d, ti] = pulp.LpVariable(
+                        f"xdisc_{iid}_{s_id}_{d}_{ti}", lowBound=0, cat="Continuous"
+                    )
 
     # Derived: actual quantity in base units delivered for (i, s, d)
     def _x(iid: int, s_id: int, d: int) -> Any:
@@ -1060,9 +1104,10 @@ def _solve_milp(
             disc_tiers = c.get("discount") or []
 
             # Pass-2 lever: penalises unreliable/long-lead suppliers proportionally
-            # to margin value.  lead_factor caps the lead penalty (floor at 0.5 for
-            # 1-day lead) so very-short leads don't become free passes.
-            lead_factor = min(lead, 2.0) / 2.0
+            # to margin value.  lead_factor is monotone in lead (floor 0.5 at
+            # lead=1) but soft-capped at lead=5 so it does not grow without bound
+            # while still separating a 2-day lead from a 4-day lead.
+            lead_factor = min(lead, 5.0) / 2.0
             exposure_coeff = margin_weight * (1.0 - reliability) * lead_factor
 
             ld = lead_ceil[s_id]
@@ -1074,12 +1119,15 @@ def _solve_milp(
                 # (1) Base item cost → real cash
                 cash_real_terms.append(p * x_var)
 
-                # (2) Per-item quantity-discount savings → real cash (negative)
-                if disc_tiers:
-                    tier = disc_tiers[0]
+                # (2) Per-item multi-tier quantity-discount savings → real cash (negative).
+                # Each tier t contributes its own per-unit saving on the qty routed
+                # through that tier (x_disc[...,t]); at most one tier is active.
+                for ti, tier in enumerate(disc_tiers):
                     disc_p = float(tier.get("unit_price") or p)
-                    if disc_p < p:
-                        cash_real_terms.append(-(p - disc_p) * x_disc.get((iid, s_id, d), 0.0))
+                    if disc_p < p and (iid, s_id, d, ti) in x_disc:
+                        cash_real_terms.append(
+                            -(p - disc_p) * x_disc[(iid, s_id, d, ti)]
+                        )
 
                 # (3) Exposure lever (used in pass-2 objective only)
                 if exposure_coeff > 0:
@@ -1142,11 +1190,18 @@ def _solve_milp(
                 vt = vol_tier.get((s_id, d, ti))
                 if vt is None:
                     continue
-                # Conservative rebate approximation (same as sourcing.py)
+                # Tier fires only when spend clears the threshold.
                 prob += ov >= threshold * vt, f"vol_tier_lb_{s_id}_{d}_{ti}"
                 prob += ov <= threshold + M_val * vt, f"vol_tier_ub_{s_id}_{d}_{ti}"
-                rebate = (disc_pct / 100.0) * threshold * vt
-                cash_real_terms.append(-rebate)
+                # Rebate on ACTUAL spend, not just the threshold: linearize
+                # z = ov * vt via the standard big-M product constraints.
+                z = pulp.LpVariable(
+                    f"volz_{s_id}_{d}_{ti}", lowBound=0, cat="Continuous"
+                )
+                prob += z <= ov, f"volz_le_ov_{s_id}_{d}_{ti}"
+                prob += z <= M_val * vt, f"volz_le_Mvt_{s_id}_{d}_{ti}"
+                prob += z >= ov - M_val * (1 - vt), f"volz_ge_{s_id}_{d}_{ti}"
+                cash_real_terms.append(-(disc_pct / 100.0) * z)
 
     # (8) Free-goods offers from active SupplierTerms.
     # For each offer, per eligible supplier-day, build a spend-threshold binary
@@ -1156,12 +1211,21 @@ def _solve_milp(
     #   (b) free_qty_g added to inbound supply on the delivery day — coverage benefit
     # Both only activate when the day's order value meets the spend threshold.
     _fg_gate: Dict[Tuple[int, int, int], Any] = {}  # (offer_idx, s_id, d) → Binary
+    # Nominal free-goods arrivals: (free_iid, service_day D) → list of (free_qty * gate).
+    _fg_arrivals: Dict[Tuple[int, int], list] = {}
+    # Delayed (+1 slip) free-goods arrivals for the robust delay scenario.
+    _fg_arrivals_delayed: Dict[Tuple[int, int], list] = {}
+    # Post-solve extraction metadata per gate: (offer_idx,s_id,d) → dict.
+    _fg_order_meta: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
     for _fgi, _fgo in enumerate(free_goods_offers):
         _fgs_id = int(_fgo.supplier_id)
         _fg_iid = int(_fgo.free_ingredient_id)
         _fg_qty = float(_fgo.free_qty_g)
         _fg_mov = float(_fgo.min_order_value)
         _fg_ref = float(ref_price.get(_fg_iid, 0.0))
+        _fg_shift = service_shift.get(_fgs_id, 0)
+        _fg_reliability = float(sup_by_id.get(_fgs_id, {}).get("reliability_score") or 1.0)
+        _fg_qualifying = _fg_reliability < robust_min_reliability
         ld = lead_ceil.get(_fgs_id, 1)
         for d in range(ld, n_days):
             if (_fgs_id, d) not in deliver:
@@ -1187,15 +1251,75 @@ def _solve_milp(
             # (a) Cost saving in objective
             if _fg_ref > 0:
                 cash_real_terms.append(-_fg_qty * _fg_ref * _fg_bin)
+            # (b) Supply benefit: physical delivery day d serves service day D=d+shift.
+            _fg_service_D = d + _fg_shift
+            if _fg_qty > 0 and _fg_service_D < n_days:
+                _fg_arrivals.setdefault((_fg_iid, _fg_service_D), []).append(
+                    _fg_qty * _fg_bin
+                )
+            # Delayed variant: qualifying (unreliable) suppliers slip +1 service day.
+            _fg_service_D_del = _fg_service_D + (1 if _fg_qualifying else 0)
+            if _fg_qty > 0 and _fg_service_D_del < n_days:
+                _fg_arrivals_delayed.setdefault((_fg_iid, _fg_service_D_del), []).append(
+                    _fg_qty * _fg_bin
+                )
+            # Record extraction metadata (used to emit a zero-price PlanOrder if fired).
+            _fg_order_meta[_fgi, _fgs_id, d] = {
+                "free_iid": _fg_iid,
+                "supplier_id": _fgs_id,
+                "delivery_day": d,
+                "qty": _fg_qty,
+            }
 
-    # (b) Free-goods supply benefit: inject into inbound_by_day so the demand-balance
-    # constraints see the extra stock.  We do this by adding a term to the existing
-    # inbound dict before finalizing — using the average of offer benefits per day.
-    # Since constraints are already built above the injection point for inbound, we
-    # instead capture this as a post-solve adjustment note on the rationale only;
-    # the cost saving (a) is enough for the optimizer to prefer the supplying day.
-    # TODO: for a full supply-side benefit, thread _fg_gate into the inventory balance
-    # constraints (requires restructuring the constraint loop; deferred to next pass).
+    def _fg_arr(iid: int, D: int) -> Any:
+        """Scalar free-goods arrival of ingredient iid on service day D."""
+        terms = _fg_arrivals.get((iid, D))
+        return pulp.lpSum(terms) if terms else 0.0
+
+    def _fg_arr_for_cohort(iid: int, D: int, e_cohort: int) -> Any:
+        """Free-goods arrival for cohort e_cohort only (perishable expiry-gated).
+
+        Returns _fg_arr(iid, D) when the arrival's expiry cohort matches
+        e_cohort, else 0.  Non-perishable → single cohort n_days.
+        """
+        exp_fn = exp_of_arrival.get(iid)
+        if exp_fn is None:
+            arr_e = n_days
+        else:
+            arr_e = exp_fn(D)
+        if arr_e == e_cohort:
+            return _fg_arr(iid, D)
+        return 0.0
+
+    def _fg_arr_delayed(iid: int, D: int) -> Any:
+        """Scalar delayed (+1 slip) free-goods arrival of iid on service day D."""
+        terms = _fg_arrivals_delayed.get((iid, D))
+        return pulp.lpSum(terms) if terms else 0.0
+
+    def _fg_arr_delayed_for_cohort(iid: int, D: int, e_cohort: int) -> Any:
+        """Delayed free-goods arrival for cohort e_cohort only.
+
+        Expiry is based on the *original* (pre-slip) service day, matching the
+        convention in _arrivals_delayed_for_cohort.
+        """
+        exp_fn = exp_of_arrival.get(iid)
+        terms = _fg_arrivals_delayed.get((iid, D))
+        if not terms:
+            return 0.0
+        # For qualifying suppliers the entry sits at D = orig_service + 1, so the
+        # original service day is D-1; for on-time suppliers it is D.  We cannot
+        # tell them apart per-term here, but non-perishable (exp_fn is None) is the
+        # only case R1 uses this for, where cohort is always n_days.
+        if exp_fn is None:
+            arr_e = n_days
+        else:
+            # Perishable: use D (arrivals on service day D expire at D+sl); the +1
+            # slip already lands the qty on day D, and the perishable rob branch
+            # keys cohorts by the delayed service day for consistency.
+            arr_e = exp_fn(D)
+        if arr_e == e_cohort:
+            return pulp.lpSum(terms)
+        return 0.0
 
     cash_real_expr = pulp.lpSum(cash_real_terms)
 
@@ -1230,7 +1354,7 @@ def _solve_milp(
                         if d == 0
                         else s_coh[iid, d - 1, e]
                     )
-                    arr = _arrivals_for_cohort(iid, d, e)
+                    arr = _arrivals_for_cohort(iid, d, e) + _fg_arr_for_cohort(iid, d, e)
                     prob += (
                         s_coh[iid, d, e] + cons_coh[iid, d, e] == prev_s + arr,
                         f"coh_bal_{iid}_{d}_{e}",
@@ -1277,7 +1401,8 @@ def _solve_milp(
 
                 prob += (
                     inv[iid, d]
-                    == prev + _arrivals(iid, d) - demand_d - waste[iid, d] + demand_short[iid, d],
+                    == prev + _arrivals(iid, d) + _fg_arr(iid, d)
+                    - demand_d - waste[iid, d] + demand_short[iid, d],
                     f"inv_bal_{iid}_{d}",
                 )
 
@@ -1327,7 +1452,9 @@ def _solve_milp(
             ov = pulp.lpSum(ov_terms)
             prob += ov >= mov * deliver[s_id, d], f"mov_{s_id}_{d}"
 
-    # Per-item quantity-discount constraints
+    # Per-item multi-tier quantity-discount constraints.
+    # For each (iid, s_id, d) at most one tier may fire (sum_t b_disc <= 1); the
+    # active tier requires its own min-qty threshold and caps the discounted qty.
     for iid in active_ids:
         for s_id in all_sup_ids:
             if (iid, s_id) not in cat_by_is:
@@ -1335,37 +1462,59 @@ def _solve_milp(
             c = cat_by_is[iid, s_id]
             disc_tiers = c.get("discount") or []
             ld = lead_ceil[s_id]
+            p_base = float(c.get("current_price") or 0.0)
             for d in range(ld, n_days):
                 if (iid, s_id, d) not in q:
                     continue
                 if not disc_tiers:
-                    prob += b_disc[iid, s_id, d] == 0, f"no_bdisc_{iid}_{s_id}_{d}"
-                    prob += x_disc[iid, s_id, d] == 0, f"no_xdisc_{iid}_{s_id}_{d}"
                     continue
-                p_base = float(c.get("current_price") or 0.0)
-                tier = disc_tiers[0]
-                disc_threshold = float(tier.get("min_qty") or 0.0)
-                disc_p = float(tier.get("unit_price") or p_base)
-                if disc_threshold > 0 and disc_p < p_base:
+                active_tiers = []
+                for ti, tier in enumerate(disc_tiers):
+                    disc_threshold = float(tier.get("min_qty") or 0.0)
+                    disc_p = float(tier.get("unit_price") or p_base)
+                    b_t = b_disc[iid, s_id, d, ti]
+                    x_t = x_disc[iid, s_id, d, ti]
+                    if disc_threshold > 0 and disc_p < p_base:
+                        prob += (
+                            _x(iid, s_id, d) >= disc_threshold * b_t,
+                            f"disc_thresh_{iid}_{s_id}_{d}_{ti}",
+                        )
+                        prob += x_t <= M * b_t, f"disc_cap_{iid}_{s_id}_{d}_{ti}"
+                        prob += x_t <= _x(iid, s_id, d), f"disc_le_x_{iid}_{s_id}_{d}_{ti}"
+                        active_tiers.append(b_t)
+                    else:
+                        # Non-beneficial / malformed tier — force off.
+                        prob += b_t == 0, f"no_bdisc_{iid}_{s_id}_{d}_{ti}"
+                        prob += x_t == 0, f"no_xdisc_{iid}_{s_id}_{d}_{ti}"
+                if active_tiers:
                     prob += (
-                        _x(iid, s_id, d) >= disc_threshold * b_disc[iid, s_id, d],
-                        f"disc_thresh_{iid}_{s_id}_{d}",
+                        pulp.lpSum(active_tiers) <= 1,
+                        f"disc_one_tier_{iid}_{s_id}_{d}",
                     )
-                    prob += x_disc[iid, s_id, d] <= M * b_disc[iid, s_id, d], \
-                        f"disc_cap_{iid}_{s_id}_{d}"
-                    prob += x_disc[iid, s_id, d] <= _x(iid, s_id, d), \
-                        f"disc_le_x_{iid}_{s_id}_{d}"
-                else:
-                    prob += b_disc[iid, s_id, d] == 0, f"no_bdisc2_{iid}_{s_id}_{d}"
-                    prob += x_disc[iid, s_id, d] == 0, f"no_xdisc2_{iid}_{s_id}_{d}"
 
     # ------------------------------------------------------------------
     # Pass 1 — cash-optimal solve
     # ------------------------------------------------------------------
-    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=30)
+    milp_time_limit = float(params.get("milp_time_limit", 30))
+    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=milp_time_limit)
+
+    def _has_usable_incumbent() -> bool:
+        """True when the current solve produced a usable plan (optimal, or a
+        time-limited feasible incumbent with every order var populated)."""
+        q_vals = [pulp.value(v) for v in q.values()]
+        usable = _incumbent_usable(prob.status, q_vals)
+        if usable and prob.status != 1:
+            logger.info(
+                "Time-phased MILP accepted a time-limited incumbent "
+                "(status=%d/%s, limit=%.0fs).",
+                prob.status, pulp.LpStatus.get(prob.status, "unknown"),
+                milp_time_limit,
+            )
+        return usable
+
     prob.solve(solver)
 
-    if prob.status != 1:
+    if not _has_usable_incumbent():
         status_name = pulp.LpStatus.get(prob.status, "unknown")
         logger.warning(
             "Time-phased MILP non-optimal (status=%d/%s); falling back to greedy.",
@@ -1375,6 +1524,100 @@ def _solve_milp(
 
     cash_optimal = float(pulp.value(cash_real_expr) or 0.0)
     logger.debug("Pass 1 (cash-optimal): C0 = %.4f", cash_optimal)
+
+    # ------------------------------------------------------------------
+    # Reusable delay-scenario balance (shared by pass-2 soft + pass-3 hard)
+    # ------------------------------------------------------------------
+    # Builds the +1-day-slip inventory balance and delay-scenario demand-coverage
+    # constraints for EVERY active ingredient (perishable cohort + non-perishable
+    # scalar), populating demand_short_rob[i,d].  It does NOT add the hard
+    # `demand_short_rob == 0` constraints — pass-2 minimises these shortfalls
+    # softly, pass-3 pins them to 0.  Idempotent: builds at most once.
+    rob_constraints_added: List[str] = []
+    _delay_built = {"done": False}
+
+    def _build_delay_balance() -> None:
+        nonlocal prob
+        if _delay_built["done"] or not _build_delay_vars:
+            return
+        _delay_built["done"] = True
+        for iid in active_ids:
+            ing_r = ing_by_id.get(iid, {})
+            _r_shelf = float(ing_r.get("shelf_life_days") or 0.0)
+            _r_per = bool(ing_r.get("perishable")) and _r_shelf > 0
+
+            if _r_per and iid in cohort_expiry:
+                for e in cohort_expiry[iid]:
+                    for d in range(min(e, n_days)):
+                        prev_s = (
+                            open_cohort[iid].get(e, 0.0)
+                            if d == 0
+                            else s_rob[iid, d - 1, e]
+                        )
+                        arr = (
+                            _arrivals_delayed_for_cohort(iid, d, e)
+                            + _fg_arr_delayed_for_cohort(iid, d, e)
+                        )
+                        cname = f"rob_coh_bal_{iid}_{d}_{e}"
+                        prob += (
+                            s_rob[iid, d, e] + cons_rob[iid, d, e] == prev_s + arr,
+                            cname,
+                        )
+                        rob_constraints_added.append(cname)
+                    if e < n_days:
+                        last_live = e - 1
+                        if last_live >= 0 and (iid, last_live, e) in s_rob:
+                            cname = f"rob_coh_waste_{iid}_{e}"
+                            prob += (
+                                waste_exp_rob[iid, e] == s_rob[iid, last_live, e],
+                                cname,
+                            )
+                            rob_constraints_added.append(cname)
+
+                for d in range(n_days):
+                    # NOTE: demand_short_rob is intentionally NOT coupled to
+                    # demand_short here.  This balance is shared by the pass-2
+                    # SOFT objective (minimise modelled delay shortfall) and the
+                    # pass-3 HARD requirement.  Bounding demand_short_rob <=
+                    # demand_short in the shared balance would force the solver to
+                    # sacrifice real NOMINAL coverage to relieve an unavoidable
+                    # +1-day slip (regression).  The "robust only where nominally
+                    # coverable" coupling is applied in pass-3 only (see below).
+                    cons_r_terms = [
+                        cons_rob[iid, d, e]
+                        for e in cohort_expiry[iid]
+                        if e > d and (iid, d, e) in cons_rob
+                    ]
+                    cname_c = f"rob_coh_dem_{iid}_{d}"
+                    demand_d = demand_by_day.get(iid, {}).get(d, 0.0)
+                    prob += (
+                        pulp.lpSum(cons_r_terms) + demand_short_rob[iid, d] == demand_d,
+                        cname_c,
+                    )
+                    rob_constraints_added.append(cname_c)
+
+            else:
+                # Non-perishable scalar robust balance (delayed arrivals, no waste).
+                for d in range(n_days):
+                    demand_d = demand_by_day.get(iid, {}).get(d, 0.0)
+                    prev = (
+                        float(initial_total.get(iid, 0.0))
+                        if d == 0
+                        else inv_rob[iid, d - 1]
+                    )
+                    delayed_arr = (
+                        _arrivals_delayed_for_cohort(iid, d, n_days)
+                        + _fg_arr_delayed(iid, d)
+                    )
+                    cname_bal = f"rob_np_bal_{iid}_{d}"
+                    prob += (
+                        inv_rob[iid, d]
+                        == prev + delayed_arr - demand_d + demand_short_rob[iid, d],
+                        cname_bal,
+                    )
+                    rob_constraints_added.append(cname_bal)
+                    # (No demand_short_rob <= demand_short coupling here — see the
+                    # note in the perishable branch above.  Applied in pass-3 only.)
 
     # ------------------------------------------------------------------
     # Pass 2 — buy down one-day-delay exposure within cash cap
@@ -1392,10 +1635,26 @@ def _solve_milp(
     if run_pass2:
         cash_cap = cash_optimal * (1.0 + reliability_cash_tolerance)
         prob += cash_real_expr <= cash_cap, "reliability_cash_cap"
-        # New objective: minimize margin-weighted exposure + penalties
-        prob += pulp.lpSum(exposure_terms + penalty_terms)
+        # R4: build the real delay-scenario balance once and add a SOFT
+        # margin-weighted delay-shortfall term to the pass-2 objective, so the
+        # solver actually buys down modelled +1-day-slip stockouts (not just the
+        # directional exposure lever) — all within the same 1% cash cap.
+        delay_short_terms: list = []
+        if _build_delay_vars:
+            _build_delay_balance()
+            for iid in active_ids:
+                _ing_m = float(margin_by_ing.get(iid, 0.0))
+                _mw = _ing_m if _ing_m > 0 else ref_price.get(iid, 0.0)
+                if _mw <= 0:
+                    _mw = 1.0  # ensure modelled delay shortfall is never free
+                for d in range(n_days):
+                    if (iid, d) in demand_short_rob:
+                        delay_short_terms.append(_mw * demand_short_rob[iid, d])
+        # New objective: minimize margin-weighted exposure + modelled delay
+        # shortfall + penalties.
+        prob += pulp.lpSum(exposure_terms + delay_short_terms + penalty_terms)
         prob.solve(solver)
-        if prob.status != 1:
+        if not _has_usable_incumbent():
             # Pass 2 infeasible / non-optimal: restore pass-1 result.
             logger.warning(
                 "Pass 2 (stress) non-optimal (status=%d); using pass-1 cash-optimal plan.",
@@ -1419,97 +1678,26 @@ def _solve_milp(
     if robust_hard_delay:
         robust_status = "skipped"
         try:
-            rob_constraints_added: List[str] = []
-
+            # Build the delay-scenario balance (shared with pass-2; no-op if
+            # already built) then pin the modelled delay shortfall to 0 — a true
+            # "no shortfall under a +1-day slip" requirement.  We use == 0 (not
+            # <= demand_short): the latter is satisfiable by RAISING demand_short
+            # (sacrificing nominal coverage) when a slip is unavoidable, whereas
+            # == 0 either holds with genuine robustness or is infeasible and falls
+            # back to the pass-2 plan below (which preserves nominal coverage).
+            _build_delay_balance()
+            rob_hard_added: List[str] = []
             for iid in active_ids:
-                ing_r = ing_by_id.get(iid, {})
-                _r_shelf = float(ing_r.get("shelf_life_days") or 0.0)
-                _r_per = bool(ing_r.get("perishable")) and _r_shelf > 0
+                for d in range(n_days):
+                    if (iid, d) not in demand_short_rob:
+                        continue
+                    cname_z = f"rob_zero_{iid}_{d}"
+                    prob += demand_short_rob[iid, d] == 0, cname_z
+                    rob_hard_added.append(cname_z)
 
-                if _r_per and iid in cohort_expiry:
-                    # Build delay-scenario cohort balance for perishables
-                    for e in cohort_expiry[iid]:
-                        for d in range(min(e, n_days)):
-                            prev_s = (
-                                open_cohort[iid].get(e, 0.0)
-                                if d == 0
-                                else s_rob[iid, d - 1, e]
-                            )
-                            arr = _arrivals_delayed_for_cohort(iid, d, e)
-                            cname = f"rob_coh_bal_{iid}_{d}_{e}"
-                            prob += (
-                                s_rob[iid, d, e] + cons_rob[iid, d, e] == prev_s + arr,
-                                cname,
-                            )
-                            rob_constraints_added.append(cname)
-                        if e < n_days:
-                            last_live = e - 1
-                            if last_live >= 0 and (iid, last_live, e) in s_rob:
-                                cname = f"rob_coh_waste_{iid}_{e}"
-                                prob += (
-                                    waste_exp_rob[iid, e] == s_rob[iid, last_live, e],
-                                    cname,
-                                )
-                                rob_constraints_added.append(cname)
-
-                    for d in range(n_days):
-                        # Bound demand_short_rob ≤ demand_short (protect coverable demand only)
-                        cname_b = f"rob_dsbound_{iid}_{d}"
-                        prob += demand_short_rob[iid, d] <= demand_short[iid, d], cname_b
-                        rob_constraints_added.append(cname_b)
-                        # Delay-scenario demand coverage
-                        cons_r_terms = [
-                            cons_rob[iid, d, e]
-                            for e in cohort_expiry[iid]
-                            if e > d and (iid, d, e) in cons_rob
-                        ]
-                        cname_c = f"rob_coh_dem_{iid}_{d}"
-                        demand_d = demand_by_day.get(iid, {}).get(d, 0.0)
-                        prob += (
-                            pulp.lpSum(cons_r_terms) + demand_short_rob[iid, d] == demand_d,
-                            cname_c,
-                        )
-                        rob_constraints_added.append(cname_c)
-                        # Hard: demand_short_rob must be 0 (robustness requirement)
-                        cname_z = f"rob_zero_{iid}_{d}"
-                        prob += demand_short_rob[iid, d] == 0, cname_z
-                        rob_constraints_added.append(cname_z)
-
-                else:
-                    # Non-perishable: simpler cumulative robustness check.
-                    # Under the delay scenario the only difference is qualifying
-                    # suppliers' arrivals shift +1 day.  Use a per-day balance
-                    # with the initial_total scalar (no expiry).
-                    _r_inv_prev: Any = float(initial_total.get(iid, 0.0))
-                    for d in range(n_days):
-                        # Build a "robust inv" expression: scalar constant updated day by day
-                        # can't be a variable here without a lot of extra vars, so we use
-                        # a simple cumulative-balance inequality per day.
-                        delay_arrivals: list = []
-                        for s_id_r in all_sup_ids:
-                            if (iid, s_id_r) not in cat_by_is:
-                                continue
-                            r_score = float(sup_by_id.get(s_id_r, {}).get("reliability_score") or 1.0)
-                            shift_r = service_shift.get(s_id_r, 0)
-                            if r_score < robust_min_reliability:
-                                phys_d_r = (d - 1) - shift_r  # slip +1
-                            else:
-                                phys_d_r = d - shift_r
-                            if phys_d_r >= 0 and (iid, s_id_r, phys_d_r) in q:
-                                delay_arrivals.append(_x(iid, s_id_r, phys_d_r))
-                        # Inbound delayed
-                        inb_delayed_np = inbound_by_day.get(iid, {}).get(d - 1, 0.0) if d >= 1 else 0.0
-                        delay_arr_expr = pulp.lpSum(delay_arrivals) + inb_delayed_np
-                        cname_b = f"rob_np_dsbound_{iid}_{d}"
-                        prob += demand_short_rob[iid, d] <= demand_short[iid, d], cname_b
-                        rob_constraints_added.append(cname_b)
-                        cname_z = f"rob_np_zero_{iid}_{d}"
-                        prob += demand_short_rob[iid, d] == 0, cname_z
-                        rob_constraints_added.append(cname_z)
-
-            # Re-solve with robust constraints
+            # Re-solve with robust hard constraints
             prob.solve(solver)
-            if prob.status == 1:
+            if _has_usable_incumbent():
                 robust_applied = True
                 robust_status = "applied"
                 logger.info("Pass 3 (robust hard delay): plan satisfies 1-day-delay coverage.")
@@ -1519,8 +1707,9 @@ def _solve_milp(
                     "falling back to pass-2 plan.",
                     prob.status,
                 )
-                # Remove robust constraints and restore previous solution
-                for cname in rob_constraints_added:
+                # Remove only the hard ==0 constraints and restore previous solution;
+                # the soft delay balance (shared with pass-2) stays in place.
+                for cname in rob_hard_added:
                     prob.constraints.pop(cname, None)
                 prob.solve(solver)
                 robust_applied = False
@@ -1591,6 +1780,32 @@ def _solve_milp(
                 ))
                 total_cost += qty * p
                 ordered_ings.add(iid)
+
+    # ------------------------------------------------------------------
+    # Free-goods: emit a zero-price PlanOrder for each fired gate so the
+    # downstream FEFO validator (which knows nothing about free goods) sees the
+    # extra supply the MILP used for coverage and does not flip coverage_ok.
+    # ------------------------------------------------------------------
+    for _fg_key, _fg_meta in _fg_order_meta.items():
+        _fg_bin_v = _fg_gate.get(_fg_key)
+        if _fg_bin_v is None:
+            continue
+        _bv = pulp.value(_fg_bin_v)
+        if _bv is None or _bv <= 0.5:
+            continue
+        _free_iid = int(_fg_meta["free_iid"])
+        _fg_ing = ing_by_id.get(_free_iid, {})
+        _fg_unit = _fg_ing.get("base_unit", "g")
+        orders.append(PlanOrder(
+            ingredient_id=_free_iid,
+            supplier_id=int(_fg_meta["supplier_id"]),
+            delivery_day=int(_fg_meta["delivery_day"]),
+            qty=float(_fg_meta["qty"]),
+            unit_price=0.0,
+            unit=_fg_unit,
+            reason="free-goods benefit",
+        ))
+        ordered_ings.add(_free_iid)
 
     # ------------------------------------------------------------------
     # Per-line risk detail — replace blanket at_risk with shortage-based flag

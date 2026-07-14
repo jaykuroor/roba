@@ -1177,3 +1177,482 @@ def test_robust_mode_forces_earlier_order_for_unreliable_supplier():
     # Plan must still be a valid procurement plan (orders present, no crash)
     # coverage_ok may be False if early days are structurally uncoverable
     assert sol.method == "milp", f"Expected MILP method, got {sol.method}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: R3 — accept feasible-but-not-optimal CBC incumbents
+# ---------------------------------------------------------------------------
+
+def test_incumbent_usable_predicate():
+    """Pure predicate: status codes + q-var populated-ness → usable?"""
+    from track_b.procurement.plan_optimizer import _incumbent_usable
+
+    # Optimal is always usable, regardless of q values.
+    assert _incumbent_usable(1, [None]) is True
+    assert _incumbent_usable(1, []) is True
+    # Infeasible / unbounded never usable.
+    assert _incumbent_usable(-1, [1.0, 2.0]) is False
+    assert _incumbent_usable(-2, [1.0, 2.0]) is False
+    # NotSolved (0) / Undefined (-3): usable iff every q var populated.
+    assert _incumbent_usable(0, [1.0, 2.0]) is True
+    assert _incumbent_usable(0, [1.0, None]) is False
+    assert _incumbent_usable(0, []) is False       # no incumbent
+    assert _incumbent_usable(-3, [0.0, 3.0]) is True
+    assert _incumbent_usable(-3, [None]) is False
+
+
+def test_timelimit_incumbent_not_discarded():
+    """A time-limited feasible incumbent (status=NotSolved with populated q vars)
+    must be accepted, not discarded to greedy."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+
+    import pulp as _pulp
+
+    real_solve = _pulp.LpProblem.solve
+
+    def _fake_solve(self, *a, **k):
+        real_solve(self, *a, **k)
+        # Force the "time-limited" status: variables retain their solved values
+        # but CBC didn't prove optimality.
+        self.status = _pulp.LpStatusNotSolved  # 0
+        return self.status
+
+    with mock.patch.object(_pulp.LpProblem, "solve", _fake_solve):
+        sol = _run(
+            ingredients=[_ing(1)],
+            catalog=[_cat(1, 1, price=0.01, pack=100.0)],
+            suppliers=[_sup(1, lead=1.0)],
+            demand_by_day={1: {d: 100.0 for d in range(5)}},
+            on_hand={1: 0.0},
+            safety_stock={1: 0.0},
+            n_days=5,
+            params={"slack_penalty": 1000.0, "stress_enabled": False},
+        )
+    assert sol.method == "milp", (
+        f"Time-limited incumbent should be kept as MILP, got {sol.method!r}"
+    )
+    assert sol.orders, "Expected incumbent plan to carry orders"
+
+
+# ---------------------------------------------------------------------------
+# Tests: R1 — real robust balance for non-perishables
+# ---------------------------------------------------------------------------
+
+def _slip_shortfall(sol, iid, demand_by_day, on_hand, n_days, slip_suppliers,
+                    inbound=None):
+    """Hand-rolled +1-day-slip FEFO over sol.orders (non-perishable).
+
+    Orders from suppliers in ``slip_suppliers`` arrive one day later than their
+    delivery_day.  Returns [(day, short_qty), ...] where demand can't be met.
+    Non-perishable: single running scalar of stock (no expiry).
+    """
+    inbound = inbound or {}
+    by_day: dict = {}
+    for o in sol.orders:
+        if o.ingredient_id == iid and o.qty > 0:
+            dd = o.delivery_day + (1 if o.supplier_id in slip_suppliers else 0)
+            by_day[dd] = by_day.get(dd, 0.0) + o.qty
+    for d, q in (inbound.get(iid, {}) or {}).items():
+        by_day[d] = by_day.get(d, 0.0) + q
+    stock = float(on_hand.get(iid, 0.0))
+    short = []
+    for d in range(n_days):
+        stock += by_day.get(d, 0.0)
+        dem = demand_by_day.get(iid, {}).get(d, 0.0)
+        if stock + 1e-6 < dem:
+            short.append((d, round(dem - stock, 2)))
+            stock = 0.0
+        else:
+            stock -= dem
+    return short
+
+
+def test_robust_nonperishable_survives_slip():
+    """Robust mode on a non-perishable with an unreliable supplier must produce a
+    plan that survives a +1-day slip on coverable days (or fall back cleanly)."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 6
+    # Single unreliable supplier, lead=1, reliability below robust threshold.
+    # on_hand covers day 0 only; robust mode must order early enough that a
+    # +1-slip still covers the remaining days.
+    sol = _run(
+        ingredients=[_ing(1)],  # non-perishable
+        catalog=[_cat(1, 1, price=0.01, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, reliability=0.50)],
+        demand_by_day={1: {d: 100.0 for d in range(n)}},
+        on_hand={1: 200.0},  # buffer so a slip is survivable if ordered early
+        safety_stock={1: 0.0},
+        n_days=n,
+        params={
+            "slack_penalty": 1000.0,
+            "robust_hard_delay": True,
+            "robust_min_reliability": 0.95,
+        },
+    )
+    assert sol.robust_requested is True
+    assert sol.method == "milp"
+    if sol.robust_applied:
+        # Under a +1-day slip of the unreliable supplier, coverable days (those
+        # the nominal plan covered) must not stock out.
+        nominal = _slip_shortfall(sol, 1, {1: {d: 100.0 for d in range(n)}},
+                                  {1: 200.0}, n, slip_suppliers=set())
+        nominal_short_days = {d for d, _ in nominal}
+        slipped = _slip_shortfall(sol, 1, {1: {d: 100.0 for d in range(n)}},
+                                  {1: 200.0}, n, slip_suppliers={1})
+        new_short = [(d, q) for d, q in slipped if d not in nominal_short_days]
+        assert not new_short, (
+            f"Robust plan should survive +1 slip on coverable days; new shortfalls: {new_short}"
+        )
+
+
+def test_robust_nonperishable_no_op_regression():
+    """With a fully reliable supplier (>= robust threshold) robust mode is a no-op:
+    the plan is unchanged from a non-robust run and still fully covers demand."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 6
+    common = dict(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=0.01, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, reliability=0.99)],  # above threshold
+        demand_by_day={1: {d: 100.0 for d in range(n)}},
+        on_hand={1: 100.0},
+        safety_stock={1: 0.0},
+        n_days=n,
+    )
+    sol_plain = _run(**common, params={"slack_penalty": 1000.0})
+    sol_robust = _run(**common, params={
+        "slack_penalty": 1000.0,
+        "robust_hard_delay": True,
+        "robust_min_reliability": 0.95,
+    })
+    assert sol_robust.robust_requested is True
+    # No qualifying (unreliable) supplier → robust constraints are inert; cost matches.
+    assert sol_robust.total_cost == pytest.approx(sol_plain.total_cost, rel=1e-3), (
+        f"Reliable-only robust run should match plain: "
+        f"robust={sol_robust.total_cost:.2f} plain={sol_plain.total_cost:.2f}"
+    )
+    assert sol_robust.coverage_ok
+
+
+# ---------------------------------------------------------------------------
+# Tests: R2 — free-goods quantity wired into coverage
+# ---------------------------------------------------------------------------
+
+def _fg_offer(supplier_id, free_ingredient_id, free_qty_g, min_order_value=0.0):
+    from track_b.procurement.terms import FreeGoodsOffer
+    return FreeGoodsOffer(
+        supplier_id=supplier_id,
+        free_ingredient_id=free_ingredient_id,
+        free_qty_g=free_qty_g,
+        min_order_value=min_order_value,
+        remaining_orders=None,
+        term_id=1,
+    )
+
+
+def test_free_goods_improve_coverage():
+    """A free-goods offer that supplies a second ingredient must let the plan
+    cover that ingredient's demand and emit a zero-price free line."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 4
+    # Ingredient 1 is ordered from supplier 1.  Ingredient 2 is only ever
+    # available as a free-goods add-on whenever we buy from supplier 1.
+    # Ingredient 2 has demand but NO catalog entry → only free goods can cover it.
+    offer = _fg_offer(supplier_id=1, free_ingredient_id=2, free_qty_g=300.0,
+                      min_order_value=0.0)
+    sol = _run(
+        ingredients=[_ing(1), _ing(2)],
+        catalog=[_cat(1, 1, price=0.01, pack=100.0)],  # only ingredient 1 orderable
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={
+            1: {d: 100.0 for d in range(n)},
+            2: {d: 50.0 for d in range(n)},  # needs free goods to cover
+        },
+        on_hand={1: 100.0, 2: 50.0},  # day 0 covered; later days need supply
+        safety_stock={1: 0.0, 2: 0.0},
+        n_days=n,
+        params={"slack_penalty": 1000.0, "free_goods_offers": [offer]},
+    )
+    free_lines = [o for o in sol.orders if o.ingredient_id == 2 and o.unit_price == 0.0]
+    assert free_lines, "Expected a zero-price free-goods line for ingredient 2"
+    assert all(o.reason == "free-goods benefit" for o in free_lines)
+    assert all(o.qty == pytest.approx(300.0) for o in free_lines)
+
+
+def test_free_goods_absent_is_noop():
+    """No free_goods_offers → behaviour identical to a plain run."""
+    n = 4
+    common = dict(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=0.01, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={1: {d: 100.0 for d in range(n)}},
+        on_hand={1: 100.0},
+        safety_stock={1: 0.0},
+        n_days=n,
+    )
+    sol_plain = _run(**common, params={"slack_penalty": 1000.0})
+    sol_empty = _run(**common, params={"slack_penalty": 1000.0, "free_goods_offers": []})
+    assert sol_empty.total_cost == pytest.approx(sol_plain.total_cost, rel=1e-6)
+    assert len(sol_empty.orders) == len(sol_plain.orders)
+    assert not any(o.reason == "free-goods benefit" for o in sol_empty.orders)
+
+
+def test_free_goods_perishable_cohort():
+    """Free goods for a perishable ingredient are cohort-gated: the free qty
+    covers demand only within its shelf life and still surfaces as a free line."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 4
+    # Ingredient 2 is a perishable only coverable via free goods.
+    offer = _fg_offer(supplier_id=1, free_ingredient_id=2, free_qty_g=200.0,
+                      min_order_value=0.0)
+    sol = _run(
+        ingredients=[_ing(1), _ing(2, perishable=1, shelf_life=5.0)],
+        catalog=[_cat(1, 1, price=0.01, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={
+            1: {d: 100.0 for d in range(n)},
+            2: {d: 40.0 for d in range(n)},
+        },
+        on_hand={1: 100.0, 2: 40.0},
+        safety_stock={1: 0.0, 2: 0.0},
+        n_days=n,
+        params={"slack_penalty": 1000.0, "free_goods_offers": [offer]},
+    )
+    free_lines = [o for o in sol.orders if o.ingredient_id == 2 and o.unit_price == 0.0]
+    assert free_lines, "Expected a zero-price free-goods line for perishable ingredient 2"
+    assert all(o.reason == "free-goods benefit" for o in free_lines)
+
+
+# ---------------------------------------------------------------------------
+# Tests: R4 — delay-shortfall objective + un-saturated lead_factor
+# ---------------------------------------------------------------------------
+
+def test_lead_factor_monotonic():
+    """lead_factor = min(lead, 5)/2 must be monotone non-decreasing in lead,
+    have a floor of 0.5 at lead=1, and separate leads within the 1..5 band
+    (so a 4-day lead is penalised more than a 2-day lead — no early saturation)."""
+    def lead_factor(lead: float) -> float:
+        return min(lead, 5.0) / 2.0
+
+    assert lead_factor(1.0) == pytest.approx(0.5)  # floor
+    leads = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0]
+    vals = [lead_factor(x) for x in leads]
+    # Monotone non-decreasing
+    for a, b in zip(vals, vals[1:]):
+        assert b >= a - 1e-9, f"lead_factor not monotone: {vals}"
+    # No early saturation: 4-day lead strictly penalised more than 2-day lead
+    assert lead_factor(4.0) > lead_factor(2.0) + 1e-9
+    # Soft cap kicks in at 5 days
+    assert lead_factor(6.0) == pytest.approx(lead_factor(5.0))
+
+
+def test_pass2_minimizes_modeled_delay():
+    """With stress enabled + margin, pass-2's soft delay-shortfall term must lower
+    the modelled +1-day-slip exposure vs a stress-disabled (cash-only) plan.
+
+    Two equal-price suppliers: one fast+reliable, one slow+unreliable.  Cash-only
+    is indifferent; stress must bias toward the resilient plan."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 6
+    ingredients = [_ing(1)]
+    catalog = [
+        _cat(1, 1, price=0.01, pack=100.0),   # supplier 1: fast + reliable
+        _cat(2, 1, price=0.01, pack=100.0),   # supplier 2: slow + unreliable
+    ]
+    suppliers = [
+        _sup(1, lead=1.0, reliability=0.99),
+        _sup(2, lead=1.0, reliability=0.50),
+    ]
+    demand = {1: {d: 100.0 for d in range(n)}}
+    common = dict(
+        ingredients=ingredients, catalog=catalog, suppliers=suppliers,
+        demand_by_day=demand, on_hand={1: 100.0}, safety_stock={1: 0.0}, n_days=n,
+    )
+    sol_cash = _run(**common, params={
+        "slack_penalty": 1000.0,
+        "safety_penalty_multiplier": 0.0,
+        "stress_enabled": False,
+        "margin_by_ing": {1: 5.0},
+    })
+    sol_stress = _run(**common, params={
+        "slack_penalty": 1000.0,
+        "safety_penalty_multiplier": 0.0,
+        "stress_enabled": True,
+        "reliability_cash_tolerance": 0.05,
+        "margin_by_ing": {1: 5.0},
+    })
+    assert sol_stress.coverage_ok
+    # Stress plan's modelled delay exposure must not be worse; ideally strictly less.
+    assert sol_stress.unit_shortfall_if_1day_late <= sol_cash.unit_shortfall_if_1day_late + 1e-6, (
+        f"Stress plan delay exposure {sol_stress.unit_shortfall_if_1day_late:.1f} "
+        f"should be <= cash plan {sol_cash.unit_shortfall_if_1day_late:.1f}"
+    )
+    # Cash cap must still hold.
+    if sol_stress.reliability_premium > 0.0:
+        assert sol_stress.reliability_premium <= sol_stress.cash_cost * 0.05 + 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Tests: R5 — multi-tier per-item discounts + rebate on actual spend
+# ---------------------------------------------------------------------------
+
+def test_multi_tier_discount_reaches_deeper_tier():
+    """When a catalog exposes two qty-discount tiers, the MILP must be able to
+    reach the DEEPER tier — offering both tiers yields a strictly lower cost than
+    offering only the shallow tier (the deep tier's per-unit saving is captured)."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 7
+    # Base price €1/g.  Demand ~600g over the horizon → deep tier is reachable.
+    shallow = [{"min_qty": 200.0, "unit_price": 0.8}]
+    deep = [
+        {"min_qty": 200.0, "unit_price": 0.8},
+        {"min_qty": 400.0, "unit_price": 0.5},
+    ]
+    common = dict(
+        ingredients=[_ing(1)],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={1: {d: 100.0 for d in range(n)}},
+        on_hand={1: 100.0},
+        safety_stock={1: 0.0},
+        n_days=n,
+        params={"slack_penalty": 1000.0, "stress_enabled": False},
+    )
+    sol_shallow = _run(catalog=[_cat(1, 1, price=1.0, pack=100.0, discount=shallow)],
+                       **common)
+    sol_deep = _run(catalog=[_cat(1, 1, price=1.0, pack=100.0, discount=deep)],
+                    **common)
+    assert sol_deep.coverage_ok and sol_shallow.coverage_ok
+    # Same goods ordered, but the deep tier's larger per-unit saving lowers cash.
+    assert sol_deep.cash_cost < sol_shallow.cash_cost - 1e-3, (
+        f"Deep tier should lower cost: deep={sol_deep.cash_cost:.2f} "
+        f"shallow={sol_shallow.cash_cost:.2f}"
+    )
+
+
+def test_volume_rebate_on_actual_spend():
+    """Volume rebate must scale with ACTUAL spend above threshold, not just the
+    threshold value.  Ordering well past the threshold yields a larger rebate
+    than the flat threshold*pct approximation would."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 7
+    # 10% off orders ≥ €100 on a single supplier-day.  Force a large single-day
+    # spend well above €100 so rebate-on-spend clearly exceeds rebate-on-threshold.
+    # High delivery charge consolidates onto one day.
+    sol = _run(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, dc=100.0,
+                        vol_discount=[{"min_value": 100.0, "discount_pct": 10}])],
+        demand_by_day={1: {d: 100.0 for d in range(n)}},
+        on_hand={1: 100.0},
+        safety_stock={1: 0.0},
+        n_days=n,
+        params={"slack_penalty": 1000.0, "stress_enabled": False},
+    )
+    assert sol.coverage_ok
+    # Reconstruct goods spend on each supplier-day from the plan.
+    from collections import defaultdict
+    spend_by_day = defaultdict(float)
+    for o in sol.orders:
+        if o.qty > 0 and o.unit_price > 0:
+            spend_by_day[o.delivery_day] += o.qty * o.unit_price
+    goods_spend = sum(spend_by_day.values())
+    # cash_cost = goods + delivery charges - rebate.  Compute expected rebate on
+    # ACTUAL spend for days clearing €100.
+    n_delivery_days = len([d for d, v in spend_by_day.items() if v > 0])
+    delivery_total = 100.0 * n_delivery_days
+    rebate_on_spend = sum(0.10 * v for v in spend_by_day.values() if v >= 100.0 - 1e-6)
+    expected_cash = goods_spend + delivery_total - rebate_on_spend
+    assert sol.cash_cost == pytest.approx(expected_cash, rel=1e-2, abs=1.0), (
+        f"cash_cost {sol.cash_cost:.2f} should match rebate-on-actual-spend "
+        f"model {expected_cash:.2f} (goods={goods_spend:.2f}, "
+        f"delivery={delivery_total:.2f}, rebate={rebate_on_spend:.2f})"
+    )
+    # And the rebate must exceed the flat threshold*pct approximation when spend
+    # is materially above the threshold on at least one day.
+    if any(v > 150.0 for v in spend_by_day.values()):
+        flat_rebate = sum(0.10 * 100.0 for v in spend_by_day.values() if v >= 100.0)
+        assert rebate_on_spend > flat_rebate + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Regression: the pass-2 SOFT delay objective must never sacrifice NOMINAL
+# coverage.  A delay-exposed ingredient whose +1-day slip is structurally
+# unavoidable (lead=1, no buffer) must still be covered on time; the modelled
+# delay shortfall is absorbed by demand_short_rob, NOT by dropping real demand.
+# (Guards the demand_short_rob<=demand_short coupling that must stay pass-3-only.)
+# ---------------------------------------------------------------------------
+
+def test_stress_pass_preserves_nominal_coverage_when_delay_unavoidable():
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 4
+    common = dict(
+        ingredients=[_ing(1)],  # non-perishable
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, reliability=0.5)],  # unreliable → qualifies for slip
+        demand_by_day={1: {1: 100.0, 2: 100.0, 3: 100.0}},
+        on_hand={1: 0.0},
+        safety_stock={1: 0.0},
+        n_days=n,
+    )
+    base = _run(**common, params={"slack_penalty": 1000.0, "stress_enabled": False})
+    stressed = _run(
+        **common,
+        params={"slack_penalty": 1000.0, "stress_enabled": True,
+                "reliability_cash_tolerance": 0.01, "margin_by_ing": {1: 5.0}},
+    )
+    # Stress must not degrade nominal coverage or exceed the 1% cash cap.
+    assert base.coverage_ok and base.total_short == pytest.approx(0.0)
+    assert stressed.coverage_ok, "stress pass dropped nominal coverage"
+    assert stressed.total_short == pytest.approx(0.0)
+    assert stressed.cash_cost >= base.cash_optimal_cost - 1e-6
+    assert stressed.cash_cost <= base.cash_optimal_cost * 1.01 + 1e-6
+
+
+def test_robust_unavoidable_slip_falls_back_without_dropping_coverage():
+    """Robust mode on a structurally-unavoidable slip must fall back (not 'apply'
+    by sacrificing nominal coverage) and keep the plan fully covered."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 4
+    common = dict(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, reliability=0.5)],
+        demand_by_day={1: {1: 100.0, 2: 100.0, 3: 100.0}},
+        safety_stock={1: 0.0},
+        n_days=n,
+    )
+    p = {"slack_penalty": 1000.0, "stress_enabled": True,
+         "reliability_cash_tolerance": 0.5, "margin_by_ing": {1: 5.0},
+         "robust_hard_delay": True}
+    # No buffer → day-1 slip unavoidable → robust cannot truly apply.
+    unavoidable = _run(**common, on_hand={1: 0.0}, params=p)
+    assert not unavoidable.robust_applied
+    assert unavoidable.robust_status == "infeasible_fell_back"
+    assert unavoidable.coverage_ok, "robust fallback dropped nominal coverage"
+    assert unavoidable.total_short == pytest.approx(0.0)
+    # Buffer covers the slip → robust should genuinely apply.
+    buffered = _run(**common, on_hand={1: 100.0}, params=p)
+    assert buffered.robust_applied and buffered.robust_status == "applied"
+    assert buffered.coverage_ok

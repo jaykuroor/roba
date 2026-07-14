@@ -1693,6 +1693,18 @@ class InventoryOptimizer(BaseAgent):
         forecast_target = demand_lead + safety_stock - on_hand
         needed = max(par_level - on_hand, forecast_target)
 
+        # Urgency for the Ordered-section label.  A healthy just-in-time reorder
+        # (triggered at the reorder point, where on-hand still covers demand over
+        # the lead time) is NOT flagged.  But an emergency reorder — current stock
+        # can't cover demand until this delivery lands (e.g. stock was run to zero)
+        # — is a real coverage gap for the lead-time window, so we mark the PO
+        # at_risk and the UI badges it "Late".
+        _reorder_urgency: Optional[str] = (
+            "at_risk"
+            if (on_hand < demand_lead or (on_hand <= 0 and par_level > 0))
+            else None
+        )
+
         # Ceiling: for perishables, never order more than can be sold before expiry
         # (avoids wastage).  Skip ceiling when no horizon is live (demand_before_expiry→0
         # → ceiling doesn't bind because forecast_target also→0).
@@ -1723,6 +1735,7 @@ class InventoryOptimizer(BaseAgent):
                 }
             ],
             created_by=self.name,
+            urgency=_reorder_urgency,
         )
 
     # -- recipe / yield helpers (mirrors ledger pattern; core.models only, no track_a import) -----

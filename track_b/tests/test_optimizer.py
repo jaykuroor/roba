@@ -26,8 +26,11 @@ class _FakeProcurement:
     def __init__(self):
         self.calls = []
 
-    def create_po(self, supplier_id, lines, created_by="optimizer"):
-        self.calls.append({"supplier_id": supplier_id, "lines": lines, "created_by": created_by})
+    def create_po(self, supplier_id, lines, created_by="optimizer", urgency=None):
+        self.calls.append({
+            "supplier_id": supplier_id, "lines": lines,
+            "created_by": created_by, "urgency": urgency,
+        })
 
 
 class _FakeApprovals:
@@ -118,6 +121,30 @@ def test_reorder_chooses_supplier_and_rounds_to_pack_size(optimizer_with_fakes, 
     assert call["supplier_id"] == pricey_id
     # needed = 240 - 50 = 190, rounded up to pack_size 50 -> 200
     assert call["lines"][0]["qty"] == pytest.approx(200.0)
+
+
+def test_emergency_reorder_flagged_at_risk_healthy_reorder_not(optimizer_with_fakes, session_factory):
+    """A reorder from emptied stock (can't cover demand until the delivery lands)
+    is flagged urgency=at_risk so the Ordered section badges the PO 'Late'.  A
+    healthy just-in-time reorder at the reorder point (stock still covers the
+    lead time) is NOT flagged."""
+    opt, procurement, _ = optimizer_with_fakes
+
+    # Emptied stock (on_hand 0, par set) -> emergency -> at_risk.
+    empty_id = _seed_ingredient_and_level(session_factory, on_hand=0.0, reorder_point=100.0, par=240.0)
+    _seed_two_suppliers(session_factory, empty_id)
+    opt._maybe_reorder(empty_id)
+    assert len(procurement.calls) == 1
+    assert procurement.calls[0]["urgency"] == "at_risk"
+
+    # Healthy reorder (on_hand > 0, no live horizon so lead-time demand is 0) ->
+    # not an emergency -> unlabelled.
+    procurement.calls.clear()
+    ok_id = _seed_ingredient_and_level(session_factory, on_hand=50.0, reorder_point=100.0, par=240.0)
+    _seed_two_suppliers(session_factory, ok_id)
+    opt._maybe_reorder(ok_id)
+    assert len(procurement.calls) == 1
+    assert procurement.calls[0]["urgency"] is None
 
 
 def test_reorder_skipped_when_above_reorder_point(optimizer_with_fakes, session_factory):

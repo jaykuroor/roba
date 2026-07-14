@@ -1578,6 +1578,79 @@ def track_a_forecast_horizon(body: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+@app.get("/api/track-a/forecast/today-breakdown")
+def track_a_today_breakdown(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Reconcile TODAY's forecast for display: full_day = already_sold + remaining.
+
+    The weekly forecast table's "Today" rows show the *remaining* forecast for
+    the rest of the day (the horizon is generated with the interval clamped to
+    ``now``), while inventory has already had the day's completed sales deducted.
+    This endpoint returns the three numbers that must reconcile so the UI / Copy
+    State export can show them side-by-side, all in menu-item units:
+
+        remaining  = sum of the LATEST persisted horizon's day-0 lines — i.e. the
+                     exact figure the item rows display and the planner uses.
+        sold_today = menu-item units already sold since the day opened.
+        full_day   = sold_today + remaining.
+
+    Deriving ``remaining`` from the same persisted horizon the UI renders (rather
+    than a fresh, differently-timed forecast) guarantees the identity
+    ``full_day - sold_today == remaining == sum(item rows)`` holds — otherwise the
+    header total, item totals and already-sold figures disagree.
+    """
+    from .clock import (  # noqa: PLC0415
+        SECONDS_PER_DAY as _SPD,
+        DAY_OPEN_OFFSET as _OPEN,
+        DAY_CLOSE_OFFSET as _CLOSE,
+    )
+    _sync_bus_to_clock()
+    now = float(ctx.bus.sim_time)
+    day_num = int(now // _SPD)
+    day_open = day_num * _SPD + _OPEN
+    day_close = day_num * _SPD + _CLOSE
+
+    # Already-sold today (aggregate menu-item units) since the day opened.
+    sold_today = float(
+        db_session.query(func.coalesce(func.sum(models.OrderLine.qty), 0.0))
+        .filter(
+            models.OrderLine.sim_time >= day_open,
+            models.OrderLine.sim_time <= now,
+            models.OrderLine.status == "sold",
+        )
+        .scalar()
+        or 0.0
+    )
+
+    # Remaining = sum of the LATEST persisted horizon's day-0 lines.  This is the
+    # very figure the UI's "Today" rows display, so the breakdown reconciles with
+    # them by construction.
+    remaining = 0.0
+    latest = (
+        db_session.query(models.HorizonForecast)
+        .order_by(models.HorizonForecast.generated_at.desc())
+        .first()
+    )
+    if latest is not None:
+        remaining = float(
+            db_session.query(func.coalesce(func.sum(models.HorizonForecastLine.qty), 0.0))
+            .filter(
+                models.HorizonForecastLine.horizon_id == latest.id,
+                models.HorizonForecastLine.day_index == 0,
+            )
+            .scalar()
+            or 0.0
+        )
+
+    return {
+        "generated_at": now,
+        "day_open": day_open,
+        "day_close": day_close,
+        "sold_today": sold_today,
+        "remaining": remaining,
+        "full_day": sold_today + remaining,
+    }
+
+
 @app.get("/api/track-a/forecast/horizons")
 def track_a_list_horizons(limit: int = 20, db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
     """List recent HorizonForecast headers."""
@@ -2871,6 +2944,9 @@ def get_procurement_plan(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]
             "unit_price": o.unit_price,
             "order_date": o.order_date,
             "order_date_label": order_label,
+            # Same overdue flag that drives the order_date label — reused so the
+            # per-line "Expedite" badge cannot disagree with the label.
+            "order_overdue": _is_overdue,
             "delivery_date": o.delivery_date,
             "delivery_date_label": _day_time_label(float(o.delivery_date or 0.0)),
             "covers_from": o.covers_from,

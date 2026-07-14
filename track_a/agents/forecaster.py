@@ -972,6 +972,7 @@ class DemandForecaster(BaseAgent):
         requested_by: str = "system",
         source: str = "system",
         include_item_ids: Optional[Iterable[int]] = None,
+        emit_horizon: bool = False,
     ) -> Dict[str, Any]:
         """Forecast demand for any interval [start, end) in sim-seconds.
 
@@ -1226,8 +1227,14 @@ class DemandForecaster(BaseAgent):
             finally:
                 session2.close()
 
-        # Emit the horizon signal for the optimizer
-        if by_day_out:
+        # Emit the horizon signal for the optimizer.
+        # ONLY the procurement rolling-horizon emitter (emit_rolling_horizon,
+        # emit_horizon=True) may publish DEMAND_FORECAST_HORIZON.  Narrow-window
+        # callers (dashboard day/custom forecasts, voice queries, the today-
+        # breakdown endpoint) must NOT emit — otherwise their 1-day forecast
+        # clobbers the 7-day procurement horizon on the bus and the plan optimises
+        # against a partial demand map (phantom shortfalls).
+        if by_day_out and emit_horizon:
             self._emit_horizon_signal(
                 by_day_out=by_day_out,
                 item_daily_baseline_median=item_daily_baseline_median,
@@ -1273,6 +1280,7 @@ class DemandForecaster(BaseAgent):
                 persist=True,        # B2: persist every roll; UI reads latest
                 requested_by="system",
                 source="horizon_emit",
+                emit_horizon=True,   # the ONLY authorized DEMAND_FORECAST_HORIZON emitter
             )
             self._prune_horizon_emits(keep=50)
         except Exception:  # noqa: BLE001 — non-critical path

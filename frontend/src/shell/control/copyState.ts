@@ -71,11 +71,19 @@ interface ProcurementWarning {
   reason: string;
 }
 
+interface TodayBreakdown {
+  generated_at: number;
+  sold_today: number;   // menu-item units already sold since the day opened
+  remaining: number;    // live forecast for the rest of today (drives the plan)
+  full_day: number;     // sold_today + remaining
+}
+
 // ─── Data bundle ─────────────────────────────────────────────────────────────
 
 export interface StateBundle {
   snapshot: TrackASnapshot | null;
   horizonLines: HorizonForecastLine[] | null;   // null = no horizon available
+  todayBreakdown: TodayBreakdown | null;         // today full-day/sold/remaining reconciliation
   lots: InventoryLot[];
   ingredients: Ingredient[];
   plan: PlanResponse | null;
@@ -118,12 +126,16 @@ export async function gatherState(): Promise<StateBundle> {
   const errors: string[] = [];
 
   // Fetch all sections in parallel; each is individually guarded.
-  const [snapshot, horizonData, lotData, ingredientData, planData, orderedData, deliveredData, warningData] =
+  const [snapshot, todayData, horizonData, lotData, ingredientData, planData, orderedData, deliveredData, warningData] =
     await Promise.all([
       apiGet<TrackASnapshot>("/api/track-a/snapshot").catch(() => {
         errors.push("Forecast snapshot unavailable");
         return null;
       }),
+
+      apiGet<TodayBreakdown>("/api/track-a/forecast/today-breakdown").catch(
+        () => null
+      ),
 
       // horizons list → then pick latest → then fetch its lines
       apiGet<{ horizons: HorizonForecast[] }>("/api/track-a/forecast/horizons")
@@ -180,6 +192,7 @@ export async function gatherState(): Promise<StateBundle> {
   return {
     snapshot,
     horizonLines: horizonData,
+    todayBreakdown: todayData,
     lots: lotData as InventoryLot[],
     ingredients: ingredientData as Ingredient[],
     plan: planData,
@@ -216,6 +229,19 @@ export function buildReport(bundle: StateBundle): string {
 
   // ── Section 1: Forecast — This Week ──────────────────────────────────────
   parts.push(banner("FORECAST — THIS WEEK"));
+
+  // Today reconciliation: the "Today" figures below are a point-in-time
+  // forecast, but the procurement plan orders against the REMAINING part of the
+  // day.  Show full-day / already-sold / remaining so the two can be reconciled.
+  const tb = bundle.todayBreakdown;
+  if (tb) {
+    parts.push(
+      "\n  Today — reconciliation (menu-item units):",
+      `    full-day forecast : ${String(Math.round(tb.full_day)).padStart(5)}`,
+      `    already sold today: ${String(Math.round(tb.sold_today)).padStart(5)}`,
+      `    remaining (drives plan): ${String(Math.round(tb.remaining)).padStart(5)}`,
+    );
+  }
 
   if (bundle.horizonLines && bundle.horizonLines.length > 0) {
     // Aggregate per (day_index, menu_item_id) across dayparts

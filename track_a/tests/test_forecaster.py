@@ -1315,3 +1315,38 @@ def test_forecast_interval_week_has_7_day_entries(bus, session_factory, seeded):
 
     assert result["status"] == "ok"
     assert len(result["by_day"]) == 7
+
+
+def test_narrow_forecast_does_not_emit_horizon_signal(bus, session_factory, seeded):
+    """Regression: only the procurement rolling-horizon emitter may publish
+    DEMAND_FORECAST_HORIZON.  A narrow-window forecast_interval call (dashboard
+    day/custom, voice query, today-breakdown endpoint) must NOT emit — otherwise
+    its 1-day forecast clobbers the 7-day procurement horizon on the bus and the
+    plan optimises against a partial demand map (phantom shortfalls)."""
+    forecaster = DemandForecaster(bus, session_factory)
+    bus.sim_time = _DAY_OPEN
+
+    # A 1-day forecast without emit_horizon must leave the bus untouched.
+    forecaster.forecast_interval(
+        _DAY_OPEN, _DAY_OPEN + SECONDS_PER_DAY,
+        granularity="day", persist=False,
+    )
+    assert not bus.live(type=SignalType.DEMAND_FORECAST_HORIZON), (
+        "narrow forecast must not emit the procurement horizon signal"
+    )
+
+    # The authorized rolling-horizon emitter publishes a 7-day signal.
+    forecaster.emit_rolling_horizon()
+    sigs = bus.live(type=SignalType.DEMAND_FORECAST_HORIZON)
+    assert sigs, "emit_rolling_horizon must publish DEMAND_FORECAST_HORIZON"
+    days = (sigs[0].payload or {}).get("days") or []
+    assert len(days) == 7, f"procurement horizon must have 7 days, got {len(days)}"
+
+    # A subsequent narrow forecast must NOT clobber the 7-day horizon.
+    forecaster.forecast_interval(
+        _DAY_OPEN, _DAY_OPEN + SECONDS_PER_DAY,
+        granularity="day", persist=False,
+    )
+    sigs2 = bus.live(type=SignalType.DEMAND_FORECAST_HORIZON)
+    days2 = (sigs2[0].payload or {}).get("days") or []
+    assert len(days2) == 7, "narrow forecast clobbered the 7-day procurement horizon"

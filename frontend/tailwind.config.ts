@@ -15,6 +15,7 @@ const config: Config = {
         text: "#eaeaea",
         success: "#4caf50",
         warning: "#ff9800",
+        caution: "#eab308",
         danger: "#f44336",
       },
       fontFamily: {
