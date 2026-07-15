@@ -8,11 +8,13 @@
  * Single column on small screens (stacked).
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Component } from "react";
+import type { ReactNode } from "react";
 import {
   CheckCircle2,
   XCircle,
   Bell,
+  AlertTriangle,
   Send,
   RefreshCw,
   Check,
@@ -37,31 +39,37 @@ import { apiGet, apiPost } from "../api";
 import { useActiveCall, useCallTurns, useLastCompletedCall, useManagerChangeVersion, actions } from "../store";
 import type { ApprovalRequest, Call, ManagerChange } from "../types";
 import { SpectateOverlay } from "../shell/SpectateOverlay";
+import { ApprovalPreview } from "./approvalPreviews";
 import { wsClient } from "../ws";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function fmtSimClock(secs: number): string {
-  const h = Math.floor(secs / 3600) % 24;
-  const m = Math.floor((secs % 3600) / 60);
-  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+// Isolates a single card's render: a bad payload or missing field shows a
+// small fallback for that card instead of unmounting the whole board (which
+// previously blanked the desk to the app background).
+class CardBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="rounded-lg border border-danger/30 bg-danger/5 p-3 text-xs text-danger">
+          <AlertTriangle size={12} className="mr-1 inline" />
+          This card failed to render.
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Approval item
 // ---------------------------------------------------------------------------
-
-interface BatchProposalPayload {
-  proposal_type?: string;
-  dish_name?: string;
-  target_window_start?: number;
-  target_qty?: number;
-  forecast_demand?: number;
-  projected_benefit?: string;
-  reasoning?: string;
-}
 
 function ApprovalItem({
   approval,
@@ -71,10 +79,6 @@ function ApprovalItem({
   onResolve: (id: number, decision: "approve" | "reject") => void;
 }) {
   const [busy, setBusy] = useState(false);
-  const [expanded, setExpanded] = useState(false);
-
-  const isBatch = approval.type === "batch";
-  const payload = isBatch ? (approval.payload as BatchProposalPayload | null) : null;
 
   return (
     <div className="rounded-lg border border-muted/60 bg-surface p-3 space-y-2">
@@ -85,78 +89,30 @@ function ApprovalItem({
           </span>
           <p className="mt-0.5 text-sm font-medium text-text">{approval.title}</p>
           {approval.summary && (
-            <p className="text-xs text-text/60 mt-0.5 line-clamp-2">{approval.summary}</p>
+            <p className="text-xs text-text/60 mt-0.5">{approval.summary}</p>
           )}
         </div>
-        <div className="flex shrink-0 flex-col gap-1.5 items-end">
-          <div className="flex gap-1.5">
-            <button
-              disabled={busy}
-              onClick={() => { setBusy(true); onResolve(approval.id, "approve"); }}
-              className="rounded-md bg-success/20 px-2 py-1 text-xs font-medium text-success hover:bg-success/30 disabled:opacity-40"
-            >
-              <CheckCircle2 size={12} className="inline mr-0.5" />
-              Approve
-            </button>
-            <button
-              disabled={busy}
-              onClick={() => { setBusy(true); onResolve(approval.id, "reject"); }}
-              className="rounded-md bg-danger/20 px-2 py-1 text-xs font-medium text-danger hover:bg-danger/30 disabled:opacity-40"
-            >
-              <XCircle size={12} className="inline mr-0.5" />
-              Reject
-            </button>
-          </div>
-          {isBatch && payload && (
-            <button
-              onClick={() => setExpanded(v => !v)}
-              className="text-xs text-text/40 hover:text-text/70"
-            >
-              {expanded ? "Hide detail ▲" : "See reasoning ▼"}
-            </button>
-          )}
+        <div className="flex shrink-0 gap-1.5">
+          <button
+            disabled={busy}
+            onClick={() => { setBusy(true); onResolve(approval.id, "approve"); }}
+            className="rounded-md bg-success/20 px-2 py-1 text-xs font-medium text-success hover:bg-success/30 disabled:opacity-40"
+          >
+            <CheckCircle2 size={12} className="inline mr-0.5" />
+            Approve
+          </button>
+          <button
+            disabled={busy}
+            onClick={() => { setBusy(true); onResolve(approval.id, "reject"); }}
+            className="rounded-md bg-danger/20 px-2 py-1 text-xs font-medium text-danger hover:bg-danger/30 disabled:opacity-40"
+          >
+            <XCircle size={12} className="inline mr-0.5" />
+            Reject
+          </button>
         </div>
       </div>
 
-      {isBatch && payload && expanded && (
-        <div className="border-t border-muted/30 pt-2 space-y-1.5 text-xs">
-          {payload.dish_name && (
-            <div className="flex gap-2">
-              <span className="text-text/40 w-28 shrink-0">Dish</span>
-              <span className="text-text font-medium">{payload.dish_name}</span>
-            </div>
-          )}
-          {payload.target_window_start != null && (
-            <div className="flex gap-2">
-              <span className="text-text/40 w-28 shrink-0">Target window</span>
-              <span className="text-text">{fmtSimClock(payload.target_window_start)}</span>
-            </div>
-          )}
-          {payload.target_qty != null && (
-            <div className="flex gap-2">
-              <span className="text-text/40 w-28 shrink-0">Suggested qty</span>
-              <span className="text-text">{payload.target_qty} portions</span>
-            </div>
-          )}
-          {payload.forecast_demand != null && (
-            <div className="flex gap-2">
-              <span className="text-text/40 w-28 shrink-0">Forecast demand</span>
-              <span className="text-text">{payload.forecast_demand.toFixed(1)} portions</span>
-            </div>
-          )}
-          {payload.projected_benefit && (
-            <div className="flex gap-2">
-              <span className="text-text/40 w-28 shrink-0">Benefit</span>
-              <span className="text-accent">{payload.projected_benefit}</span>
-            </div>
-          )}
-          {payload.reasoning && (
-            <div className="mt-1 rounded bg-muted/30 p-2 text-text/70 leading-relaxed">
-              {payload.reasoning}
-            </div>
-          )}
-        </div>
-      )}
+      <ApprovalPreview approval={approval} />
     </div>
   );
 }
@@ -644,7 +600,9 @@ function CardsBoard({
           </div>
           <div className="space-y-2">
             {pendingChanges.map((c) => (
-              <ChangeCard key={c.id} change={c} onRefresh={loadChanges} />
+              <CardBoundary key={c.id}>
+                <ChangeCard change={c} onRefresh={loadChanges} />
+              </CardBoundary>
             ))}
           </div>
         </section>
@@ -661,7 +619,9 @@ function CardsBoard({
           </div>
           <div className="space-y-2">
             {notices.map((a) => (
-              <NoticeCard key={a.id} notice={a} onDismiss={(id) => onResolve(id, "approve")} />
+              <CardBoundary key={a.id}>
+                <NoticeCard notice={a} onDismiss={(id) => onResolve(id, "approve")} />
+              </CardBoundary>
             ))}
           </div>
         </section>
@@ -678,7 +638,9 @@ function CardsBoard({
           </div>
           <div className="space-y-2">
             {realApprovals.map((a) => (
-              <ApprovalItem key={a.id} approval={a} onResolve={onResolve} />
+              <CardBoundary key={a.id}>
+                <ApprovalItem approval={a} onResolve={onResolve} />
+              </CardBoundary>
             ))}
           </div>
         </section>

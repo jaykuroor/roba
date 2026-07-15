@@ -1368,7 +1368,7 @@ async def live_bridge(
 
         try:
             task_c2g = asyncio.create_task(
-                _client_to_gemini(websocket, session, voice_processor, voice_actions, buffers, bridge, call_id=call_id),
+                _client_to_gemini(websocket, session, voice_processor, voice_actions, buffers, bridge, call_id=call_id, calls=calls),
                 name="voice_live_c2g",
             )
             task_g2c = asyncio.create_task(
@@ -1451,6 +1451,7 @@ async def _client_to_gemini(
     buffers: "_TurnBuffer", bridge: "_BridgeState",
     *,
     call_id: Optional[int] = None,
+    calls: Optional[Any] = None,
 ) -> None:
     """Read frames from the browser WS and relay to the Live session."""
     from google.genai import types as _gtypes
