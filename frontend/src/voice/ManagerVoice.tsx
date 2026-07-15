@@ -170,6 +170,14 @@ const NOTICE_KIND: Record<string, string> = {
   staff_shift: "Staff",
 };
 
+// Severity is carried on ApprovalRequest.urgency (high | normal | low) — drives
+// the notice's indicative colour so the manager sees severity at a glance.
+const NOTICE_SEVERITY: Record<string, { card: string; chip: string; label: string }> = {
+  high:   { card: "border-danger/40 bg-danger/5",   chip: "bg-danger/20 text-danger",   label: "Critical" },
+  normal: { card: "border-warning/30 bg-warning/5", chip: "bg-warning/20 text-warning", label: "Warning" },
+  low:    { card: "border-muted/50 bg-surface",     chip: "bg-muted/60 text-text/60",   label: "Info" },
+};
+
 function NoticeCard({
   notice,
   onDismiss,
@@ -178,20 +186,20 @@ function NoticeCard({
   onDismiss: (id: number) => void;
 }) {
   const [busy, setBusy] = useState(false);
-  const high = notice.urgency === "high";
+  const sev = NOTICE_SEVERITY[notice.urgency ?? "normal"] ?? NOTICE_SEVERITY.normal;
+  const Icon = notice.urgency === "high" ? AlertTriangle : Bell;
   return (
-    <div className={[
-      "rounded-lg border p-3",
-      high ? "border-danger/40 bg-danger/5" : "border-warning/30 bg-warning/5",
-    ].join(" ")}>
+    <div className={`rounded-lg border p-3 ${sev.card}`}>
       <div className="flex items-start gap-3">
         <div className="flex-1 min-w-0">
-          <span className={[
-            "inline-block rounded px-1.5 py-0.5 text-xs font-medium uppercase tracking-wide",
-            high ? "bg-danger/20 text-danger" : "bg-warning/20 text-warning",
-          ].join(" ")}>
-            {NOTICE_KIND[notice.type] ?? "Notice"}
-          </span>
+          <div className="flex items-center gap-1.5">
+            <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium uppercase tracking-wide ${sev.chip}`}>
+              <Icon size={11} /> {NOTICE_KIND[notice.type] ?? "Notice"}
+            </span>
+            <span className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${sev.chip}`}>
+              {sev.label}
+            </span>
+          </div>
           <p className="mt-0.5 text-sm font-medium text-text">{notice.title}</p>
           {notice.summary && <p className="text-xs text-text/60 mt-0.5">{notice.summary}</p>}
         </div>

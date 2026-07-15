@@ -214,6 +214,7 @@ def _migrate_schema() -> None:
         ("sim_settings", "batch_auto_qty", "ALTER TABLE sim_settings ADD COLUMN batch_auto_qty INTEGER DEFAULT 0"),
         ("sim_settings", "staff_checkin_mode", "ALTER TABLE sim_settings ADD COLUMN staff_checkin_mode TEXT DEFAULT 'sim_auto'"),
         ("kitchen_tasks", "note", "ALTER TABLE kitchen_tasks ADD COLUMN note TEXT"),
+        ("kitchen_tasks", "severity", "ALTER TABLE kitchen_tasks ADD COLUMN severity TEXT"),
     ]
     with db.engine.connect() as conn:
         for table, column, ddl in migrations:
@@ -2148,6 +2149,11 @@ class TaskOutcomeBody(BaseModel):
     by: str = "cook"
 
 
+class TaskReportBody(BaseModel):
+    text: str
+    prior_qa: Optional[List[Dict[str, str]]] = None  # [{"q":..., "a":...}] from a clarification round
+
+
 class StaffModeBody(BaseModel):
     mode: str  # "sim_auto" | "manual"
 
@@ -2178,6 +2184,46 @@ def kitchen_task_outcome(task_id: int, body: TaskOutcomeBody) -> Dict[str, Any]:
         return {"task_id": task_id, "status": t.status, "note": t.note}
     finally:
         session.close()
+
+
+@app.post("/api/kitchen/tasks/{task_id}/report")
+def kitchen_task_report(task_id: int, body: TaskReportBody) -> Dict[str, Any]:
+    """Interpret a cook's written task report with an LLM, then record the outcome.
+
+    Returns ``{status:"needs_input", question}`` when Roba needs one clarification
+    (frontend shows an overlay); otherwise records done/not_done with a clean note
+    and severity, and (for not_done) raises a severity-graded manager notice.
+    """
+    from . import kitchen_tasks, task_report
+    now = float(ctx.clock.sim_time)
+    session = db.new_session()
+    try:
+        t = session.get(models.KitchenTask, task_id)
+        if t is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        task_ctx = {"title": t.title, "category": t.category, "details": list(t.details or [])}
+    finally:
+        session.close()
+
+    verdict = task_report.interpret(task_ctx, body.text, prior_qa=body.prior_qa)
+    if verdict.get("needs_clarification") and verdict.get("question"):
+        return {"status": "needs_input", "question": verdict["question"]}
+
+    session = db.new_session()
+    try:
+        kitchen_tasks.set_outcome(
+            session, task_id,
+            status=verdict["outcome"], note=verdict["note"], severity=verdict["severity"],
+            by="cook", now=now, approvals=ctx.approvals,
+        )
+    finally:
+        session.close()
+    return {
+        "status": "recorded",
+        "outcome": verdict["outcome"],
+        "severity": verdict["severity"],
+        "note": verdict["note"],
+    }
 
 
 @app.get("/api/kitchen/staff/board")

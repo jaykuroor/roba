@@ -127,6 +127,7 @@ def _row_to_dict(t: models.KitchenTask, now: float, station_names: dict[int, str
         "details": list(t.details or []),
         "status": t.status,
         "note": t.note,
+        "severity": t.severity,
         "overdue": bool(overdue),
         "done_at": t.done_at,
         "done_by": t.done_by,
@@ -168,18 +169,23 @@ def task_board(session: Any, *, now: float, cuisine: Optional[str]) -> dict:
     }
 
 
+# Severity → ApprovalRequest.urgency (drives the manager notice's indicative UI).
+_SEVERITY_URGENCY = {"high": "high", "medium": "normal", "low": "low"}
+
+
 def _notify_not_done(approvals: Any, t: models.KitchenTask) -> None:
     """Raise a manager notice that a task was reported not done (with the reason)."""
     if approvals is None:
         return
     note = (t.note or "").strip()
+    severity = t.severity or ("high" if t.category in ("temp", "safety") else "medium")
     approvals.create(
         type="kitchen_task",
         title=f"Task not done: {t.title}",
         summary=f"Kitchen reported this not done — {note}" if note else "Kitchen reported this task not done.",
         payload={"task_id": int(t.id), "category": t.category, "template_key": t.template_key,
-                 "note": note, "outcome": "not_done"},
-        urgency="high" if t.category in ("temp", "safety") else "normal",
+                 "note": note, "outcome": "not_done", "severity": severity},
+        urgency=_SEVERITY_URGENCY.get(severity, "normal"),
         ref_id=int(t.id),
     )
 
@@ -190,14 +196,16 @@ def set_outcome(
     *,
     status: str,
     note: Optional[str] = None,
+    severity: Optional[str] = None,
     by: str = "cook",
     now: float,
     approvals: Any = None,
 ) -> Optional[models.KitchenTask]:
     """Set a task's outcome: ``done`` | ``not_done`` | ``pending``.
 
-    ``not_done`` stores the reason and immediately raises a manager notice
-    (idempotent via ``notified_manager``).  Returns the row, or None if missing.
+    ``not_done`` stores the reason + ``severity`` and immediately raises a
+    severity-graded manager notice (idempotent via ``notified_manager``).
+    Returns the row, or None if missing.
     """
     t = session.get(models.KitchenTask, task_id)
     if t is None:
@@ -206,12 +214,14 @@ def set_outcome(
         t.status = "done"
         t.done_at = now
         t.done_by = by
+        t.severity = None
         if note is not None:
             t.note = note
     elif status == "not_done":
         was_not_done = t.status == "not_done"
         t.status = "not_done"
         t.note = note
+        t.severity = severity if severity in ("low", "medium", "high") else None
         t.done_at = now
         t.done_by = by
         t.notified_manager = 1  # also stops reconcile re-escalating it as overdue
@@ -220,6 +230,7 @@ def set_outcome(
     else:  # pending (revert)
         t.status = "pending"
         t.note = None
+        t.severity = None
         t.done_at = None
         t.done_by = None
     session.commit()

@@ -37,6 +37,8 @@ function relativeTime(target: number, nowSim: number): string {
 // Tasks panel
 // ===========================================================================
 
+export type Severity = "low" | "medium" | "high";
+
 export interface KitchenTask {
   id: number;
   template_key: string;
@@ -47,9 +49,18 @@ export interface KitchenTask {
   details: string[];
   status: "pending" | "done" | "not_done" | "skipped";
   note: string | null;
+  severity: Severity | null;
   overdue: boolean;
   done_at: number | null;
   done_by: string | null;
+}
+
+export interface ReportResult {
+  status: "recorded" | "needs_input";
+  question?: string;
+  outcome?: "done" | "not_done";
+  severity?: Severity;
+  note?: string;
 }
 
 export interface TaskBoard {
@@ -93,7 +104,17 @@ export function useTasksBoard() {
     } catch { void load(); }
   }, [load]);
 
-  return { board, loading, setOutcome, reload: load };
+  // Written report → Roba (LLM) interprets it. May return needs_input (caller
+  // shows an overlay) or record the outcome; on record we refresh the board.
+  const reportIssue = useCallback(async (
+    task: KitchenTask, text: string, priorQa?: { q: string; a: string }[],
+  ): Promise<ReportResult> => {
+    const res = await apiPost<ReportResult>(`/api/kitchen/tasks/${task.id}/report`, { text, prior_qa: priorQa });
+    if (res.status === "recorded") void load();
+    return res;
+  }, [load]);
+
+  return { board, loading, setOutcome, reportIssue, reload: load };
 }
 
 const CATEGORY_META: Record<string, { label: string; icon: React.ElementType; cls: string }> = {
@@ -105,28 +126,114 @@ const CATEGORY_META: Record<string, { label: string; icon: React.ElementType; cl
   safety:   { label: "Safety",    icon: ShieldCheck,          cls: "bg-rose-500/20 text-rose-400" },
 };
 
-export function TaskCard({ task, nowSim, onOutcome, onAssignVoice }: {
+const SEVERITY_META: Record<Severity, { label: string; cls: string }> = {
+  low:    { label: "Low",      cls: "bg-muted/60 text-text/60" },
+  medium: { label: "Medium",   cls: "bg-warning/20 text-warning" },
+  high:   { label: "Critical", cls: "bg-danger/20 text-danger" },
+};
+
+function TaskReportOverlay({ taskTitle, question, busy, onAnswer, onExplainToRoba, onClose }: {
+  taskTitle: string;
+  question: string;
+  busy: boolean;
+  onAnswer: (answer: string) => void;
+  onExplainToRoba?: () => void;
+  onClose: () => void;
+}) {
+  const [answer, setAnswer] = useState("");
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
+      <div
+        className="w-full max-w-md rounded-2xl border border-muted/60 bg-surface p-5 shadow-2xl"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Mic size={16} className="text-accent" />
+            <span className="text-sm font-semibold text-text">Roba needs a detail</span>
+          </div>
+          <button onClick={onClose} className="text-text/30 hover:text-text/60" aria-label="Close"><X size={16} /></button>
+        </div>
+        <p className="mt-1 text-xs text-text/40">{taskTitle}</p>
+        <p className="mt-3 text-base font-medium text-text">{question}</p>
+        <textarea
+          value={answer}
+          onChange={e => setAnswer(e.target.value)}
+          autoFocus
+          rows={3}
+          placeholder="Type your answer…"
+          className="mt-3 w-full resize-none rounded-lg border border-muted bg-primary px-3 py-2 text-sm text-text placeholder:text-text/30 focus:border-accent focus:outline-none"
+        />
+        <div className="mt-3 flex items-center gap-2">
+          <button
+            onClick={() => answer.trim() && onAnswer(answer.trim())}
+            disabled={!answer.trim() || busy}
+            className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-accent px-3 py-2.5 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40"
+          >
+            {busy ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+            {busy ? "Recording…" : "Continue"}
+          </button>
+          {onExplainToRoba && (
+            <button
+              onClick={onExplainToRoba}
+              className="flex items-center justify-center gap-1.5 rounded-lg border border-accent/50 bg-accent/10 px-3 py-2.5 text-sm font-medium text-accent hover:bg-accent/20"
+            >
+              <Mic size={14} /> Explain to Roba
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function TaskCard({ task, nowSim, onOutcome, onReport, onAssignVoice }: {
   task: KitchenTask;
   nowSim: number;
   onOutcome: (t: KitchenTask, status: TaskOutcome, note?: string) => void;
+  onReport?: (t: KitchenTask, text: string, priorQa?: { q: string; a: string }[]) => Promise<ReportResult>;
   onAssignVoice?: (t: KitchenTask) => void;
 }) {
   const [detailOpen, setDetailOpen] = useState(false);
   const [notDoneOpen, setNotDoneOpen] = useState(false);
   const [typing, setTyping] = useState(false);
   const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  // Clarification overlay when Roba needs one more detail.
+  const [clarify, setClarify] = useState<{ question: string; originalText: string } | null>(null);
   const cat = CATEGORY_META[task.category] ?? { label: task.category, icon: ClipboardList, cls: "bg-muted/40 text-text/50" };
   const CatIcon = cat.icon;
   const isDone = task.status === "done";
   const isNotDone = task.status === "not_done";
   const resolved = isDone || isNotDone;
+  const sev = task.severity ? SEVERITY_META[task.severity] : null;
   const rel = task.due_sim_time != null ? relativeTime(task.due_sim_time, nowSim) : null;
 
-  function submitReason() {
-    const note = reason.trim();
-    if (!note) return;
-    onOutcome(task, "not_done", note);
-    setTyping(false); setNotDoneOpen(false); setReason("");
+  async function submitReason() {
+    const text = reason.trim();
+    if (!text || busy) return;
+    // Fall back to a direct not-done write if no LLM report handler is wired.
+    if (!onReport) { onOutcome(task, "not_done", text); setTyping(false); setNotDoneOpen(false); setReason(""); return; }
+    setBusy(true);
+    try {
+      const res = await onReport(task, text);
+      if (res.status === "needs_input" && res.question) {
+        setClarify({ question: res.question, originalText: text });
+      } else {
+        setTyping(false); setNotDoneOpen(false); setReason("");
+      }
+    } catch { /* leave the box open to retry */ }
+    finally { setBusy(false); }
+  }
+
+  async function submitClarification(answer: string) {
+    if (!onReport || !clarify || busy) return;
+    setBusy(true);
+    try {
+      await onReport(task, clarify.originalText, [{ q: clarify.question, a: answer }]);
+      setClarify(null); setTyping(false); setNotDoneOpen(false); setReason("");
+    } catch { /* keep overlay open */ }
+    finally { setBusy(false); }
   }
 
   return (
@@ -168,6 +275,9 @@ export function TaskCard({ task, nowSim, onOutcome, onAssignVoice }: {
           {isNotDone && (
             <span className="text-base font-semibold text-warning">not done</span>
           )}
+          {isNotDone && sev && (
+            <span className={`ml-auto rounded-full px-2 py-0.5 text-xs font-semibold ${sev.cls}`}>{sev.label}</span>
+          )}
           {task.overdue && !resolved && (
             <span className="ml-auto flex items-center gap-1 rounded-full bg-danger/20 px-2 py-0.5 text-xs font-medium text-danger">
               <AlertTriangle size={12} /> sent to manager
@@ -203,13 +313,13 @@ export function TaskCard({ task, nowSim, onOutcome, onAssignVoice }: {
               <CheckSquare size={24} /> Confirm done
             </button>
 
-            {/* Didn't do → two options */}
+            {/* Report an issue → type a note (Roba interprets it) or hand to voice */}
             {!notDoneOpen ? (
               <button
                 onClick={() => setNotDoneOpen(true)}
                 className="w-full flex items-center justify-center gap-2 rounded-xl border border-warning/40 bg-warning/5 px-4 py-2.5 text-sm font-semibold text-warning hover:bg-warning/10 transition-colors"
               >
-                <Ban size={16} /> Didn't do it
+                <Ban size={16} /> Report an issue
               </button>
             ) : (
               <div className="rounded-xl border border-warning/30 bg-warning/5 p-2.5 space-y-2">
@@ -219,7 +329,7 @@ export function TaskCard({ task, nowSim, onOutcome, onAssignVoice }: {
                       onClick={() => setTyping(true)}
                       className="flex-1 flex items-center justify-center gap-1.5 rounded-lg border border-muted/60 bg-surface px-3 py-2 text-sm font-medium text-text/70 hover:bg-muted/20"
                     >
-                      <Pencil size={14} /> Type reason
+                      <Pencil size={14} /> Type it
                     </button>
                     {onAssignVoice && (
                       <button
@@ -244,16 +354,17 @@ export function TaskCard({ task, nowSim, onOutcome, onAssignVoice }: {
                       onChange={e => setReason(e.target.value)}
                       autoFocus
                       rows={2}
-                      placeholder="Why wasn't it done? (goes to the manager)"
+                      placeholder="What happened? Roba will read this and log it."
                       className="w-full resize-none rounded-lg border border-muted bg-surface px-3 py-2 text-sm text-text placeholder:text-text/30 focus:border-accent focus:outline-none"
                     />
                     <div className="flex gap-2">
                       <button
                         onClick={submitReason}
-                        disabled={!reason.trim()}
+                        disabled={!reason.trim() || busy}
                         className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-warning/85 px-3 py-2 text-sm font-semibold text-white hover:bg-warning disabled:opacity-40"
                       >
-                        <Send size={14} /> Report not done
+                        {busy ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+                        {busy ? "Roba is reading…" : "Send to Roba"}
                       </button>
                       <button
                         onClick={() => { setTyping(false); setReason(""); }}
@@ -269,6 +380,18 @@ export function TaskCard({ task, nowSim, onOutcome, onAssignVoice }: {
           </>
         )}
       </div>
+
+      {/* Clarification overlay — Roba needs one more detail */}
+      {clarify && (
+        <TaskReportOverlay
+          taskTitle={task.title}
+          question={clarify.question}
+          busy={busy}
+          onAnswer={submitClarification}
+          onExplainToRoba={onAssignVoice ? () => { setClarify(null); setNotDoneOpen(false); onAssignVoice(task); } : undefined}
+          onClose={() => setClarify(null)}
+        />
+      )}
 
       {/* Details */}
       {task.details.length > 0 && (
@@ -297,7 +420,7 @@ export function TaskCard({ task, nowSim, onOutcome, onAssignVoice }: {
 }
 
 export function TasksPanel({ onAssignVoice }: { onAssignVoice?: (t: KitchenTask) => void }) {
-  const { board, loading, setOutcome } = useTasksBoard();
+  const { board, loading, setOutcome, reportIssue } = useTasksBoard();
   const nowSim = board?.generated_at_sim ?? 0;
   const c = board?.counts;
 
@@ -325,7 +448,7 @@ export function TasksPanel({ onAssignVoice }: { onAssignVoice?: (t: KitchenTask)
         ) : !board || board.tasks.length === 0 ? (
           <div className="py-10 text-center text-sm text-text/30">No tasks scheduled today.</div>
         ) : (
-          board.tasks.map(t => <TaskCard key={t.id} task={t} nowSim={nowSim} onOutcome={setOutcome} onAssignVoice={onAssignVoice} />)
+          board.tasks.map(t => <TaskCard key={t.id} task={t} nowSim={nowSim} onOutcome={setOutcome} onReport={reportIssue} onAssignVoice={onAssignVoice} />)
         )}
       </div>
     </section>

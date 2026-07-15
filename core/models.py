@@ -408,6 +408,7 @@ class KitchenTask(Base):
     details = mapped_column(JSON, nullable=True)        # list[str] checklist steps
     status = mapped_column(String, default="pending")  # pending | done | not_done | skipped
     note = mapped_column(String, nullable=True)        # cook's reason when not_done (or a done note)
+    severity = mapped_column(String, nullable=True)    # low | medium | high — set when reported not_done
     done_at = mapped_column(Float, nullable=True)
     done_by = mapped_column(String, nullable=True)
     notified_manager = mapped_column(Integer, default=0)  # bool 0/1 — overdue/not-done notice already raised

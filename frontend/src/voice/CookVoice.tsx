@@ -772,7 +772,7 @@ export function CookVoice() {
           allItems.map(item =>
             item.kind === "batch"
               ? <BatchCard key={`b-${item.batch.id}`} batch={item.batch} nowSim={nowSim} onCheck={handleCheck} />
-              : <TaskCard key={`t-${item.task.id}`} task={item.task} nowSim={tasks.board?.generated_at_sim ?? nowSim} onOutcome={handleTaskOutcome} onAssignVoice={handleAssignVoice} />
+              : <TaskCard key={`t-${item.task.id}`} task={item.task} nowSim={tasks.board?.generated_at_sim ?? nowSim} onOutcome={handleTaskOutcome} onReport={tasks.reportIssue} onAssignVoice={handleAssignVoice} />
           )
         )}
       </div>
