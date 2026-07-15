@@ -152,6 +152,10 @@ def _ensure_columns() -> None:
         ("planned_orders",        "coverage_status",     "TEXT"),
         ("planned_orders",        "short_nominal",       "REAL DEFAULT 0.0"),
         ("planned_orders",        "short_delayed",       "REAL DEFAULT 0.0"),
+        # Cook-desk staff board: sim-auto (default) vs manual check-in mode
+        ("sim_settings",          "staff_checkin_mode",  "TEXT DEFAULT 'sim_auto'"),
+        # Cook-desk task "not done" reason / note
+        ("kitchen_tasks",         "note",                "TEXT"),
     ]
     conn = engine.raw_connection()
     try:

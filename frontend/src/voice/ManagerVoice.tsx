@@ -162,6 +162,55 @@ function ApprovalItem({
 }
 
 // ---------------------------------------------------------------------------
+// Notice item — kitchen/staff alerts: informational, single Dismiss (no approve/reject)
+// ---------------------------------------------------------------------------
+
+const NOTICE_KIND: Record<string, string> = {
+  kitchen_task: "Kitchen",
+  staff_shift: "Staff",
+};
+
+function NoticeCard({
+  notice,
+  onDismiss,
+}: {
+  notice: ApprovalRequest;
+  onDismiss: (id: number) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const high = notice.urgency === "high";
+  return (
+    <div className={[
+      "rounded-lg border p-3",
+      high ? "border-danger/40 bg-danger/5" : "border-warning/30 bg-warning/5",
+    ].join(" ")}>
+      <div className="flex items-start gap-3">
+        <div className="flex-1 min-w-0">
+          <span className={[
+            "inline-block rounded px-1.5 py-0.5 text-xs font-medium uppercase tracking-wide",
+            high ? "bg-danger/20 text-danger" : "bg-warning/20 text-warning",
+          ].join(" ")}>
+            {NOTICE_KIND[notice.type] ?? "Notice"}
+          </span>
+          <p className="mt-0.5 text-sm font-medium text-text">{notice.title}</p>
+          {notice.summary && <p className="text-xs text-text/60 mt-0.5">{notice.summary}</p>}
+        </div>
+        <button
+          disabled={busy}
+          onClick={() => { setBusy(true); onDismiss(notice.id); }}
+          className="shrink-0 rounded-md bg-muted px-2 py-1 text-xs font-medium text-text/60 hover:bg-muted/70 disabled:opacity-40"
+        >
+          <X size={12} className="inline mr-0.5" />
+          Dismiss
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const NOTICE_TYPES = new Set(["kitchen_task", "staff_shift"]);
+
+// ---------------------------------------------------------------------------
 // Active call card
 // ---------------------------------------------------------------------------
 
@@ -563,6 +612,9 @@ function CardsBoard({
   const lastCompletedCall = useLastCompletedCall();
   const pendingChanges = changes.filter((c) => c.status === "pending");
   const recentChanges = changes.filter((c) => c.status === "applied").slice(0, 5);
+  // Kitchen/staff items are notices (informational), not approve/reject approvals.
+  const notices = approvals.filter((a) => NOTICE_TYPES.has(a.type));
+  const realApprovals = approvals.filter((a) => !NOTICE_TYPES.has(a.type));
 
   return (
     <div className="flex flex-col gap-3 p-3">
@@ -590,17 +642,34 @@ function CardsBoard({
         </section>
       )}
 
-      {/* Approvals inbox */}
-      {approvals.length > 0 && (
+      {/* Kitchen & staff notices — informational, single Dismiss */}
+      {notices.length > 0 && (
         <section>
           <div className="mb-2 flex items-center gap-1.5">
             <Bell size={13} className="text-warning" />
             <span className="text-xs font-semibold uppercase tracking-wide text-text/50">
-              Needs approval ({approvals.length})
+              Kitchen &amp; staff notices ({notices.length})
             </span>
           </div>
           <div className="space-y-2">
-            {approvals.map((a) => (
+            {notices.map((a) => (
+              <NoticeCard key={a.id} notice={a} onDismiss={(id) => onResolve(id, "approve")} />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Approvals inbox */}
+      {realApprovals.length > 0 && (
+        <section>
+          <div className="mb-2 flex items-center gap-1.5">
+            <Bell size={13} className="text-warning" />
+            <span className="text-xs font-semibold uppercase tracking-wide text-text/50">
+              Needs approval ({realApprovals.length})
+            </span>
+          </div>
+          <div className="space-y-2">
+            {realApprovals.map((a) => (
               <ApprovalItem key={a.id} approval={a} onResolve={onResolve} />
             ))}
           </div>

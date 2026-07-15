@@ -449,6 +449,24 @@ _TOOLS: list[dict[str, Any]] = [
                 },
             },
             {
+                "name": "record_task_outcome",
+                "description": (
+                    "Record a kitchen checklist task as done or not done, with the cook's notes. "
+                    "Use when reporting on a task: 'I cleaned the grill', 'didn't do the fridge temp check, "
+                    "the probe was broken'. Set done=false and put the reason in notes when it wasn't done — "
+                    "that reason is sent to the manager."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_reference": {"type": "string", "description": "Task title or id (e.g. '#12' or 'clean the grill')."},
+                        "done": {"type": "boolean", "description": "true if the task was completed, false if not."},
+                        "notes": {"type": "string", "description": "What happened / why it wasn't done (optional for done, expected for not-done)."},
+                    },
+                    "required": ["task_reference", "done"],
+                },
+            },
+            {
                 "name": "set_staff_attendance",
                 "description": (
                     "Update one or more staff members' attendance status. The system will automatically "
@@ -950,6 +968,8 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "• Did we cook X → get_batches(dish=..., status='ready')\n"
         "• Mark cooked → confirm_batch_cooked(dish_or_batch=..., actual_qty=...)\n"
         "• Waste (dish) → record_waste(item_name=..., qty=..., cause=...)\n"
+        "• Task done / not done → record_task_outcome(task_reference=..., done=true/false, notes=...)\n"
+        "  ↳ When a task wasn't done, set done=false and capture WHY in notes (it goes to the manager).\n"
         "• Ingredient spoiled → record_spoilage(ingredient_name=..., all_stock=...)\n"
         "• Inventory check → get_inventory(item_name=...)\n"
         "• Dish forecast → forecast_demand(range=week|day|daypart, item_name=...)\n"
@@ -2115,6 +2135,17 @@ async def _execute_tool(
                 item_name=str(args.get("item_name", "")),
                 qty=float(args.get("qty", 0)),
                 cause=str(args.get("cause", "overproduction")),
+                mode=mode,
+            )
+
+        if name == "record_task_outcome":
+            if va is None:
+                return {"error": "VoiceActions not available"}
+            return await asyncio.to_thread(
+                va.record_task_outcome,
+                task_reference=str(args.get("task_reference", "")),
+                done=bool(args.get("done", False)),
+                notes=args.get("notes") or None,
                 mode=mode,
             )
 

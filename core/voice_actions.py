@@ -867,6 +867,72 @@ class VoiceActions:
             human_readable=f"Mark {names} as {status}.",
         )
 
+    def _resolve_task(self, session: Any, task_reference: str) -> Optional[Any]:
+        """Resolve a reference to one of today's KitchenTasks (id / '#N' / title)."""
+        from . import kitchen_tasks
+        from .models import KitchenTask
+        now = float(self.bus.sim_time)
+        sim_day = int(now // kitchen_tasks.SECONDS_PER_DAY)
+        needle = task_reference.strip().lower()
+        if needle.lstrip("#").isdigit():
+            t = session.get(KitchenTask, int(needle.lstrip("#")))
+            if t is not None and t.sim_day == sim_day:
+                return t
+        rows = (
+            session.query(KitchenTask)
+            .filter(KitchenTask.sim_day == sim_day)
+            .order_by(KitchenTask.due_sim_time.asc())
+            .all()
+        )
+        for t in rows:  # exact title first, then substring
+            if (t.title or "").lower() == needle:
+                return t
+        for t in rows:
+            if needle in (t.title or "").lower():
+                return t
+        return None
+
+    def record_task_outcome(
+        self,
+        task_reference: str,
+        done: bool,
+        notes: Optional[str] = None,
+        *,
+        mode: str = "confirm",
+    ) -> Dict[str, Any]:
+        """Record a kitchen checklist task as done or not-done, with the cook's notes.
+
+        A not-done outcome raises a manager notice carrying the reason.
+        """
+        from . import kitchen_tasks
+        session = self.db_session_factory()
+        try:
+            t = self._resolve_task(session, task_reference)
+            if t is None:
+                return {"need": "task_reference",
+                        "question": f"I couldn't find today's task '{task_reference}'. Which task do you mean?"}
+            task_id, title = int(t.id), t.title
+        finally:
+            session.close()
+
+        status = "done" if done else "not_done"
+
+        def _apply():
+            s = self.db_session_factory()
+            try:
+                kitchen_tasks.set_outcome(
+                    s, task_id, status=status, note=notes, by="voice",
+                    now=float(self.bus.sim_time), approvals=getattr(self.vp, "approvals", None),
+                )
+            finally:
+                s.close()
+            self.hub_broadcast("task_updated", {"task_id": task_id, "status": status})
+            return {"ok": True, "task_id": task_id, "title": title, "status": status, "notes": notes}
+
+        verb = "done" if done else "NOT done"
+        hr = f"Record '{title}' as {verb}" + (f" — {notes}" if notes else "") + "."
+        return self._stage_or_apply(mode, _apply, human_readable=hr)
+
     def forecast_demand(
         self,
         range: Optional[str] = None,          # "daypart" | "day" | "week" | "custom"

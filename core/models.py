@@ -388,6 +388,58 @@ class Attendance(Base):
                 f"date_sim_day={self.date_sim_day} status={self.status!r}>")
 
 
+class KitchenTask(Base):
+    """A per-day instance of a kitchen checklist task (opening/temp/cleaning/closing).
+
+    Materialized lazily from ``core.kitchen_tasks.TASK_TEMPLATES`` once per sim
+    day; the cook confirms each one, and any left pending past its due time is
+    surfaced to the manager desk (as an ``ApprovalRequest`` of type
+    ``kitchen_task``).
+    """
+    __tablename__ = "kitchen_tasks"
+
+    id = _pk()
+    template_key = mapped_column(String)                # stable template id, e.g. "open_fridge_temp"
+    sim_day = mapped_column(Integer, index=True)
+    title = mapped_column(String)
+    category = mapped_column(String)                    # opening | temp | cleaning | closing | prep | safety
+    station_id = mapped_column(ForeignKey("stations.id"), nullable=True)
+    due_sim_time = mapped_column(Float)                 # absolute sim-seconds
+    details = mapped_column(JSON, nullable=True)        # list[str] checklist steps
+    status = mapped_column(String, default="pending")  # pending | done | not_done | skipped
+    note = mapped_column(String, nullable=True)        # cook's reason when not_done (or a done note)
+    done_at = mapped_column(Float, nullable=True)
+    done_by = mapped_column(String, nullable=True)
+    notified_manager = mapped_column(Integer, default=0)  # bool 0/1 — overdue/not-done notice already raised
+
+    def __repr__(self):
+        return (f"<KitchenTask id={self.id} key={self.template_key!r} "
+                f"sim_day={self.sim_day} status={self.status!r}>")
+
+
+class ShiftCheckin(Base):
+    """Per-(staff, sim_day) shift check-in state for the cook desk staff board.
+
+    Kept separate from ``Attendance`` (which drives leave/sick menu-availability):
+    this only tracks whether a staff member has clocked in for their shift and
+    whether they were late/absent, which is surfaced to the manager desk.
+    """
+    __tablename__ = "shift_checkins"
+
+    id = _pk()
+    staff_id = mapped_column(ForeignKey("staff.id"), index=True)
+    sim_day = mapped_column(Integer, index=True)
+    status = mapped_column(String, default="absent")   # present | late | absent
+    shift_start = mapped_column(Float)                  # absolute sim-seconds
+    checked_in_at = mapped_column(Float, nullable=True)
+    source = mapped_column(String, default="manual")   # auto | manual
+    notified_manager = mapped_column(Integer, default=0)  # bool 0/1 — late/absent alert raised
+
+    def __repr__(self):
+        return (f"<ShiftCheckin id={self.id} staff_id={self.staff_id} "
+                f"sim_day={self.sim_day} status={self.status!r}>")
+
+
 class MenuToggle(Base):
     __tablename__ = "menu_toggles"
 
@@ -996,6 +1048,7 @@ class SimSettings(Base):
     anomaly_injections = mapped_column(JSON)
     availability_oos_mode = mapped_column(String, default="threshold")  # "threshold" | "zero"
     batch_auto_qty = mapped_column(Integer, default=0)  # bool 0/1 — forecaster may adjust batch quantities without approval
+    staff_checkin_mode = mapped_column(String, default="sim_auto")  # "sim_auto" | "manual" — cook-desk staff board
 
     def __repr__(self):
         return (f"<SimSettings id={self.id} base_orders_per_day={self.base_orders_per_day} "
@@ -1319,7 +1372,7 @@ REFERENCE_MODELS = [
 TRANSACTIONAL_MODELS = [
     InventoryLot, InventoryLedger, InventoryLevel, Order, OrderLine,
     Batch, WasteEvent, PurchaseOrder, PurchaseOrderLine, MenuToggle,
-    Attendance,
+    Attendance, KitchenTask, ShiftCheckin,
 ]
 
 INTELLIGENCE_MODELS = [

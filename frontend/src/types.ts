@@ -39,6 +39,8 @@ export type ApprovalType =
   | "outbound_call"
   | "forecast_override_proposal"
   | "batch"
+  | "kitchen_task"
+  | "staff_shift"
   | "other";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";

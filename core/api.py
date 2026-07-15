@@ -212,6 +212,8 @@ def _migrate_schema() -> None:
         ("sim_settings", "availability_oos_mode", "ALTER TABLE sim_settings ADD COLUMN availability_oos_mode TEXT DEFAULT 'threshold'"),
         ("menu_toggles", "reason_code", "ALTER TABLE menu_toggles ADD COLUMN reason_code TEXT"),
         ("sim_settings", "batch_auto_qty", "ALTER TABLE sim_settings ADD COLUMN batch_auto_qty INTEGER DEFAULT 0"),
+        ("sim_settings", "staff_checkin_mode", "ALTER TABLE sim_settings ADD COLUMN staff_checkin_mode TEXT DEFAULT 'sim_auto'"),
+        ("kitchen_tasks", "note", "ALTER TABLE kitchen_tasks ADD COLUMN note TEXT"),
     ]
     with db.engine.connect() as conn:
         for table, column, ddl in migrations:
@@ -220,6 +222,24 @@ def _migrate_schema() -> None:
             if column not in existing_cols:
                 conn.execute(text(ddl))
                 conn.commit()
+
+
+def _kitchen_engine_tick() -> None:
+    """Interval trigger: escalate overdue tasks + late/absent staff to the manager.
+
+    Runs on its own session; idempotent via each row's ``notified_manager`` flag,
+    so it delivers alerts even when no cook desk is polling the boards.
+    """
+    from . import kitchen_tasks, staff_shifts
+    now = float(ctx.clock.sim_time)
+    session = db.new_session()
+    try:
+        kitchen_tasks.reconcile(session, now=now, cuisine=_active_cuisine(), approvals=ctx.approvals)
+        staff_shifts.reconcile(session, now=now, approvals=ctx.approvals)
+    except Exception:  # noqa: BLE001 - a reconcile hiccup must not stall the sim
+        logger.exception("kitchen_engine tick failed")
+    finally:
+        session.close()
 
 
 def _bootstrap() -> None:
@@ -291,6 +311,12 @@ def _bootstrap() -> None:
         lambda: scenarios.tick(clock.sim_time),
         interval_sim_s=SCENARIO_TICK_INTERVAL_SIM_S,
         name="scenario_engine",
+    )
+    orchestrator.register(
+        "interval",
+        _kitchen_engine_tick,
+        interval_sim_s=300.0,  # every 5 sim-min: escalate overdue tasks + late/absent staff
+        name="kitchen_engine",
     )
 
     # Ship the flagship Friday Rush scenario on first run.
@@ -2083,6 +2109,112 @@ def kitchen_waste(body: KitchenWasteBody) -> Dict[str, Any]:
         target_agents=["forecaster", "ledger"],
     )
     return {"waste_event_id": we_id, "status": "recorded"}
+
+
+# ---------------------------------------------------------------------------
+# Kitchen tasks & staff check-in (cook-desk modes: tasks / staff)
+# ---------------------------------------------------------------------------
+
+
+def _active_cuisine() -> Optional[str]:
+    """Resolve the current restaurant cuisine from the active seed.
+
+    Prefers the preset bundle's ``meta.cuisine``; falls back to treating the
+    seed id itself as a cuisine (generated restaurants set it to the cuisine).
+    """
+    session = db.new_session()
+    try:
+        state = get_or_create_sim_state(session)
+        seed = state.active_seed_id if state is not None else None
+    finally:
+        session.close()
+    if not seed:
+        return None
+    try:
+        from .seeding import DATA_DIR
+        path = DATA_DIR / f"{seed}.json"
+        if path.exists():
+            import json as _json
+            meta = _json.loads(path.read_text()).get("meta", {})
+            return meta.get("cuisine") or seed
+    except Exception:  # noqa: BLE001
+        pass
+    return str(seed)
+
+
+class TaskOutcomeBody(BaseModel):
+    status: str = "done"  # "done" | "not_done" | "pending"
+    note: Optional[str] = None
+    by: str = "cook"
+
+
+class StaffModeBody(BaseModel):
+    mode: str  # "sim_auto" | "manual"
+
+
+@app.get("/api/kitchen/tasks/board")
+def kitchen_tasks_board(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Today's kitchen checklist tasks + counts (reconciles overdue → manager)."""
+    from . import kitchen_tasks
+    now = float(ctx.clock.sim_time)
+    cuisine = _active_cuisine()
+    kitchen_tasks.reconcile(db_session, now=now, cuisine=cuisine, approvals=ctx.approvals)
+    return kitchen_tasks.task_board(db_session, now=now, cuisine=cuisine)
+
+
+@app.post("/api/kitchen/tasks/{task_id}/outcome")
+def kitchen_task_outcome(task_id: int, body: TaskOutcomeBody) -> Dict[str, Any]:
+    """Cook records a task outcome: done, not_done (with a reason → manager notice), or pending."""
+    from . import kitchen_tasks
+    now = float(ctx.clock.sim_time)
+    session = db.new_session()
+    try:
+        t = kitchen_tasks.set_outcome(
+            session, task_id, status=body.status, note=body.note, by=body.by,
+            now=now, approvals=ctx.approvals,
+        )
+        if t is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        return {"task_id": task_id, "status": t.status, "note": t.note}
+    finally:
+        session.close()
+
+
+@app.get("/api/kitchen/staff/board")
+def kitchen_staff_board(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
+    """Staff check-in board for today (reconciles late/absent → manager)."""
+    from . import staff_shifts
+    now = float(ctx.clock.sim_time)
+    staff_shifts.reconcile(db_session, now=now, approvals=ctx.approvals)
+    return staff_shifts.staff_board(db_session, now=now)
+
+
+@app.post("/api/kitchen/staff/mode")
+def kitchen_staff_mode(body: StaffModeBody) -> Dict[str, Any]:
+    """Switch staff check-in mode (sim_auto | manual); re-seeds today's rows."""
+    from . import staff_shifts
+    now = float(ctx.clock.sim_time)
+    session = db.new_session()
+    try:
+        mode = staff_shifts.set_mode(session, body.mode, now=now)
+        return {"mode": mode}
+    finally:
+        session.close()
+
+
+@app.post("/api/kitchen/staff/{staff_id}/checkin")
+def kitchen_staff_checkin(staff_id: int, undo: bool = Query(False)) -> Dict[str, Any]:
+    """Clock a staff member in for their shift (or undo with ?undo=true)."""
+    from . import staff_shifts
+    now = float(ctx.clock.sim_time)
+    session = db.new_session()
+    try:
+        res = (staff_shifts.undo_checkin if undo else staff_shifts.checkin)(session, staff_id, now=now)
+        if res is None:
+            raise HTTPException(status_code=404, detail=f"Staff {staff_id} not on today's roster")
+        return res
+    finally:
+        session.close()
 
 
 # ---------------------------------------------------------------------------

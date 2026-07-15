@@ -2,8 +2,11 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Loader2, ChefHat, Trash2, Send, RefreshCw, Check, X,
   ChevronDown, ChevronUp, BookOpen, CheckSquare, Minus, Plus,
+  LayoutGrid, ClipboardList, Users,
 } from "lucide-react";
 import { useVoiceLive } from "./useVoiceLive";
+import { TasksPanel, StaffPanel, TaskCard, useTasksBoard } from "./CookPanels";
+import type { KitchenTask, TaskOutcome } from "./CookPanels";
 import { MicButton } from "./MicButton";
 import { PlanConfirmCard } from "./PlanConfirmCard";
 import { ForecastCard } from "./ForecastCard";
@@ -301,8 +304,10 @@ function TextFallback({ onSend }: { onSend: (t: string) => void }) {
 
 export function CookVoice() {
   const live = useVoiceLive("cook");
+  const tasks = useTasksBoard();
   const [board, setBoard] = useState<KitchenBoard | null>(null);
   const [loading, setLoading] = useState(true);
+  const [deskMode, setDeskMode] = useState<"all" | "batches" | "tasks" | "staff">("all");
   const [showDev, setShowDev] = useState(false);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
 
@@ -378,6 +383,18 @@ export function CookVoice() {
       live.setDone("Clarification submitted.");
     } catch { /* ignore */ }
   }
+
+  // Hand a task off to Roba voice: seed the live session so Roba asks what
+  // happened, then records the outcome via the record_task_outcome tool.
+  function handleAssignVoice(task: KitchenTask) {
+    live.sendText(
+      `I'm reporting on the kitchen task "${task.title}" (task #${task.id}). ` +
+      `Ask me what happened, then call record_task_outcome with task_reference="${task.id}", ` +
+      `done=true or false, and my notes.`
+    );
+  }
+
+  const handleTaskOutcome = (t: KitchenTask, status: TaskOutcome, note?: string) => tasks.setOutcome(t, status, note);
 
   const isUnavailable = live.state === "unavailable";
   const nowSim = board?.generated_at_sim ?? 0;
@@ -634,7 +651,7 @@ export function CookVoice() {
   // Batches panel (shared — rendered in left column on lg, above voice on sm)
   // -------------------------------------------------------------------------
   const batchesPanel = (
-    <section className="flex flex-col min-h-0 rounded-xl border border-muted/40 bg-surface/60 overflow-hidden">
+    <section className="flex flex-1 flex-col min-h-0 rounded-xl border border-muted/40 bg-surface/60 overflow-hidden">
       {/* Header with counts */}
       <div className="shrink-0 flex items-center justify-between px-4 py-3 border-b border-muted/30">
         <div className="flex items-center gap-2">
@@ -695,6 +712,87 @@ export function CookVoice() {
   );
 
   // -------------------------------------------------------------------------
+  // Mode tabs + the left-column content for the active mode
+  // -------------------------------------------------------------------------
+  const DESK_TABS = [
+    { key: "all", label: "All", icon: LayoutGrid },
+    { key: "batches", label: "Batches", icon: ChefHat },
+    { key: "tasks", label: "Tasks", icon: ClipboardList },
+    { key: "staff", label: "Staff", icon: Users },
+  ] as const;
+
+  const deskTabs = (
+    <div className="shrink-0 inline-flex self-start rounded-lg border border-muted/60 bg-surface/60 p-0.5">
+      {DESK_TABS.map(({ key, label, icon: Icon }) => (
+        <button
+          key={key}
+          onClick={() => setDeskMode(key)}
+          className={[
+            "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+            deskMode === key ? "bg-accent text-white shadow-sm" : "text-text/50 hover:text-text",
+          ].join(" ")}
+        >
+          <Icon size={14} /> {label}
+        </button>
+      ))}
+    </div>
+  );
+
+  // "All" mode — one time-sorted feed of OUTSTANDING batch + task cards.
+  // Outstanding batches: ready-to-cook / awaiting-approval (exclude cooked/skipped).
+  // Outstanding tasks: still pending (exclude done / not_done / skipped).
+  type AllItem =
+    | { kind: "batch"; time: number; batch: BoardBatch }
+    | { kind: "task"; time: number; task: KitchenTask };
+  const outstandingBatches = sortedBatches.filter(
+    b => b.state === "ready_to_cook" || b.state === "awaiting_approval"
+  );
+  const outstandingTasks = (tasks.board?.tasks ?? []).filter(t => t.status === "pending");
+  const allItems: AllItem[] = [
+    ...outstandingBatches.map(b => ({ kind: "batch" as const, time: b.cook_by ?? Number.POSITIVE_INFINITY, batch: b })),
+    ...outstandingTasks.map(t => ({ kind: "task" as const, time: t.due_sim_time ?? Number.POSITIVE_INFINITY, task: t })),
+  ].sort((a, b) => a.time - b.time);
+
+  const allPanel = (
+    <section className="flex flex-1 flex-col min-h-0 rounded-xl border border-muted/40 bg-surface/60 overflow-hidden">
+      <div className="shrink-0 flex items-center justify-between px-4 py-3 border-b border-muted/30">
+        <div className="flex items-center gap-2">
+          <LayoutGrid size={14} className="text-accent" />
+          <span className="text-sm font-semibold text-text">Up next</span>
+        </div>
+        <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-xs justify-end">
+          {outstandingBatches.length > 0 && <span className="text-accent font-medium">{outstandingBatches.length} batches</span>}
+          {outstandingTasks.length > 0 && <span className="text-text/50 font-medium">{outstandingTasks.length} tasks</span>}
+        </div>
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
+        {allItems.length === 0 ? (
+          <div className="py-10 text-center text-sm text-text/30">Nothing outstanding — all caught up.</div>
+        ) : (
+          allItems.map(item =>
+            item.kind === "batch"
+              ? <BatchCard key={`b-${item.batch.id}`} batch={item.batch} nowSim={nowSim} onCheck={handleCheck} />
+              : <TaskCard key={`t-${item.task.id}`} task={item.task} nowSim={tasks.board?.generated_at_sim ?? nowSim} onOutcome={handleTaskOutcome} onAssignVoice={handleAssignVoice} />
+          )
+        )}
+      </div>
+    </section>
+  );
+
+  const activePanel =
+    deskMode === "batches" ? batchesPanel
+    : deskMode === "tasks" ? <TasksPanel onAssignVoice={handleAssignVoice} />
+    : deskMode === "staff" ? <StaffPanel />
+    : allPanel;
+
+  const leftColumn = (
+    <div className="flex flex-col gap-3 min-h-0 h-full">
+      {deskTabs}
+      {activePanel}
+    </div>
+  );
+
+  // -------------------------------------------------------------------------
   // Page layout
   //
   // lg+:  two columns — batches (left, fills height) | voice (right, fills height)
@@ -706,8 +804,8 @@ export function CookVoice() {
       {/* ── LARGE screens: side-by-side ───────────────────────────────────── */}
       {/* Voice pane is wider (55%) so ForecastCards and other infographics have room */}
       <div className="hidden lg:grid lg:grid-cols-[minmax(0,9fr)_minmax(0,11fr)] gap-4 h-full min-h-0">
-        {/* Left — scrollable batch list */}
-        {batchesPanel}
+        {/* Left — mode tabs + active board */}
+        {leftColumn}
 
         {/* Right — voice pane. overflow-hidden so transcript's flex-1 fills
              the remaining height rather than the whole column scrolling. */}
@@ -729,9 +827,9 @@ export function CookVoice() {
           {voiceCards}
         </div>
 
-        {/* Batches fills the available middle space */}
+        {/* Mode tabs + active board fills the available middle space */}
         <div className="flex-1 min-h-0">
-          {batchesPanel}
+          {leftColumn}
         </div>
 
         {/* Transcript — collapsible to keep small screens clean */}
