@@ -350,13 +350,16 @@ _TOOLS: list[dict[str, Any]] = [
                     "Disable (turn off) a menu item so it cannot be ordered. "
                     "This is a manual sticky disable — it stays off until explicitly re-enabled. "
                     "Use this when the manager says 'disable X', 'take X off the menu', etc. "
+                    "To disable MULTIPLE dishes, pass ALL of them in item_names in ONE call — "
+                    "never call this tool more than once in a turn. "
                     "Pass category to bulk-disable all active items in a category (e.g. 'pasta'). "
                     "Pass name_contains to bulk-disable all active items whose name contains that string."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "item_name": {"type": "string", "description": "The dish name to disable (single item)."},
+                        "item_name": {"type": "string", "description": "A single dish name to disable."},
+                        "item_names": {"type": "array", "items": {"type": "string"}, "description": "Multiple dish names to disable in one call (e.g. ['Pasta Pomodoro', 'Spaghetti Carbonara'])."},
                         "category": {"type": "string", "description": "Bulk: disable all active items in this category."},
                         "name_contains": {"type": "string", "description": "Bulk: disable all active items whose name contains this string."},
                         "reason": {"type": "string", "description": "Optional reason for the disable."},
@@ -367,13 +370,15 @@ _TOOLS: list[dict[str, Any]] = [
                 "name": "enable_menu_item",
                 "description": (
                     "Re-enable a disabled menu item. Clears all blocks (including manual and stock-based). "
+                    "To re-enable MULTIPLE dishes, pass ALL of them in item_names in ONE call. "
                     "Pass category to bulk-enable all disabled items in a category. "
                     "Pass name_contains to bulk-enable all disabled items whose name contains that string."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "item_name": {"type": "string", "description": "The dish name to re-enable (single item)."},
+                        "item_name": {"type": "string", "description": "A single dish name to re-enable."},
+                        "item_names": {"type": "array", "items": {"type": "string"}, "description": "Multiple dish names to re-enable in one call."},
                         "category": {"type": "string", "description": "Bulk: re-enable all disabled items in this category."},
                         "name_contains": {"type": "string", "description": "Bulk: re-enable all disabled items whose name contains this string."},
                     },
@@ -774,6 +779,19 @@ User: "Disable Margherita Pizza."
 → [after confirm] "Margherita Pizza has been disabled."
 → [auto mode] "Margherita Pizza is now disabled."
 
+User: "Disable the pastas and the spaghettis."   # loose/plural names — resolve to the real dishes; ONE call, ONE card
+→ disable_menu_item(item_names=["Pasta Pomodoro", "Spaghetti Carbonara"])
+→ [confirm mode] "I'll disable Pasta Pomodoro and Spaghetti Carbonara — a confirmation card is on screen."
+→ [after confirm] "Pasta Pomodoro and Spaghetti Carbonara have been disabled."
+# NEVER call disable_menu_item twice in a turn — put every dish in item_names.
+
+User: "I couldn't preheat the grill, the stove is broken."   # incomplete task + follow-up disable
+→ record_task_outcome(task_reference="preheat cooking equipment", done=false, notes="Stove is broken — couldn't preheat.")
+→ "Logged as not done and flagged to the manager. Which dishes are affected so I can take them off the menu?"
+User: "The pastas and the spaghettis."
+→ disable_menu_item(item_names=["Pasta Pomodoro", "Spaghetti Carbonara"], reason="stove broken")
+→ [confirm mode] "I'll disable Pasta Pomodoro and Spaghetti Carbonara — a confirmation card is on screen."
+
 User: "All the tomatoes have spoiled."
 → record_spoilage(ingredient_name="Tomato", all_stock=true)
 → [confirm mode] "I'll zero the Tomato stock and auto-disable affected dishes — a confirmation card is on screen."
@@ -970,6 +988,8 @@ _SYSTEM_INSTRUCTIONS: Dict[str, str] = {
         "• Waste (dish) → record_waste(item_name=..., qty=..., cause=...)\n"
         "• Task done / not done → record_task_outcome(task_reference=..., done=true/false, notes=...)\n"
         "  ↳ When a task wasn't done, set done=false and capture WHY in notes (it goes to the manager).\n"
+        "• Take dish(es) off the menu → disable_menu_item(item_names=[...])  (ONE call for ALL dishes)\n"
+        "  ↳ Loose/plural names like 'the pastas' map to real dishes (Pasta Pomodoro); never call disable twice in a turn.\n"
         "• Ingredient spoiled → record_spoilage(ingredient_name=..., all_stock=...)\n"
         "• Inventory check → get_inventory(item_name=...)\n"
         "• Dish forecast → forecast_demand(range=week|day|daypart, item_name=...)\n"
@@ -2079,6 +2099,7 @@ async def _execute_tool(
                 reason=str(args.get("reason", "voice request")),
                 category=args.get("category") or None,
                 name_contains=args.get("name_contains") or None,
+                item_names=args.get("item_names") or None,
                 mode=mode,
             )
 
@@ -2090,6 +2111,7 @@ async def _execute_tool(
                 item_name=str(args.get("item_name", "")),
                 category=args.get("category") or None,
                 name_contains=args.get("name_contains") or None,
+                item_names=args.get("item_names") or None,
                 mode=mode,
             )
 

@@ -306,6 +306,58 @@ class VoiceActions:
     # Write tools
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _names_label(names: List[str]) -> str:
+        """Join dish names naturally: 'A', 'A and B', 'A, B, and C'."""
+        if len(names) == 1:
+            return names[0]
+        if len(names) == 2:
+            return f"{names[0]} and {names[1]}"
+        return ", ".join(names[:-1]) + f", and {names[-1]}"
+
+    def _resolve_menu_targets(
+        self,
+        *,
+        active: int,
+        item_name: str,
+        item_names: Optional[List[str]],
+        category: Optional[str],
+        name_contains: Optional[str],
+    ) -> tuple:
+        """Resolve a disable/enable request to (item_ids[(id,name)], unresolved[names]).
+
+        ``active`` filters the category/name_contains bulk query (1 = disable
+        active items, 0 = enable disabled items).  ``item_name``/``item_names``
+        resolve by fuzzy name across ALL items via :meth:`_resolve_menu_item`.
+        """
+        from .models import MenuItem
+        names = list(item_names) if item_names else ([item_name] if item_name else [])
+        if names:
+            item_ids: list = []
+            unresolved: list = []
+            seen = set()
+            for nm in names:
+                iid, rname = self._resolve_menu_item(nm)
+                if iid is None:
+                    unresolved.append(nm)
+                elif iid not in seen:
+                    seen.add(iid)
+                    item_ids.append((iid, rname))
+            return item_ids, unresolved
+        if category or name_contains:
+            session = self.db_session_factory()
+            try:
+                q = session.query(MenuItem).filter(MenuItem.active == active)
+                if category:
+                    q = q.filter(MenuItem.category.ilike(f"%{category}%"))
+                if name_contains:
+                    q = q.filter(MenuItem.name.ilike(f"%{name_contains}%"))
+                matched = q.all()
+            finally:
+                session.close()
+            return [(int(mi.id), str(mi.name)) for mi in matched], []
+        return [], []
+
     def disable_menu_item(
         self,
         item_name: str = "",
@@ -313,111 +365,64 @@ class VoiceActions:
         *,
         category: Optional[str] = None,
         name_contains: Optional[str] = None,
+        item_names: Optional[List[str]] = None,
         mode: str = "confirm",
     ) -> Dict[str, Any]:
-        """Disable a menu item (sticky manual block).
+        """Disable one or more menu items (sticky manual block).
 
-        When ``category`` or ``name_contains`` is given, disables ALL active
-        matching items in bulk (returns list of names affected).
+        Pass ``item_names`` (a list) to disable several dishes in ONE call — they
+        are staged as a single confirmation card.  ``category``/``name_contains``
+        disable all active matching items in bulk.
         """
-        # ── Bulk path ────────────────────────────────────────────────────────
-        if category or name_contains:
-            from .models import MenuItem, MenuToggle
-            from .signals import SignalType
+        from .models import MenuItem, MenuToggle
+        from .signals import SignalType
 
-            session = self.db_session_factory()
-            try:
-                q = session.query(MenuItem).filter(MenuItem.active == 1)
-                if category:
-                    q = q.filter(MenuItem.category.ilike(f"%{category}%"))
-                if name_contains:
-                    q = q.filter(MenuItem.name.ilike(f"%{name_contains}%"))
-                matched = q.all()
-            finally:
-                session.close()
+        item_ids, unresolved = self._resolve_menu_targets(
+            active=1, item_name=item_name, item_names=item_names,
+            category=category, name_contains=name_contains,
+        )
+        if not item_ids:
+            if item_name or item_names:
+                missing = ", ".join(unresolved) or item_name
+                return {"need": "item_name", "question": f"I couldn't find {missing} on the menu. Which dish did you mean?"}
+            return {"need": "item_name", "question": "No active items found matching that filter."}
 
-            if not matched:
-                return {"need": "item_name", "question": f"No active items found matching that filter."}
+        matched_names = [name for _, name in item_ids]
 
-            item_ids = [(int(mi.id), str(mi.name)) for mi in matched]
-            matched_names = [name for _, name in item_ids]
-
-            def _apply_bulk():
-                from .models import MenuItem, MenuToggle
-                from .signals import SignalType
-                now = float(self.bus.sim_time)
-                session = self.db_session_factory()
-                try:
-                    for iid, iname in item_ids:
-                        item = session.get(MenuItem, iid)
-                        if item and item.active:
-                            item.active = 0
-                            session.add(MenuToggle(
-                                menu_item_id=iid,
-                                action="disable",
-                                reason=reason,
-                                reason_code="manual",
-                                triggered_by="voice",
-                                sim_time=now,
-                                active=1,
-                            ))
-                    session.commit()
-                finally:
-                    session.close()
-                for iid, _ in item_ids:
-                    self.hub_broadcast("menu_toggled", {"menu_item_id": iid, "action": "disable"})
-                return {"ok": True, "items": matched_names, "action": "disabled", "count": len(matched_names)}
-
-            label = ", ".join(matched_names[:3]) + (f" and {len(matched_names)-3} more" if len(matched_names) > 3 else "")
-            hr = f"Disable {len(matched_names)} item(s): {label}."
-            return self._stage_or_apply(mode, _apply_bulk, human_readable=hr)
-
-        # ── Single-item path ─────────────────────────────────────────────────
-        item_id, resolved_name = self._resolve_menu_item(item_name)
-        if item_id is None:
-            return {"need": "item_name", "question": f"I couldn't find '{item_name}' on the menu. Which dish did you mean?"}
-
-        def _apply():
-            from .models import MenuItem, MenuToggle
-            from .signals import SignalType
+        def _apply_bulk():
             now = float(self.bus.sim_time)
             session = self.db_session_factory()
             try:
-                item = session.get(MenuItem, item_id)
-                if item is None:
-                    return {"error": "Item not found"}
-                if not item.active:
-                    return {"ok": True, "item": resolved_name, "was_already_disabled": True}
-                item.active = 0
-                session.add(MenuToggle(
-                    menu_item_id=item_id,
-                    action="disable",
-                    reason=reason,
-                    reason_code="manual",
-                    triggered_by="voice",
-                    sim_time=now,
-                    active=1,
-                ))
+                for iid, _iname in item_ids:
+                    item = session.get(MenuItem, iid)
+                    if item and item.active:
+                        item.active = 0
+                        session.add(MenuToggle(
+                            menu_item_id=iid, action="disable", reason=reason,
+                            reason_code="manual", triggered_by="voice", sim_time=now, active=1,
+                        ))
                 session.commit()
             finally:
                 session.close()
-            self.hub_broadcast("menu_toggled", {"menu_item_id": item_id, "action": "disable"})
-            try:
-                self.bus.emit(
-                    SignalType.MENU_TOGGLE,
-                    {"menu_item_id": item_id, "action": "disable", "reason": reason},
-                    source="voice",
-                    dedup_key=f"toggle:{item_id}",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return {"ok": True, "item": resolved_name, "action": "disabled"}
+            for iid, _ in item_ids:
+                self.hub_broadcast("menu_toggled", {"menu_item_id": iid, "action": "disable"})
+                try:
+                    self.bus.emit(
+                        SignalType.MENU_TOGGLE,
+                        {"menu_item_id": iid, "action": "disable", "reason": reason},
+                        source="voice", dedup_key=f"toggle:{iid}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            result = {"ok": True, "items": matched_names, "action": "disabled", "count": len(matched_names)}
+            if unresolved:
+                result["unresolved"] = unresolved
+            return result
 
-        return self._stage_or_apply(
-            mode,
-            _apply,
-            human_readable=f"Disable {resolved_name} on the menu.",
-        )
+        hr = f"Disable {self._names_label(matched_names)} on the menu."
+        if unresolved:
+            hr += f" (couldn't find: {', '.join(unresolved)})"
+        return self._stage_or_apply(mode, _apply_bulk, human_readable=hr)
 
     def enable_menu_item(
         self,
@@ -425,119 +430,67 @@ class VoiceActions:
         *,
         category: Optional[str] = None,
         name_contains: Optional[str] = None,
+        item_names: Optional[List[str]] = None,
         mode: str = "confirm",
     ) -> Dict[str, Any]:
-        """Re-enable a menu item — clears all blocks including manual.
+        """Re-enable one or more menu items — clears all blocks including manual.
 
-        When ``category`` or ``name_contains`` is given, enables ALL matching
-        disabled items in bulk.
+        Pass ``item_names`` (a list) to re-enable several dishes in ONE call.
+        ``category``/``name_contains`` re-enable all matching disabled items.
         """
-        # ── Bulk path ────────────────────────────────────────────────────────
-        if category or name_contains:
-            from .models import MenuItem, MenuToggle
+        from .models import MenuItem, MenuToggle
+        from .signals import SignalType
 
-            session = self.db_session_factory()
-            try:
-                q = session.query(MenuItem).filter(MenuItem.active == 0)
-                if category:
-                    q = q.filter(MenuItem.category.ilike(f"%{category}%"))
-                if name_contains:
-                    q = q.filter(MenuItem.name.ilike(f"%{name_contains}%"))
-                matched = q.all()
-            finally:
-                session.close()
+        item_ids, unresolved = self._resolve_menu_targets(
+            active=0, item_name=item_name, item_names=item_names,
+            category=category, name_contains=name_contains,
+        )
+        if not item_ids:
+            if item_name or item_names:
+                missing = ", ".join(unresolved) or item_name
+                return {"need": "item_name", "question": f"I couldn't find {missing} on the menu."}
+            return {"need": "item_name", "question": "No disabled items found matching that filter."}
 
-            if not matched:
-                return {"need": "item_name", "question": "No disabled items found matching that filter."}
+        matched_names = [name for _, name in item_ids]
 
-            item_ids = [(int(mi.id), str(mi.name)) for mi in matched]
-            matched_names = [name for _, name in item_ids]
-
-            def _apply_bulk_enable():
-                from .models import MenuItem, MenuToggle
-                from .signals import SignalType
-                now = float(self.bus.sim_time)
-                session = self.db_session_factory()
-                try:
-                    for iid, iname in item_ids:
-                        item = session.get(MenuItem, iid)
-                        if item and not item.active:
-                            item.active = 1
-                            session.query(MenuToggle).filter(
-                                MenuToggle.menu_item_id == iid,
-                                MenuToggle.active == 1,
-                            ).update({MenuToggle.active: 0})
-                            session.add(MenuToggle(
-                                menu_item_id=iid,
-                                action="enable",
-                                reason="manual voice enable",
-                                reason_code="manual",
-                                triggered_by="voice",
-                                sim_time=now,
-                                active=1,
-                            ))
-                    session.commit()
-                finally:
-                    session.close()
-                for iid, _ in item_ids:
-                    self.hub_broadcast("menu_toggled", {"menu_item_id": iid, "action": "enable"})
-                return {"ok": True, "items": matched_names, "action": "enabled", "count": len(matched_names)}
-
-            label = ", ".join(matched_names[:3]) + (f" and {len(matched_names)-3} more" if len(matched_names) > 3 else "")
-            hr = f"Re-enable {len(matched_names)} item(s): {label}."
-            return self._stage_or_apply(mode, _apply_bulk_enable, human_readable=hr)
-
-        # ── Single-item path ─────────────────────────────────────────────────
-        item_id, resolved_name = self._resolve_menu_item(item_name)
-        if item_id is None:
-            return {"need": "item_name", "question": f"I couldn't find '{item_name}' on the menu."}
-
-        def _apply():
-            from .models import MenuItem, MenuToggle
-            from .signals import SignalType
+        def _apply_bulk_enable():
             now = float(self.bus.sim_time)
             session = self.db_session_factory()
             try:
-                item = session.get(MenuItem, item_id)
-                if item is None:
-                    return {"error": "Item not found"}
-                if item.active:
-                    return {"ok": True, "item": resolved_name, "was_already_enabled": True}
-                item.active = 1
-                # Clear ALL active blocks for a manual enable.
-                session.query(MenuToggle).filter(
-                    MenuToggle.menu_item_id == item_id,
-                    MenuToggle.active == 1,
-                ).update({MenuToggle.active: 0})
-                session.add(MenuToggle(
-                    menu_item_id=item_id,
-                    action="enable",
-                    reason="manual voice enable",
-                    reason_code="manual",
-                    triggered_by="voice",
-                    sim_time=now,
-                    active=1,
-                ))
+                for iid, _iname in item_ids:
+                    item = session.get(MenuItem, iid)
+                    if item and not item.active:
+                        item.active = 1
+                        session.query(MenuToggle).filter(
+                            MenuToggle.menu_item_id == iid,
+                            MenuToggle.active == 1,
+                        ).update({MenuToggle.active: 0})
+                        session.add(MenuToggle(
+                            menu_item_id=iid, action="enable", reason="manual voice enable",
+                            reason_code="manual", triggered_by="voice", sim_time=now, active=1,
+                        ))
                 session.commit()
             finally:
                 session.close()
-            self.hub_broadcast("menu_toggled", {"menu_item_id": item_id, "action": "enable"})
-            try:
-                self.bus.emit(
-                    SignalType.MENU_TOGGLE,
-                    {"menu_item_id": item_id, "action": "enable", "reason": "manual voice enable"},
-                    source="voice",
-                    dedup_key=f"toggle:{item_id}",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return {"ok": True, "item": resolved_name, "action": "enabled"}
+            for iid, _ in item_ids:
+                self.hub_broadcast("menu_toggled", {"menu_item_id": iid, "action": "enable"})
+                try:
+                    self.bus.emit(
+                        SignalType.MENU_TOGGLE,
+                        {"menu_item_id": iid, "action": "enable", "reason": "manual voice enable"},
+                        source="voice", dedup_key=f"toggle:{iid}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            result = {"ok": True, "items": matched_names, "action": "enabled", "count": len(matched_names)}
+            if unresolved:
+                result["unresolved"] = unresolved
+            return result
 
-        return self._stage_or_apply(
-            mode,
-            _apply,
-            human_readable=f"Re-enable {resolved_name} on the menu.",
-        )
+        hr = f"Re-enable {self._names_label(matched_names)} on the menu."
+        if unresolved:
+            hr += f" (couldn't find: {', '.join(unresolved)})"
+        return self._stage_or_apply(mode, _apply_bulk_enable, human_readable=hr)
 
     def adjust_inventory(
         self,
@@ -1413,20 +1366,46 @@ class VoiceActions:
         return None, None
 
     def _resolve_menu_item(self, name: str) -> tuple:
-        """Returns (menu_item_id, resolved_name) or (None, None)."""
+        """Returns (menu_item_id, resolved_name) or (None, None).
+
+        Matching is tolerant of loose/plural references so "pastas" resolves to
+        "Pasta Pomodoro" and "spaghettis" to "Spaghetti Carbonara":
+          1. exact name,
+          2. whole-string substring (either direction),
+          3. token/stem match — a word from the query (plural-stemmed) equals or
+             prefixes a word in the dish name.
+        Longer dish names are tried first so more-specific matches win.
+        """
+        import re
         from .models import MenuItem
         needle = name.strip().lower()
+        if not needle:
+            return None, None
         session = self.db_session_factory()
         try:
             items = session.query(MenuItem).all()
-            for mi in sorted(items, key=lambda i: len(i.name or ""), reverse=True):
-                if (mi.name or "").lower() == needle:
-                    return int(mi.id), str(mi.name)
-            for mi in sorted(items, key=lambda i: len(i.name or ""), reverse=True):
-                if needle in (mi.name or "").lower():
-                    return int(mi.id), str(mi.name)
         finally:
             session.close()
+        ordered = sorted(items, key=lambda i: len(i.name or ""), reverse=True)
+
+        # 1. exact
+        for mi in ordered:
+            if (mi.name or "").lower() == needle:
+                return int(mi.id), str(mi.name)
+        # 2. whole-string substring, either direction
+        for mi in ordered:
+            nm = (mi.name or "").lower()
+            if needle in nm or (len(needle) >= 4 and nm in needle):
+                return int(mi.id), str(mi.name)
+        # 3. token/stem match (plural-tolerant)
+        def _stem(w: str) -> str:
+            return w[:-1] if len(w) > 3 and w.endswith("s") else w
+        needle_stems = {_stem(t) for t in re.findall(r"[a-z0-9]+", needle) if len(t) >= 3}
+        for mi in ordered:
+            tokens = [_stem(t) for t in re.findall(r"[a-z0-9]+", (mi.name or "").lower()) if len(t) >= 3]
+            for ns in needle_stems:
+                if any(tok == ns or tok.startswith(ns) or ns.startswith(tok) for tok in tokens):
+                    return int(mi.id), str(mi.name)
         return None, None
 
     def _resolve_staff(self, name_or_role: str) -> List[Dict[str, Any]]:
