@@ -30,10 +30,25 @@ class FreeGoodsOffer:
 
 
 @dataclass
+class FreeDeliveryOffer:
+    """One ``free_delivery`` SupplierTerm in a MILP-consumable form.
+
+    Modelled as a delivery-charge rebate gated on the supplier-day order value
+    (``min_order_value``), NOT a pre-zeroed charge — otherwise the solver could
+    open a free delivery-day and harvest other promo benefits without buying.
+    """
+    supplier_id: int
+    min_order_value: float     # € spend threshold; 0.0 = unconditional
+    remaining_orders: Optional[int]  # None = no cap
+    term_id: int
+
+
+@dataclass
 class AppliedTerms:
     catalog: List[Dict[str, Any]]           # milp_catalog with prices/availability adjusted
     suppliers: List[Dict[str, Any]]          # milp_suppliers with volume_discount extended
     free_goods_offers: List[FreeGoodsOffer] = field(default_factory=list)
+    free_delivery_offers: List["FreeDeliveryOffer"] = field(default_factory=list)
 
 
 def apply_supplier_terms(
@@ -54,7 +69,8 @@ def apply_supplier_terms(
     - discount multiplies the current price.
     - threshold_discount is appended to volume_discount tiers.
     - free_goods is returned as FreeGoodsOffer objects.
-    - free_delivery zeroes the supplier's delivery_charge while the term is live.
+    - free_delivery is returned as FreeDeliveryOffer objects (MOV-gated rebate
+      applied inside the MILP, not a pre-zeroed charge).
     - unavailable sets availability to 'out'.
     - lead_time_override replaces lead_time_days.
     """
@@ -125,8 +141,9 @@ def apply_supplier_terms(
 
     # --- Adjust supplier rows ------------------------------------------------
     # Also collect threshold_discount terms as extra volume_discount tiers.
-    # free_goods terms become FreeGoodsOffer objects returned separately.
+    # free_goods / free_delivery terms become offer objects returned separately.
     free_goods_offers: List[FreeGoodsOffer] = []
+    free_delivery_offers: List[FreeDeliveryOffer] = []
     new_suppliers: List[Dict[str, Any]] = []
 
     for s in suppliers:
@@ -137,16 +154,21 @@ def apply_supplier_terms(
 
         # Collect all terms for this supplier (scope=all only — lead/threshold are supplier-level)
         all_terms = term_map.get((s_id, None), [])
-        free_delivery = False
         for t in all_terms:
             tt = t.term_type
             if tt == "free_delivery":
-                # Waive the delivery charge while the term is live. Expiry
-                # (date / next-N-orders) is already enforced by _term_is_live,
-                # and order-count is decremented on PO placement.
-                # ponytail: waiver is unconditional while live; MOV-gating it to
-                # orders ≥ min_order_value would need the free-goods big-M gate.
-                free_delivery = True
+                # Delivery-charge rebate gated on the supplier-day order value
+                # (mirrors free_goods). Do NOT pre-zero the charge: an
+                # unconditional zero lets the solver open a free delivery-day to
+                # harvest other promo benefits without buying (the €100 threshold
+                # would be bypassed). Expiry (date / next-N-orders) is enforced by
+                # _term_is_live; order-count decrements on PO placement.
+                free_delivery_offers.append(FreeDeliveryOffer(
+                    supplier_id=s_id,
+                    min_order_value=float(t.min_order_value or 0.0),
+                    remaining_orders=t.remaining_orders,
+                    term_id=int(t.id),
+                ))
             elif tt == "lead_time_override":
                 base_lead = float(t.value)
             elif tt == "threshold_discount":
@@ -168,12 +190,11 @@ def apply_supplier_terms(
 
         adjusted_s["lead_time_days"] = base_lead
         adjusted_s["volume_discount"] = vol_disc if vol_disc else None
-        if free_delivery:
-            adjusted_s["delivery_charge"] = 0.0
         new_suppliers.append(adjusted_s)
 
     return AppliedTerms(
         catalog=new_catalog,
         suppliers=new_suppliers,
         free_goods_offers=free_goods_offers,
+        free_delivery_offers=free_delivery_offers,
     )

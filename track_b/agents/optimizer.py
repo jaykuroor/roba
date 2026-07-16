@@ -653,6 +653,7 @@ class InventoryOptimizer(BaseAgent):
             milp_catalog = _applied.catalog
             milp_suppliers = _applied.suppliers
             _milp_free_goods = _applied.free_goods_offers
+            _milp_free_delivery = _applied.free_delivery_offers
 
             _lead_by_sup = {s["id"]: float(s.get("lead_time_days") or 1.0) for s in milp_suppliers}
             _delivery_hour_by_sup = {
@@ -763,6 +764,7 @@ class InventoryOptimizer(BaseAgent):
                     ),
                     "robust_min_reliability": config.RELIABILITY_ROBUST_MIN_RELIABILITY,
                     "free_goods_offers": _milp_free_goods,
+                    "free_delivery_offers": _milp_free_delivery,
                 },
             )
             plan_method = _solution.method
@@ -1264,6 +1266,16 @@ class InventoryOptimizer(BaseAgent):
             for order_data in final_new_orders:
                 session.add(PlannedOrder(**order_data, plan_run_id=run.id, created_at=now))
 
+            # Evaluate captured promotions against this plan and surface a
+            # manager-desk card when an active promo was offered but not used
+            # (it stays available for its remaining orders / until it expires).
+            try:
+                self._evaluate_promotions(
+                    session, now, list(getattr(_solution, "orders", []) or []), run.id
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("build_procurement_plan: promo evaluation failed", exc_info=True)
+
             session.commit()
         except Exception:  # noqa: BLE001
             session.rollback()
@@ -1278,6 +1290,135 @@ class InventoryOptimizer(BaseAgent):
             total_active, n_new, n_kept, n_superseded, horizon_days,
         )
         return total_active
+
+    # -- promotion evaluation ----------------------------------------------
+    _PROMO_TERM_TYPES = ("free_goods", "free_delivery", "threshold_discount")
+
+    @staticmethod
+    def _promo_expiry_phrase(term: Any) -> str:
+        """Human phrase describing how much of a multi-use promo remains."""
+        if term.expiry_kind == "orders":
+            n = int(term.remaining_orders or 0)
+            return f"still available for {n} more order{'s' if n != 1 else ''}"
+        if term.expiry_kind == "date" and term.expires_at:
+            days = max(0, round((float(term.expires_at) - float(term.effective_at or 0)) / SECONDS_PER_DAY))
+            return f"still available for ~{days} more day{'s' if days != 1 else ''}"
+        return "still available"
+
+    @staticmethod
+    def _promo_offer_desc(term: Any, ing_name: str) -> str:
+        mov = f" on orders ≥ €{term.min_order_value:.0f}" if term.min_order_value else ""
+        if term.term_type == "free_delivery":
+            return f"free delivery{mov}"
+        if term.term_type == "free_goods":
+            qty = f"{(term.free_qty_g or 0) / 1000:.3g}kg" if term.free_qty_g else "goods"
+            return f"free {qty} {ing_name or 'goods'}{mov}"
+        if term.term_type == "threshold_discount":
+            return f"{abs(float(term.value)) * 100:.0f}% off{mov}"
+        return term.term_type
+
+    def _evaluate_promotions(
+        self, session: Any, now: float, orders: List[Any], run_id: int
+    ) -> None:
+        """Check each active captured promotion against the freshly-built plan.
+
+        A promo "fires" when its supplier receives a single-delivery order value
+        ≥ the promo's spend threshold. When an active promo did NOT fire, post
+        (or refresh) a manager-desk card explaining it was evaluated but not used
+        and that it remains available for its uncommitted orders. The plan itself
+        stays cost/risk-optimal — this only makes the rejection transparent, and
+        because the offer is re-evaluated on every replan it can still be taken on
+        a later order while it is live.
+        """
+        terms = (
+            session.query(SupplierTerm)
+            .filter(
+                SupplierTerm.status == "active",
+                SupplierTerm.term_type.in_(self._PROMO_TERM_TYPES),
+            )
+            .all()
+        )
+        live = [t for t in terms if self._term_is_live(t)]
+
+        # Max single-delivery order value per supplier from the planned orders.
+        ov_by_sup: Dict[int, float] = {}
+        for o in orders:
+            key = (int(o.supplier_id), int(o.delivery_day))
+            ov_by_sup[key] = ov_by_sup.get(key, 0.0) + float(o.qty) * float(o.unit_price)
+        max_ov_by_sup: Dict[int, float] = {}
+        for (s_id, _d), val in ov_by_sup.items():
+            max_ov_by_sup[s_id] = max(max_ov_by_sup.get(s_id, 0.0), val)
+
+        # Group live promos by supplier; a supplier's promos are "unused" when the
+        # best single-delivery order value to it falls short of every promo's MOV.
+        by_sup: Dict[int, List[Any]] = {}
+        for t in live:
+            by_sup.setdefault(int(t.supplier_id), []).append(t)
+
+        for s_id, sterms in by_sup.items():
+            best_ov = max_ov_by_sup.get(s_id, 0.0)
+            unused = [t for t in sterms if best_ov < float(t.min_order_value or 0.0) + 1e-6]
+            # Drop any stale card for this supplier first (refresh each replan).
+            self._clear_promo_cards(session, s_id)
+            if not unused:
+                continue  # promo(s) actually used → no rejection card
+            sup = session.get(Supplier, s_id)
+            sup_name = sup.name if sup else f"Supplier #{s_id}"
+            lead = float(getattr(sup, "lead_time_days", 0) or 0)
+            ing_names = {
+                i.id: i.name for i in session.query(Ingredient).filter(
+                    Ingredient.id.in_([t.free_ingredient_id for t in unused if t.free_ingredient_id] or [-1])
+                ).all()
+            }
+            offer_lines = [self._promo_offer_desc(t, ing_names.get(t.free_ingredient_id, "")) for t in unused]
+            avail = "; ".join(sorted({self._promo_expiry_phrase(t) for t in unused}))
+            mov = max(float(t.min_order_value or 0.0) for t in unused)
+            summary = (
+                f"Promotion from {sup_name} evaluated but not used — "
+                f"{', '.join(offer_lines)}. Ordering ≥ €{mov:.0f} from {sup_name} on one "
+                f"delivery wasn't cost-optimal (its {lead:g}-day lead / prices didn't beat "
+                f"current suppliers for the days needed). {avail.capitalize()}."
+            )
+            details = {
+                "supplier_id": s_id,
+                "supplier_name": sup_name,
+                "run_id": run_id,
+                "offers": offer_lines,
+                "min_order_value": mov,
+                "best_order_value": round(best_ov, 2),
+                "term_ids": [int(t.id) for t in unused],
+                "remaining": avail,
+            }
+            session.add(ManagerChange(
+                kind="promo_evaluation",
+                status="pending",
+                auto_applied=0,
+                summary=summary,
+                details=details,
+                created_at=now,
+            ))
+
+    @staticmethod
+    def _clear_promo_cards(session: Any, supplier_id: int) -> None:
+        """Remove prior (pending) promo-evaluation cards for a supplier so the
+        desk shows at most one current card per supplier."""
+        stale = (
+            session.query(ManagerChange)
+            .filter(ManagerChange.kind == "promo_evaluation", ManagerChange.status == "pending")
+            .all()
+        )
+        for c in stale:
+            if int((c.details or {}).get("supplier_id", -1)) == int(supplier_id):
+                session.delete(c)
+
+    @staticmethod
+    def _term_is_live(t: Any) -> bool:
+        """Mirror terms.apply_supplier_terms._term_is_live (order/date expiry)."""
+        if t.expiry_kind == "date" and t.expires_at is not None:
+            return True  # date validity already filtered by status; treat as live
+        if t.expiry_kind == "orders":
+            return (t.remaining_orders or 0) > 0
+        return True
 
     def execute_due_planned_orders(self) -> int:
         """Convert planned orders whose order_date <= now into real POs.

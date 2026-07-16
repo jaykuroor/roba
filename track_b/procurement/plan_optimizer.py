@@ -711,6 +711,8 @@ def _solve_milp(
     robust_min_reliability: float = float(params.get("robust_min_reliability", 0.95))
     # Free-goods offers from active SupplierTerms (threshold-gated supply benefits)
     free_goods_offers: List[Any] = list(params.get("free_goods_offers") or [])
+    # Free-delivery offers (threshold-gated delivery-charge rebate)
+    free_delivery_offers: List[Any] = list(params.get("free_delivery_offers") or [])
 
     ing_by_id: Dict[int, Dict] = {int(i["id"]): i for i in ingredients}
     sup_by_id: Dict[int, Dict] = {int(s["id"]): s for s in suppliers}
@@ -1164,6 +1166,38 @@ def _solve_milp(
         for d in range(ld, n_days):
             if (s_id, d) in deliver and (s_id, d) not in scheduled_supplier_days:
                 cash_real_terms.append(dc * deliver[s_id, d])
+
+    # (6b) Free-delivery offers → MOV-gated delivery-charge rebate (negative cash).
+    # Credits back the delivery charge only when the supplier-day order value
+    # clears the offer's spend threshold (e.g. "free delivery on orders ≥ €100").
+    # gate=1 ⇒ order value ≥ MOV; rebate = delivery_charge already charged in (6).
+    _fd_gate: Dict[Tuple[int, int], Any] = {}  # (offer_idx, s_id, d) → Binary, exposed for post-solve
+    for _fdi, _fdo in enumerate(free_delivery_offers):
+        _fds_id = int(_fdo.supplier_id)
+        _fd_dc = float(sup_by_id.get(_fds_id, {}).get("delivery_charge") or 0.0)
+        _fd_mov = float(getattr(_fdo, "min_order_value", 0.0) or 0.0)
+        ld = lead_ceil.get(_fds_id, 1)
+        for d in range(ld, n_days):
+            if (_fds_id, d) not in deliver or (_fds_id, d) in scheduled_supplier_days:
+                continue
+            _fd_ov_terms = []
+            for _iid in active_ids:
+                if (_iid, _fds_id, d) not in q:
+                    continue
+                _p_i = float(cat_by_is.get((_iid, _fds_id), {}).get("current_price") or 0.0)
+                _fd_ov_terms.append(_p_i * _x(_iid, _fds_id, d))
+            if not _fd_ov_terms:
+                continue
+            _fd_ov = pulp.lpSum(_fd_ov_terms)
+            _fd_bin = pulp.LpVariable(f"fd_{_fdi}_{_fds_id}_{d}", cat="Binary")
+            _fd_gate[_fdi, _fds_id, d] = _fd_bin
+            # Rebate can only fire on a day the supplier is actually opened.
+            prob += _fd_bin <= deliver[_fds_id, d], f"fd_open_{_fdi}_{_fds_id}_{d}"
+            if _fd_mov > 0:
+                prob += _fd_ov >= _fd_mov * _fd_bin, f"fd_lb_{_fdi}_{_fds_id}_{d}"
+                prob += _fd_ov <= _fd_mov + M_val * _fd_bin, f"fd_ub_{_fdi}_{_fds_id}_{d}"
+            if _fd_dc > 0:
+                cash_real_terms.append(-_fd_dc * _fd_bin)
 
     # (7) Supplier-level volume-discount rebates → real cash (negative)
     for s_id in all_sup_ids:

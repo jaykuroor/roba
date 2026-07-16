@@ -8,9 +8,10 @@ def _supplier(delivery_charge=12.0):
     return [{"id": 1, "delivery_charge": delivery_charge, "lead_time_days": 2.0}]
 
 
-def test_free_delivery_zeroes_delivery_charge(session_factory):
-    """A live free_delivery term waives the supplier's delivery charge (rather
-    than the old bug of a €0 price on every item)."""
+def test_free_delivery_becomes_mov_gated_offer(session_factory):
+    """A live free_delivery term is returned as a MOV-gated FreeDeliveryOffer —
+    NOT a pre-zeroed delivery charge (which the solver could exploit by opening a
+    free delivery-day to harvest other promo benefits without buying)."""
     session = session_factory()
     try:
         session.add(SupplierTerm(
@@ -21,13 +22,17 @@ def test_free_delivery_zeroes_delivery_charge(session_factory):
         ))
         session.commit()
         applied = apply_supplier_terms(session, [], _supplier(), now=1000.0)
-        assert applied.suppliers[0]["delivery_charge"] == 0.0
+        # Charge is left intact; the rebate is applied inside the MILP.
+        assert applied.suppliers[0]["delivery_charge"] == 12.0
+        assert len(applied.free_delivery_offers) == 1
+        offer = applied.free_delivery_offers[0]
+        assert offer.supplier_id == 1 and offer.min_order_value == 100.0
     finally:
         session.close()
 
 
-def test_expired_free_delivery_leaves_charge(session_factory):
-    """An order-limited free_delivery term with no orders left is not applied."""
+def test_expired_free_delivery_yields_no_offer(session_factory):
+    """An order-limited free_delivery term with no orders left produces no offer."""
     session = session_factory()
     try:
         session.add(SupplierTerm(
@@ -37,6 +42,7 @@ def test_expired_free_delivery_leaves_charge(session_factory):
         ))
         session.commit()
         applied = apply_supplier_terms(session, [], _supplier(), now=1000.0)
+        assert applied.free_delivery_offers == []
         assert applied.suppliers[0]["delivery_charge"] == 12.0
     finally:
         session.close()

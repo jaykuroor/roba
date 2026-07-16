@@ -29,6 +29,8 @@ from core.models import (
     Station,
     Supplier,
     SupplierCatalog,
+    SupplierTerm,
+    ManagerChange,
     MenuItem,
 )
 from core.signals import SignalType
@@ -1151,5 +1153,54 @@ def test_build_plan_r1_skips_when_proposed_po_covers_demand(bus, session_factory
             f"Expected 0 active planned rows when a proposed PO already covers demand, "
             f"got {active_rows}. R1 reconciliation gate is not suppressing duplicates."
         )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Promotion evaluation: an active promo that the plan does not use must surface
+# a manager-desk card noting it is still available (Phase 3, promo-awareness).
+# ---------------------------------------------------------------------------
+
+def test_unused_promo_posts_manager_card(bus, session_factory):
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0, safety_stock=10.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=100.0)
+    # Cheap default supplier (fast, no MOV) that will win the order.
+    _seed_supplier(session_factory, ing_id, lead_time_days=1.0, price=1.0, pack_size=100.0)
+    # A promo supplier that also stocks the ingredient but carries a free_delivery
+    # promo gated at €1000 — far above the tiny order value, so it can't fire.
+    promo_sid = _seed_supplier(session_factory, ing_id, lead_time_days=2.0, price=1.0, pack_size=100.0)
+    session = session_factory()
+    try:
+        session.add(SupplierTerm(
+            supplier_id=promo_sid, ingredient_id=None, term_type="free_delivery",
+            value=0.0, scope="all", effective_at=0.0, expiry_kind="orders",
+            remaining_orders=2, status="active", min_order_value=1000.0, created_at=0.0,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=1.0)
+    opt, _ = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=14.0)
+
+    session = session_factory()
+    try:
+        cards = session.query(ManagerChange).filter(
+            ManagerChange.kind == "promo_evaluation").all()
+        assert len(cards) == 1, [c.summary for c in cards]
+        assert "still available for 2 more orders" in cards[0].summary.lower()
+        assert cards[0].details["supplier_id"] == promo_sid
+    finally:
+        session.close()
+
+    # Re-running must refresh (not duplicate) the card.
+    opt.build_procurement_plan(horizon_days=14.0)
+    session = session_factory()
+    try:
+        cards = session.query(ManagerChange).filter(
+            ManagerChange.kind == "promo_evaluation").all()
+        assert len(cards) == 1, "promo card should be refreshed, not duplicated"
     finally:
         session.close()
