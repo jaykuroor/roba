@@ -374,6 +374,7 @@ function ChangeCard({
     onboarding: "New supplier",
     supplier_data: "Supplier update",
     supplier_term: "Supplier term",
+    promo_evaluation: "Promotion review",
   };
 
   async function act(action: "apply" | "revert" | "dismiss") {
