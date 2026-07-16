@@ -255,14 +255,18 @@ class LLMProvider:
         use_site: str = "",
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        model: Optional[str] = None,
     ) -> Union[str, dict]:
         """Run the fallback chain and return a parsed dict (when ``json_schema``
         is given) or a raw string. Never raises on provider failure — the chain
-        always terminates at the canned response."""
+        always terminates at the canned response.
+
+        ``model`` overrides the default Gemini model for this call only (e.g. a
+        stronger reasoning model for supplier-term extraction)."""
         cache_key = hashlib.sha256(
             json.dumps(
                 {
-                    "model": GEMINI_MODEL,
+                    "model": model or GEMINI_MODEL,
                     "messages": messages,
                     "json_schema": json_schema,
                     "temperature": temperature,
@@ -304,7 +308,7 @@ class LLMProvider:
 
             try:
                 raw = self._attempt_provider(
-                    provider, messages, json_schema, max_tokens, want_json, temperature, top_p
+                    provider, messages, json_schema, max_tokens, want_json, temperature, top_p, model
                 )
             except _SkipProvider:
                 continue
@@ -332,6 +336,7 @@ class LLMProvider:
                         want_json,
                         temperature,
                         top_p,
+                        model,
                     )
                     parsed = self._try_parse(raw2, json_schema)
                 except _SkipProvider:
@@ -451,6 +456,7 @@ class LLMProvider:
         want_json: bool,
         temperature: Optional[float],
         top_p: Optional[float],
+        model: Optional[str] = None,
     ) -> str:
         """Call one provider with exponential backoff over retryable errors.
 
@@ -461,7 +467,7 @@ class LLMProvider:
         for attempt in range(self.retries):
             try:
                 return self._call_provider(
-                    provider, messages, json_schema, max_tokens, want_json, temperature, top_p
+                    provider, messages, json_schema, max_tokens, want_json, temperature, top_p, model
                 )
             except _RetryableError as exc:
                 last_error = exc
@@ -485,9 +491,10 @@ class LLMProvider:
         want_json: bool,
         temperature: Optional[float],
         top_p: Optional[float],
+        model: Optional[str] = None,
     ) -> str:
         if provider == "gemini":
-            return self._gemini(messages, json_schema, max_tokens, want_json, temperature, top_p)
+            return self._gemini(messages, json_schema, max_tokens, want_json, temperature, top_p, model)
         raise _SkipProvider()
 
     # -- concrete providers -------------------------------------------------
@@ -500,6 +507,7 @@ class LLMProvider:
         want_json: bool,
         temperature: Optional[float],
         top_p: Optional[float],
+        model: Optional[str] = None,
     ) -> str:
         """Gemini on Vertex AI via the google-genai SDK (vertexai=True)."""
         system_parts: List[str] = []
@@ -529,7 +537,7 @@ class LLMProvider:
 
         try:
             response = self._gemini_generate(
-                client, GEMINI_MODEL, contents, gen_config
+                client, model or GEMINI_MODEL, contents, gen_config
             )
         except Exception as exc:
             self._classify_gemini_error(exc)

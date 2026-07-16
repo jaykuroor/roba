@@ -124,6 +124,10 @@ AUTO_APPLY_SUPPLIER_CHANGES = os.getenv("AUTO_APPLY_SUPPLIER_CHANGES", "0").lowe
 # forecasting, cook reports all degrade invisibly). gemini-2.5-flash-lite is the
 # lite model actually available to this project/region.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# Supplier-call outcome extraction drives real ordering, so it uses a stronger
+# reasoning model than the default (parses compound offers reliably). Runs once
+# per call, post-hangup, so latency/cost are not a concern.
+GEMINI_EXTRACTION_MODEL = os.getenv("GEMINI_EXTRACTION_MODEL", "gemini-2.5-pro")
 LLM_FALLBACK = ["gemini", "canned"]
 LLM_RETRIES = 3
 LLM_BACKOFF_BASE_S = 1.5

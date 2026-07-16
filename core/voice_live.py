@@ -636,94 +636,11 @@ _TOOLS: list[dict[str, Any]] = [
 # Call-role tool declarations & allowlist
 # ──────────────────────────────────────────────────────────────────────────────
 
-# The only tool exposed to supplier-side call roles.
-# record_supplier_update is the live capture tool: the agent calls it
-# whenever the caller states a price change, discount, or availability update.
-_RECORD_SUPPLIER_UPDATE_DECL: dict = {
-    "function_declarations": [
-        {
-            "name": "record_supplier_update",
-            "description": (
-                "Record a supplier update stated by the caller. "
-                "ALWAYS call this tool when the caller states: a new price, a discount, "
-                "an availability change (e.g. 'can't supply for 2 weeks'), or a lead-time change. "
-                "BEFORE calling, RESTATE EXACTLY what you heard to confirm — e.g. "
-                "'Just to confirm — you won't be able to supply for two weeks from now?' "
-                "ONLY call this tool after the caller explicitly confirms your restatement. "
-                "NEVER invent or assume a value the caller did not clearly state. "
-                "For availability/lead_time updates, omit 'amount' if no numeric amount was stated. "
-                "This creates a manager approval card so the update can be applied to ordering."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "update_type": {
-                        "type": "string",
-                        "enum": ["price_change", "discount", "threshold_discount", "free_goods", "availability", "lead_time", "other"],
-                        "description": "The type of update. Use 'threshold_discount' for a percentage discount that applies only when the order value exceeds a threshold (e.g. '20% off orders over €100'). Use 'free_goods' for a free item given with qualifying orders (e.g. 'free 1kg tomato on orders over €100').",
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["all", "ingredient"],
-                        "description": "'all' if the update applies to all items from this supplier; 'ingredient' if specific to one item.",
-                    },
-                    "ingredient_name": {
-                        "type": "string",
-                        "description": "The ingredient name (required when scope='ingredient').",
-                    },
-                    "amount": {
-                        "type": "number",
-                        "description": "The numeric value exactly as stated by the caller. For '20%' pass 20. For '€4.20/kg' pass 4.20. Do NOT convert. Omit for availability/lead_time updates where no numeric amount was stated.",
-                    },
-                    "amount_kind": {
-                        "type": "string",
-                        "enum": ["absolute_price", "percent_discount", "percent_increase", "availability_status", "days"],
-                        "description": "What the amount represents.",
-                    },
-                    "unit": {
-                        "type": "string",
-                        "description": "The unit as stated by the caller, e.g. 'per_kg', 'per_g', 'per_litre', 'each'. Omit if not a price.",
-                    },
-                    "expiry": {
-                        "type": "string",
-                        "enum": ["none", "until_date", "for_n_orders"],
-                        "description": "'none' = permanent; 'until_date' = expires on a date; 'for_n_orders' = expires after N purchase orders.",
-                    },
-                    "date_text": {
-                        "type": "string",
-                        "description": "Natural-language expiry date as stated, e.g. 'end of month', 'next Friday'. Required when expiry='until_date'.",
-                    },
-                    "n": {
-                        "type": "integer",
-                        "description": "Number of orders (required when expiry='for_n_orders').",
-                    },
-                    "min_order_value": {
-                        "type": "number",
-                        "description": "The minimum order value (in €) required for the offer to apply. Use for 'threshold_discount' and 'free_goods' offer types (e.g. 100 for 'orders over €100'). Omit when not conditional on order value.",
-                    },
-                    "free_ingredient_name": {
-                        "type": "string",
-                        "description": "The ingredient given for free (for update_type='free_goods'). E.g. 'tomato'. Required for free_goods offers.",
-                    },
-                    "free_qty": {
-                        "type": "number",
-                        "description": "The quantity of the free ingredient given (for update_type='free_goods'). Exactly as stated, e.g. 1 for '1kg'.",
-                    },
-                    "free_unit": {
-                        "type": "string",
-                        "description": "The unit of the free quantity (for update_type='free_goods'). E.g. 'kg', 'g', 'litre'. Required for free_goods offers.",
-                    },
-                    "verbatim_quote": {
-                        "type": "string",
-                        "description": "The caller's EXACT words. Required. Never paraphrase.",
-                    },
-                },
-                "required": ["update_type", "scope", "verbatim_quote"],
-            },
-        }
-    ],
-}
-
+# Supplier-side call roles are given NO tools: the native-audio agent only
+# converses and verbally confirms the offer. Structured supplier terms are
+# extracted once, after the call, by a strong reasoning model (see
+# calls._extract_outcome) — the single source of truth. Live in-call capture
+# was removed because the conversational model mis-parsed compound offers.
 _SUPPLIER_CALL_ROLES: frozenset = frozenset(
     {"supplier_call", "inbound_supplier_call", "onboarding_call"}
 )
@@ -734,7 +651,7 @@ _COMPETITOR_CALL_ROLES: frozenset = frozenset(
 _ALL_CALL_ROLES: frozenset = _SUPPLIER_CALL_ROLES | _COMPETITOR_CALL_ROLES
 # Tool names each call role is allowed to call (defense-in-depth guard in _execute_tool)
 _CALL_ROLE_ALLOWLIST: Dict[str, frozenset] = {
-    **{r: frozenset({"record_supplier_update"}) for r in _SUPPLIER_CALL_ROLES},
+    **{r: frozenset() for r in _SUPPLIER_CALL_ROLES},
     **{r: frozenset() for r in _COMPETITOR_CALL_ROLES},
 }
 
@@ -742,12 +659,10 @@ _CALL_ROLE_ALLOWLIST: Dict[str, frozenset] = {
 def _tools_for(role: str) -> list:
     """Return the filtered tool list for a given role.
 
-    Call roles get only the capture tool (supplier) or nothing (competitor).
+    Call roles (supplier and competitor) get no tools — they only converse.
     All other roles (manager, cook) get the full _TOOLS list.
     """
-    if role in _SUPPLIER_CALL_ROLES:
-        return [_RECORD_SUPPLIER_UPDATE_DECL]
-    if role in _COMPETITOR_CALL_ROLES:
+    if role in _ALL_CALL_ROLES:
         return []
     return _TOOLS
 
@@ -1966,31 +1881,6 @@ async def _execute_tool(
             return {"error": "This tool is not available during a call."}
 
     try:
-        # ── Supplier live-capture tool ─────────────────────────────────────
-        if name == "record_supplier_update":
-            if calls is None or call_id is None:
-                return {"error": "record_supplier_update requires an active call session"}
-            return await asyncio.to_thread(
-                calls.record_supplier_update_sync,
-                call_id,
-                update_type=str(args.get("update_type", "other")),
-                scope=str(args.get("scope", "all")),
-                ingredient_name=str(args.get("ingredient_name") or ""),
-                amount=float(args.get("amount") or 0.0),
-                amount_kind=str(args.get("amount_kind", "absolute_price")),
-                unit=str(args.get("unit") or ""),
-                effective=str(args.get("effective") or "immediate"),
-                expiry=str(args.get("expiry") or "none"),
-                date_text=str(args.get("date_text") or ""),
-                n=args.get("n"),
-                verbatim_quote=str(args.get("verbatim_quote") or ""),
-                min_order_value=args.get("min_order_value"),
-                free_ingredient_name=str(args.get("free_ingredient_name") or ""),
-                free_qty=args.get("free_qty"),
-                free_unit=str(args.get("free_unit") or ""),
-            )
-
-
         # ── Read tools ────────────────────────────────────────────────────
         if name == "get_inventory":
             if va:

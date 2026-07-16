@@ -302,3 +302,137 @@ def test_expire_pending(bus, session_factory):
         assert session.get(ApprovalRequest, approval.id).status == "expired"
     finally:
         session.close()
+
+
+class _PromoLLM:
+    """Extraction stub for the real bug scenario: a supplier offering BOTH free
+    delivery AND free 2kg tomatoes on orders ≥ €100 for the next two orders.
+    A strong model returns exactly two clean updates (no phantom €0 price)."""
+
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **kwargs):
+        if use_site == "outcome_extraction":
+            return {
+                "updates": [
+                    {
+                        "update_type": "free_delivery",
+                        "scope": "all",
+                        "min_order_value": 100.0,
+                        "expiry_kind": "for_n_orders",
+                        "expires_hint": "for 2 orders",
+                        "verbatim_quote": "free delivery",
+                        "confidence": 1.0,
+                    },
+                    {
+                        "update_type": "free_goods",
+                        "scope": "ingredient",
+                        "free_ingredient_name": "tomatoes",
+                        "free_qty": 2.0,
+                        "free_unit": "kg",
+                        "min_order_value": 100.0,
+                        "expiry_kind": "for_n_orders",
+                        "expires_hint": "for 2 orders",
+                        "verbatim_quote": "free 2kg of tomatoes",
+                        "confidence": 1.0,
+                    },
+                ]
+            }
+        return "Scripted agent line."
+
+    def canned(self, use_site):
+        return "canned line"
+
+
+class _BadDeliveryLLM:
+    """Extraction stub for the pre-fix failure mode: 'free delivery' mislabelled
+    as an absolute €0 price on all items. The zero-price guard must drop it."""
+
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **kwargs):
+        if use_site == "outcome_extraction":
+            return {
+                "updates": [
+                    {
+                        "update_type": "price_change",
+                        "scope": "all",
+                        "amount": 0.0,
+                        "amount_kind": "absolute_price",
+                        "unit": "per_kg",
+                        "expiry_kind": "none",
+                        "verbatim_quote": "free delivery",
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        return "Scripted agent line."
+
+    def canned(self, use_site):
+        return "canned line"
+
+
+def _run_supplier_call(bus, session_factory, llm, line):
+    from core.models import AppSettings
+
+    clock = SimClock(session_factory, bus)
+    clock.play()
+    bus.sim_time = 1000.0
+    session = session_factory()
+    try:
+        session.add(AppSettings(id=1, auto_apply_supplier_changes=1))
+        session.commit()
+    finally:
+        session.close()
+
+    approvals = ApprovalsHub(bus, session_factory)
+    calls = CallSubsystem(bus, session_factory, clock, llm)
+    calls.attach_approvals(approvals)
+    call = calls.start_direct(
+        agent="user", counterparty_type="supplier", counterparty_id=1, purpose="promo"
+    )
+    calls.add_turn(call.id, "counterparty", line)
+    calls.end_call(call.id)
+    return calls
+
+
+def test_compound_promo_yields_two_clean_terms(bus, session_factory):
+    """The free-delivery + free-tomatoes promo must produce exactly two terms —
+    one free_delivery, one free_goods — both limited to 2 orders and gated at
+    €100, with NO phantom €0 price_override (the original bug)."""
+    from core.models import SupplierTerm
+
+    _run_supplier_call(
+        bus, session_factory, _PromoLLM(),
+        "Free delivery and free 2kg of tomatoes on any order above €100, for your next two orders.",
+    )
+
+    session = session_factory()
+    try:
+        terms = session.query(SupplierTerm).all()
+        by_type = {t.term_type: t for t in terms}
+        assert set(by_type) == {"free_delivery", "free_goods"}, [t.term_type for t in terms]
+        assert "price_override" not in by_type  # no €0-on-all-items poison
+
+        fd = by_type["free_delivery"]
+        assert fd.expiry_kind == "orders" and fd.remaining_orders == 2
+        assert fd.min_order_value == 100.0
+
+        fg = by_type["free_goods"]
+        assert fg.expiry_kind == "orders" and fg.remaining_orders == 2
+        assert fg.free_qty_g == 2000.0 and fg.min_order_value == 100.0
+    finally:
+        session.close()
+
+
+def test_mislabelled_free_delivery_price_is_dropped(bus, session_factory):
+    """A 'free delivery' hallucinated as an absolute €0 price must never become a
+    price_override term (which would make the supplier win every item at €0)."""
+    from core.models import SupplierTerm
+
+    _run_supplier_call(
+        bus, session_factory, _BadDeliveryLLM(), "You get free delivery.",
+    )
+
+    session = session_factory()
+    try:
+        terms = session.query(SupplierTerm).all()
+        assert all(t.term_type != "price_override" for t in terms), [t.term_type for t in terms]
+    finally:
+        session.close()

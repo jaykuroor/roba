@@ -54,6 +54,7 @@ def apply_supplier_terms(
     - discount multiplies the current price.
     - threshold_discount is appended to volume_discount tiers.
     - free_goods is returned as FreeGoodsOffer objects.
+    - free_delivery zeroes the supplier's delivery_charge while the term is live.
     - unavailable sets availability to 'out'.
     - lead_time_override replaces lead_time_days.
     """
@@ -136,9 +137,17 @@ def apply_supplier_terms(
 
         # Collect all terms for this supplier (scope=all only — lead/threshold are supplier-level)
         all_terms = term_map.get((s_id, None), [])
+        free_delivery = False
         for t in all_terms:
             tt = t.term_type
-            if tt == "lead_time_override":
+            if tt == "free_delivery":
+                # Waive the delivery charge while the term is live. Expiry
+                # (date / next-N-orders) is already enforced by _term_is_live,
+                # and order-count is decremented on PO placement.
+                # ponytail: waiver is unconditional while live; MOV-gating it to
+                # orders ≥ min_order_value would need the free-goods big-M gate.
+                free_delivery = True
+            elif tt == "lead_time_override":
                 base_lead = float(t.value)
             elif tt == "threshold_discount":
                 # Append as a volume_discount tier so the existing MILP rebate loop handles it.
@@ -159,6 +168,8 @@ def apply_supplier_terms(
 
         adjusted_s["lead_time_days"] = base_lead
         adjusted_s["volume_discount"] = vol_disc if vol_disc else None
+        if free_delivery:
+            adjusted_s["delivery_charge"] = 0.0
         new_suppliers.append(adjusted_s)
 
     return AppliedTerms(

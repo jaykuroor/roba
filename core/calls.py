@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .llm import CANNED_NOTE
 from . import call_personas
+from . import config
 from .models import Call, Competitor, CompetitorOffer, Ingredient, Supplier, SupplierCatalog, SupplierTerm
 from .signals import SignalType
 
@@ -404,8 +405,8 @@ class CallSubsystem:
         )
 
         # Persist SupplierTerm cards from post-call extraction (new array format).
-        # For supplier calls the schema now returns {"updates": [...]}.
-        # Any terms already captured live by record_supplier_update are skipped (dedupe).
+        # For supplier calls the schema returns {"updates": [...]}. This post-call
+        # extraction is the single source of truth — there is no live capture.
         if isinstance(outcome, dict) and call.counterparty_type == "supplier":
             updates = outcome.get("updates")
             if isinstance(updates, list) and updates:
@@ -664,12 +665,23 @@ class CallSubsystem:
                 "The system normalises amounts in code — never convert.\n"
                 "5. SCOPE: 'all items' / 'everything' / 'all products' / 'whole range' → scope=all. "
                 "Named item → scope=ingredient, ingredient_name=<exact name stated>.\n"
-                "6. EXPIRY: No expiry stated → expiry_kind=none. "
+                "6. FREE DELIVERY vs FREE GOODS vs PRICE — do not confuse these:\n"
+                "   - 'free delivery' → update_type=free_delivery. It is NOT a price. "
+                "Never emit a price_change/amount=0 for it.\n"
+                "   - 'free 2kg of tomatoes' → update_type=free_goods, "
+                "free_ingredient_name='tomatoes', free_qty=2, free_unit='kg'.\n"
+                "   - Only an actual stated price ('€4.20 per kg') is a price_change.\n"
+                "7. COMPOUND OFFERS: one sentence can contain several offers "
+                "(e.g. 'free delivery AND free 2kg tomatoes on orders over €100, for your next "
+                "two orders'). Emit ONE update per offer (here: free_delivery + free_goods), and "
+                "apply the shared condition (min_order_value=100) and the shared expiry "
+                "(expiry_kind=for_n_orders, expires_hint='for 2 orders') to BOTH.\n"
+                "8. EXPIRY (always set expiry_kind): No expiry stated → expiry_kind=none. "
                 "'for 2 orders' → expiry_kind=for_n_orders, expires_hint='for 2 orders'. "
                 "'until end of month' → expiry_kind=until_date, expires_hint='until end of month'.\n"
-                "7. CONFIDENCE: 1.0 = caller stated it clearly. 0.5 = somewhat ambiguous. "
+                "9. CONFIDENCE: 1.0 = caller stated it clearly. 0.5 = somewhat ambiguous. "
                 "0.0 = you'd be guessing. Do not include items below 0.5.\n"
-                "8. If nothing was stated, return {\"updates\": []}.\n"
+                "10. If nothing was stated, return {\"updates\": []}.\n"
             )
         else:
             system_prompt = (
@@ -686,9 +698,12 @@ class CallSubsystem:
         # Low temperature for supplier extraction to minimise hallucination.
         temp = 0.2 if call.counterparty_type == "supplier" else None
         max_tok = 600 if call.counterparty_type == "supplier" else 300
+        # Supplier terms drive real ordering — use a stronger reasoning model to
+        # parse compound offers reliably. Runs once, post-call, so latency is fine.
+        model = config.GEMINI_EXTRACTION_MODEL if call.counterparty_type == "supplier" else None
         result = self.llm.complete(
             messages, json_schema=schema, max_tokens=max_tok,
-            use_site="outcome_extraction", temperature=temp,
+            use_site="outcome_extraction", temperature=temp, model=model,
         )
 
         if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
@@ -879,7 +894,7 @@ class CallSubsystem:
                             "properties": {
                                 "update_type": {
                                     "type": "string",
-                                    "description": "price_change | discount | threshold_discount | free_goods | availability | lead_time | other",
+                                    "description": "price_change | discount | threshold_discount | free_goods | free_delivery | availability | lead_time | other. Use free_delivery for a waived delivery charge ('free delivery') — NEVER model it as a price. Use free_goods for a free item ('free 2kg tomatoes').",
                                 },
                                 "scope": {
                                     "type": "string",
@@ -911,7 +926,7 @@ class CallSubsystem:
                                 },
                                 "expires_hint": {
                                     "type": "string",
-                                    "description": "Natural-language expiry as stated, e.g. 'end of month', 'for 2 orders'. Omit if none.",
+                                    "description": "Natural-language expiry as stated, e.g. 'end of month', 'for 2 orders'. When a limit like 'next two orders' or 'until Friday' applies to a bundle of offers, repeat it on EVERY offer it covers. Empty string if expiry_kind=none.",
                                 },
                                 "min_order_value": {
                                     "type": "number",
@@ -938,7 +953,7 @@ class CallSubsystem:
                                     "description": "0.0–1.0 confidence this was clearly stated (not inferred).",
                                 },
                             },
-                            "required": ["update_type", "scope", "amount_kind", "verbatim_quote", "confidence"],
+                            "required": ["update_type", "scope", "expiry_kind", "verbatim_quote", "confidence"],
                         },
                     },
                 },
@@ -1030,10 +1045,16 @@ class CallSubsystem:
             return "none", None, None
 
         if kind == "for_n_orders":
-            try:
-                count = int(float(str(n or 0)))
-            except (ValueError, TypeError):
-                # Try to extract a number from the hint text
+            # Prefer an explicit n; otherwise pull the count from the hint text.
+            # (The post-call extraction path always passes n=None and relies on
+            # the hint, e.g. "for 2 orders" — don't let a spurious 0 win.)
+            count: Optional[int] = None
+            if n is not None:
+                try:
+                    count = int(float(str(n)))
+                except (ValueError, TypeError):
+                    count = None
+            if not count or count <= 0:
                 import re as _re
                 m = _re.search(r"(\d+)", hint)
                 count = int(m.group(1)) if m else 1
@@ -1087,9 +1108,10 @@ class CallSubsystem:
     ) -> Optional["SupplierTerm"]:
         """Upsert a SupplierTerm and create a ManagerChange desk card.
 
-        Deduplicates against existing terms for the same call to prevent double-capture
-        when both the live tool and post-call extraction fire for the same update.
-        Returns the term row, or None if a duplicate was found.
+        Deduplicates against existing terms for the same call so a single
+        extraction emitting the same offer twice (e.g. once with an expiry and
+        once without) cannot create two cards. Returns the term row, or None if
+        a duplicate was found.
         """
         from .models import AppSettings as _AppSettings  # noqa: PLC0415
         from .models import ManagerChange as _MC  # noqa: PLC0415
@@ -1101,7 +1123,9 @@ class CallSubsystem:
             _settings = session.get(_AppSettings, 1)
             auto_apply = bool(_settings.auto_apply_supplier_changes if _settings else False)
 
-            # Deduplicate: same call, same type, same scope, same ingredient
+            # Deduplicate: same call, same type/scope/ingredient AND same expiry.
+            # Expiry is part of the key so a re-emitted offer that flips from
+            # "for 2 orders" to "permanent" can't create a second, wrong card.
             existing = (
                 session.query(SupplierTerm)
                 .filter(
@@ -1109,11 +1133,13 @@ class CallSubsystem:
                     SupplierTerm.term_type == term_type,
                     SupplierTerm.scope == scope,
                     SupplierTerm.ingredient_id == ingredient_id,
+                    SupplierTerm.expiry_kind == expiry_kind,
+                    SupplierTerm.remaining_orders == remaining_orders,
                 )
                 .first()
             )
             if existing is not None:
-                return None  # already captured by live tool
+                return None  # same offer already captured for this call
 
             # Resolve ingredient + supplier names for summary display
             sup = session.get(Supplier, call.counterparty_id)
@@ -1164,6 +1190,16 @@ class CallSubsystem:
                 qty_str = f"{(free_qty_g or 0) / 1000:.3g}kg" if free_qty_g else "?"
                 mov_str = f" (orders ≥ €{min_order_value:.0f})" if min_order_value else ""
                 summary = f"Free {qty_str} {free_ing_name or 'item'} from {sup_name}{mov_str}"
+                if expiry_kind == "orders":
+                    summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
+                elif expiry_kind == "date" and expires_at:
+                    days_left = max(1, round((expires_at - now) / 86400))
+                    summary += f" (expires in ~{days_left} days)"
+                else:
+                    summary += " (permanent)"
+            elif term_type == "free_delivery":
+                mov_str = f" (orders ≥ €{min_order_value:.0f})" if min_order_value else ""
+                summary = f"Free delivery from {sup_name}{mov_str}"
                 if expiry_kind == "orders":
                     summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
                 elif expiry_kind == "date" and expires_at:
@@ -1309,190 +1345,11 @@ class CallSubsystem:
         finally:
             session.close()
 
-    def record_supplier_update_sync(
-        self,
-        call_id: int,
-        *,
-        update_type: str,
-        scope: str,
-        ingredient_name: str = "",
-        amount: float = 0.0,
-        amount_kind: str = "",
-        unit: str = "",
-        effective: str = "immediate",
-        expiry: str = "none",
-        date_text: str = "",
-        n: Any = None,
-        verbatim_quote: str,
-        min_order_value: Any = None,
-        free_ingredient_name: str = "",
-        free_qty: Any = None,
-        free_unit: str = "",
-    ) -> Dict[str, Any]:
-        """Synchronous handler for the ``record_supplier_update`` live voice tool.
-
-        Called from ``_execute_tool`` in voice_live.py when the AI agent records a
-        supplier update mid-call. Creates a SupplierTerm + ManagerChange card and
-        returns a short confirmation for the agent to speak back.
-
-        All numeric normalisation is deterministic Python; the LLM reports the raw
-        values and we convert here.  update_type drives the term_type: availability
-        → unavailable, lead_time → lead_time_override, threshold_discount / free_goods
-        → new offer types, price/discount → existing path.
-        """
-        call = self._load(call_id)
-        if call is None:
-            return {"error": "call not found"}
-
-        now = float(self.bus.sim_time)
-        utype = (update_type or "other").strip().lower()
-
-        # Resolve ingredient_id (for scoped offers)
-        session = self.db_session_factory()
-        try:
-            ingredient_id: Optional[int] = None
-            resolved_scope = (scope or "all").strip().lower()
-            if resolved_scope == "ingredient" and ingredient_name:
-                ingredient_id = self._fuzzy_match_ingredient(
-                    session, call.counterparty_id, ingredient_name
-                )
-                if ingredient_id is None:
-                    logger.info(
-                        "record_supplier_update: could not match ingredient %r for supplier %s",
-                        ingredient_name, call.counterparty_id,
-                    )
-            # Resolve free_ingredient_id for free_goods offers
-            free_ingredient_id: Optional[int] = None
-            if utype == "free_goods" and free_ingredient_name:
-                free_ingredient_id = self._fuzzy_match_ingredient(
-                    session, call.counterparty_id, free_ingredient_name
-                )
-        finally:
-            session.close()
-
-        # Normalise min_order_value
-        _min_order_value: Optional[float] = float(min_order_value) if min_order_value is not None else None
-
-        # Normalise free_qty_g: convert stated qty+unit → grams
-        _free_qty_g: Optional[float] = None
-        if utype == "free_goods" and free_qty is not None:
-            _fq = float(free_qty)
-            _fu = (free_unit or "g").strip().lower()
-            if _fu in ("kg",):
-                _free_qty_g = _fq * 1000.0
-            elif _fu in ("litre", "liter", "l"):
-                _free_qty_g = _fq * 1000.0
-            else:
-                _free_qty_g = _fq  # already grams or each
-
-        # Branch on update_type
-        if utype == "availability":
-            term_type = "unavailable"
-            value = 0.0
-            # Use the caller's stated duration as the blackout window.
-            expiry_hint = expiry if expiry else "until_date"
-            hint_text = date_text or verbatim_quote or "2 weeks"
-            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
-                expiry_hint, hint_text, n, now
-            )
-            if expiry_kind_str == "none":
-                expiry_kind_str = "date"
-                expires_at = now + 14 * 86400.0
-        elif utype == "lead_time":
-            term_type = "lead_time_override"
-            value = max(0.0, float(amount) if amount else 1.0)
-            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
-                expiry, date_text, n, now
-            )
-        elif utype == "threshold_discount":
-            # Percentage discount that applies only when order ≥ min_order_value
-            _, value = self._normalise_term_value(amount, amount_kind or "percent_discount", unit)
-            term_type = "threshold_discount"
-            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
-                expiry, date_text, n, now
-            )
-        elif utype == "free_goods":
-            term_type = "free_goods"
-            value = 0.0  # no price change; supply benefit captured via free_qty_g
-            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
-                expiry, date_text, n, now
-            )
-        else:
-            # price_change / discount / other — original numeric path
-            term_type, value = self._normalise_term_value(amount, amount_kind, unit)
-            expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
-                expiry, date_text, n, now
-            )
-
-        # Create SupplierTerm + ManagerChange
-        term = self._create_supplier_term(
-            call=call,
-            term_type=term_type,
-            value=value,
-            scope=resolved_scope,
-            ingredient_id=ingredient_id,
-            unit_basis=(unit or "").strip(),
-            effective_at=now,
-            expiry_kind=expiry_kind_str,
-            expires_at=expires_at,
-            remaining_orders=remaining_orders,
-            verbatim_quote=(verbatim_quote or "").strip(),
-            min_order_value=_min_order_value,
-            free_ingredient_id=free_ingredient_id,
-            free_qty_g=_free_qty_g,
-        )
-
-        if term is None:
-            return {"status": "duplicate", "message": "This update was already recorded for this call."}
-
-        # Build spoken confirmation
-        if term_type == "unavailable":
-            item_desc = ingredient_name or "all items" if resolved_scope == "ingredient" else "all items"
-            if expiry_kind_str == "date" and expires_at:
-                days = max(1, round((expires_at - now) / 86400))
-                summary = f"unavailable for {item_desc} for approximately {days} days"
-            else:
-                summary = f"unavailable for {item_desc} for the stated period"
-        elif term_type == "lead_time_override":
-            item_desc = ingredient_name or "all items" if resolved_scope == "ingredient" else "all deliveries"
-            summary = f"lead time updated to {value:.0f} day{'s' if value != 1 else ''} for {item_desc}"
-        elif term_type == "threshold_discount":
-            pct = round(abs(value) * 100, 1)
-            mov_str = f" on orders over €{_min_order_value:.0f}" if _min_order_value else ""
-            summary = f"{pct}% discount{mov_str} on {'all items' if resolved_scope == 'all' else ingredient_name or 'that item'}"
-        elif term_type == "free_goods":
-            qty_str = f"{(_free_qty_g or 0)/1000:.3g}kg" if _free_qty_g else "some"
-            mov_str = f" on orders over €{_min_order_value:.0f}" if _min_order_value else ""
-            summary = f"free {qty_str} {free_ingredient_name or 'item'}{mov_str}"
-        elif term_type == "discount":
-            pct = round(abs(value) * 100, 1)
-            direction = "increase" if value < 0 else "discount"
-            if resolved_scope == "all":
-                summary = f"{pct}% {direction} on all items"
-            else:
-                summary = f"{pct}% {direction} on {ingredient_name or 'that item'}"
-        else:
-            disp = value * 1000
-            if resolved_scope == "all":
-                summary = f"new price of €{disp:.2f}/kg on all items"
-            else:
-                summary = f"new price of €{disp:.2f}/kg on {ingredient_name or 'that item'}"
-
-        if expiry_kind_str == "orders":
-            summary += f" for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''}"
-        elif expiry_kind_str == "date" and term_type not in ("unavailable",):
-            summary += " until the stated date"
-        elif term_type not in ("unavailable", "lead_time_override"):
-            summary += " permanently"
-
-        return {
-            "status": "recorded",
-            "message": f"Recorded: {summary}. A change card has been created for manager review.",
-        }
-
     def _process_extracted_updates(self, call: Any, updates: List[Dict[str, Any]]) -> None:
-        """Create SupplierTerm rows for any updates found by post-call extraction
-        that were NOT already captured live by record_supplier_update."""
+        """Create SupplierTerm rows from the post-call extraction — the single
+        source of truth for supplier terms. The native-audio agent no longer
+        captures terms live; it only converses and confirms, and a strong
+        reasoning model parses the full transcript here."""
         now = float(self.bus.sim_time)
         session = self.db_session_factory()
         try:
@@ -1566,11 +1423,30 @@ class CallSubsystem:
                     expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
                         expiry_kind_raw, expires_hint, None, now
                     )
+                elif utype == "free_delivery":
+                    # Waived delivery charge for qualifying orders — never a price.
+                    term_type = "free_delivery"
+                    value = 0.0
+                    scope = "all"  # delivery is supplier-level, not per-ingredient
+                    ingredient_id = None
+                    expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                        expiry_kind_raw, expires_hint, None, now
+                    )
                 else:
                     term_type, value = self._normalise_term_value(amount, amount_kind, unit)
                     expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
                         expiry_kind_raw, expires_hint, None, now
                     )
+                    # Guard: a "free X" mislabelled as an absolute price yields a
+                    # €0 price_override that poisons the plan (supplier wins every
+                    # item at €0). A zero/negative price is never a real update.
+                    if term_type == "price_override" and value <= 0.0:
+                        logger.info(
+                            "Call %s: dropping zero/negative price_override from "
+                            "extraction (utype=%r, quote=%r)",
+                            call.id, utype, verbatim_quote[:60],
+                        )
+                        continue
 
                 self._create_supplier_term(
                     call=call,
