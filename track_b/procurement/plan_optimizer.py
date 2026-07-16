@@ -1933,6 +1933,14 @@ def _solve_milp(
             dv = pulp.value(deliver[s_id, d])
             if dv is not None and dv > 0.5:
                 total_cost += dc
+                # Net out a fired free-delivery rebate so the reported invoice
+                # reflects the waived charge (matches the objective's cash).
+                for (_fdi, _fs, _fd), _fd_bin_v in _fd_gate.items():
+                    if _fs == s_id and _fd == d:
+                        _bv = pulp.value(_fd_bin_v)
+                        if _bv is not None and _bv > 0.5:
+                            total_cost -= dc
+                            break
 
     from core.config import COVERAGE_EPSILON as _COV_EPS_M  # noqa: PLC0415
     coverage_ok = total_short <= _COV_EPS_M

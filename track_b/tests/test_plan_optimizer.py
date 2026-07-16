@@ -1682,3 +1682,27 @@ def test_freshness_defers_perishable_delivery_jit():
     assert all(o.delivery_day >= 3 for o in sol.orders), (
         f"perishable front-loaded instead of JIT: {[(o.delivery_day, o.qty) for o in sol.orders]}"
     )
+
+
+def test_free_delivery_rebate_fires_above_threshold():
+    """A MOV-gated free_delivery offer rebates the supplier's delivery charge
+    once a delivery clears the spend threshold — so the promo lowers real cash
+    exactly when the offer says it should."""
+    from track_b.procurement.terms import FreeDeliveryOffer
+    n = 4
+    common = dict(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, dc=20.0)],
+        demand_by_day={1: {d: 50.0 for d in range(n)}},  # 200 units → order value ≫ €100
+        on_hand={1: 0.0},
+        n_days=n,
+    )
+    base = _run(**common, params={"slack_penalty": 1000.0})
+    promo = _run(**common, params={
+        "slack_penalty": 1000.0,
+        "free_delivery_offers": [FreeDeliveryOffer(supplier_id=1, min_order_value=100.0,
+                                                   remaining_orders=2, term_id=1)],
+    })
+    # The promo plan buys the same goods but rebates at least one €20 delivery.
+    assert promo.total_cost < base.total_cost - 1e-6, (base.total_cost, promo.total_cost)
