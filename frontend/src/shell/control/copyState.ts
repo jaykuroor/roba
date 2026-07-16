@@ -58,6 +58,8 @@ interface PlanResponse {
   generated_at: number;
   coverage_ok: boolean;
   total_short: number;
+  late_delivery_coverage_ok: boolean;
+  coverage_depends_on_planned_orders: boolean;
   reliability_premium: number;
   exposed_value_baseline: number;
   exposed_value_protected: number;
@@ -342,8 +344,17 @@ export function buildReport(bundle: StateBundle): string {
     parts.push("  (unavailable)");
   } else {
     const meta = bundle.plan;
+    // "Coverage: OK" only holds if every delivery arrives on time — say so, and
+    // flag when a 1-day slip breaks it or when coverage relies on unplaced orders.
+    const coverageCaveats: string[] = [];
+    if (meta.coverage_ok && meta.late_delivery_coverage_ok === false) {
+      coverageCaveats.push("⚠ at risk to a 1-day delivery slip");
+    }
+    if (meta.coverage_depends_on_planned_orders) {
+      coverageCaveats.push("⚠ depends on placing planned orders");
+    }
     const coverageLine = meta.coverage_ok
-      ? "Coverage: OK"
+      ? `Coverage: OK if deliveries on time${coverageCaveats.length ? "  —  " + coverageCaveats.join("  ") : ""}`
       : `Coverage: SHORT  total_short=${meta.total_short.toFixed(0)}`;
     const premiumLine = meta.reliability_premium > 0
       ? `  Reliability premium: ${formatMoney(meta.reliability_premium)}`

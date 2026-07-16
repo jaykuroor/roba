@@ -1648,9 +1648,12 @@ def track_a_today_breakdown(db_session: Any = Depends(db.get_db)) -> Dict[str, A
         or 0.0
     )
 
-    # Remaining = sum of the LATEST persisted horizon's day-0 lines.  This is the
-    # very figure the UI's "Today" rows display, so the breakdown reconciles with
-    # them by construction.
+    # Remaining = sum of the LATEST persisted horizon's day-0 forecast.  The UI
+    # shows one rounded figure PER DISH (dayparts aggregated, then rounded), so we
+    # must reconcile against sum-of-rounded-per-dish — NOT round(sum-of-floats),
+    # which drifts by a unit (the 132-vs-131 off-by-one).  Group by menu item,
+    # round each dish total, then sum, so the reconciliation equals the visible
+    # dish lines exactly.
     remaining = 0.0
     latest = (
         db_session.query(models.HorizonForecast)
@@ -1658,15 +1661,19 @@ def track_a_today_breakdown(db_session: Any = Depends(db.get_db)) -> Dict[str, A
         .first()
     )
     if latest is not None:
-        remaining = float(
-            db_session.query(func.coalesce(func.sum(models.HorizonForecastLine.qty), 0.0))
+        per_dish = (
+            db_session.query(
+                models.HorizonForecastLine.menu_item_id,
+                func.coalesce(func.sum(models.HorizonForecastLine.qty), 0.0),
+            )
             .filter(
                 models.HorizonForecastLine.horizon_id == latest.id,
                 models.HorizonForecastLine.day_index == 0,
             )
-            .scalar()
-            or 0.0
+            .group_by(models.HorizonForecastLine.menu_item_id)
+            .all()
         )
+        remaining = float(sum(round(float(q or 0.0)) for _mid, q in per_dish))
 
     return {
         "generated_at": now,
