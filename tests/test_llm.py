@@ -90,7 +90,7 @@ def test_gemini_uses_google_genai_sdk_and_default_model(monkeypatch):
     )
 
     assert result == "gemini hello"
-    assert calls["models"][0] == config.GEMINI_MODEL == "gemini-3.1-flash-lite"
+    assert calls["models"][0] == config.GEMINI_MODEL == "gemini-2.5-flash-lite"
     assert calls["contents"][0]
 
 

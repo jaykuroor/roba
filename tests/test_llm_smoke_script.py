@@ -7,5 +7,5 @@ def test_llm_smoke_script_offline(monkeypatch, capsys):
 
     assert main() == 0
     output = capsys.readouterr().out
-    assert '"gemini_model": "gemini-3.1-flash-lite"' in output
+    assert '"gemini_model": "gemini-2.5-flash-lite"' in output
     assert '"gcp_project_present": false' in output

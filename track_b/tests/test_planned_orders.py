@@ -172,6 +172,35 @@ def _make_optimizer(bus, session_factory):
 # ---------------------------------------------------------------------------
 
 
+def test_stale_uncoverable_signal_retracted_when_covered(bus, session_factory):
+    """A lingering INGREDIENT_UNCOVERABLE from an earlier rebuild must be consumed
+    once the plan covers everything — otherwise the sourcing panel shows a phantom
+    shortfall (e.g. 'Basil 7g short') for up to the 24h TTL."""
+    # Well-stocked ingredient with tiny demand → no shortage, nothing uncoverable.
+    ing_id = _seed_ingredient(session_factory, on_hand=10000.0, safety_stock=1.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=1.0)
+    _seed_supplier(session_factory, ing_id, lead_time_days=1.0, pack_size=10.0)
+
+    bus.sim_time = 0.0
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=1.0)
+
+    # Pre-seed a stale warning for a bogus ingredient that will never be uncoverable.
+    bus.emit(
+        type=SignalType.INGREDIENT_UNCOVERABLE,
+        payload={"ingredient_id": 987654, "ingredient_name": "Ghost",
+                 "short_qty": 6.65, "unit": "g", "reason": "stale"},
+        dedup_key="uncoverable:987654",
+        source="test",
+    )
+    assert len(bus.live(type=SignalType.INGREDIENT_UNCOVERABLE)) == 1
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=14.0)
+
+    # The covered rebuild must retract the stale warning.
+    assert bus.live(type=SignalType.INGREDIENT_UNCOVERABLE) == []
+
+
 def test_build_procurement_plan_creates_planned_order(bus, session_factory):
     """When projected stock dips below safety_stock, a PlannedOrder row is created."""
     # on_hand=0, safety_stock=50 → immediate shortage on day 0 → order must be scheduled.

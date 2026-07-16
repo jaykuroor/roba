@@ -1217,6 +1217,13 @@ class InventoryOptimizer(BaseAgent):
                         ).model_dump(),
                         dedup_key=f"uncoverable:{_co_iid}",
                     )
+                # Retract stale warnings: an ingredient that WAS uncoverable on an
+                # earlier rebuild but is covered now keeps a live signal until its
+                # 24h TTL — consume it so the sourcing panel reflects the current
+                # plan (fixes phantom "Basil 7g short" after the gap is closed).
+                for _live in self.bus.live(type=SignalType.INGREDIENT_UNCOVERABLE):
+                    if (_live.payload or {}).get("ingredient_id") not in _emitted_iids:
+                        self.bus.consume(_live.signal_id)
             except Exception:  # noqa: BLE001
                 logger.warning("build_procurement_plan: failed to emit INGREDIENT_UNCOVERABLE signals")
 

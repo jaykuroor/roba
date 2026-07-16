@@ -13,7 +13,7 @@ class FakeLLM:
     """Deterministic stub: returns a concrete outcome dict for extraction and
     a scripted line for agent turns (so call.outcome is genuinely populated)."""
 
-    def complete(self, messages, json_schema=None, max_tokens=800, use_site=""):
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **kwargs):
         if use_site == "outcome_extraction":
             return {"agreed": True, "agreed_price": 1.8, "ingredient_id": 1}
         return "Scripted agent line."
@@ -212,6 +212,73 @@ def test_auto_resolve_completes_without_roleplay(wired):
 
     assert len(calls.bus.live(type=SignalType.CALL_OUTCOME)) == 1
     assert clock.current_state()["status"] != CALL_FROZEN
+
+
+class _DiscountLLM:
+    """Extraction stub returning the §8.5 supplier `updates` array — mirrors a
+    real model capturing an explicit '20% off all items' offer."""
+
+    def complete(self, messages, json_schema=None, max_tokens=800, use_site="", **kwargs):
+        if use_site == "outcome_extraction":
+            return {
+                "updates": [
+                    {
+                        "update_type": "discount",
+                        "scope": "all",
+                        "amount": 20.0,
+                        "amount_kind": "percent_discount",
+                        "verbatim_quote": "20 percent off all items",
+                        "confidence": 1.0,
+                    }
+                ]
+            }
+        return "Scripted agent line."
+
+    def canned(self, use_site):
+        return "canned line"
+
+
+def test_supplier_discount_creates_active_term_and_replan_signal(bus, session_factory):
+    """A supplier call stating a discount must end with an active SupplierTerm and
+    a replan-triggering signal — the chain that turns 'informed the agent of a
+    discount' into an applied procurement change (auto_apply on)."""
+    from core.models import AppSettings, SupplierTerm
+
+    clock = SimClock(session_factory, bus)
+    clock.play()
+    bus.sim_time = 1000.0
+    session = session_factory()
+    try:
+        session.add(AppSettings(id=1, auto_apply_supplier_changes=1))
+        session.commit()
+    finally:
+        session.close()
+
+    approvals = ApprovalsHub(bus, session_factory)
+    calls = CallSubsystem(bus, session_factory, clock, _DiscountLLM())
+    calls.attach_approvals(approvals)
+
+    call = calls.start_direct(
+        agent="user",
+        counterparty_type="supplier",
+        counterparty_id=1,
+        purpose="negotiate",
+    )
+    calls.add_turn(call.id, "counterparty", "20 percent off all items for two weeks.")
+    calls.end_call(call.id)
+
+    session = session_factory()
+    try:
+        terms = session.query(SupplierTerm).all()
+        assert len(terms) == 1
+        assert terms[0].term_type == "discount"
+        assert terms[0].scope == "all"
+        assert terms[0].status == "active"  # auto_apply → live for the optimizer
+    finally:
+        session.close()
+
+    # scope='all' auto-apply emits CALL_OUTCOME so the optimizer re-plans.
+    assert len(calls.bus.live(type=SignalType.CALL_OUTCOME)) >= 1
 
 
 def test_expire_pending(bus, session_factory):

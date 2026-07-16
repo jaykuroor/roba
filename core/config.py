@@ -119,7 +119,11 @@ AUTO_APPLY_SUPPLIER_CHANGES = os.getenv("AUTO_APPLY_SUPPLIER_CHANGES", "0").lowe
 }
 
 # llm — Vertex AI only; Groq/OpenRouter removed
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+# NOTE: gemini-3.1-flash-lite returns 404 (not a real / accessible Vertex model),
+# which silently drops every completion to the canned no-op (call extraction,
+# forecasting, cook reports all degrade invisibly). gemini-2.5-flash-lite is the
+# lite model actually available to this project/region.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 LLM_FALLBACK = ["gemini", "canned"]
 LLM_RETRIES = 3
 LLM_BACKOFF_BASE_S = 1.5

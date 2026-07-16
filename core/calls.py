@@ -693,6 +693,16 @@ class CallSubsystem:
 
         if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
             outcome: Optional[Dict[str, Any]] = None
+            # A canned fallback means the LLM was unavailable (e.g. bad model id →
+            # 404 → every completion silently degrades). For supplier calls this
+            # silently drops any discount/price the caller stated, so nothing is
+            # captured and no plan change happens. Make that visible.
+            if call.counterparty_type == "supplier":
+                logger.warning(
+                    "Call %s: supplier outcome extraction fell back to canned "
+                    "(LLM unavailable) — no supplier terms captured. Check GEMINI_MODEL.",
+                    call_id,
+                )
         else:
             outcome = result
 
