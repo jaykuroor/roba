@@ -1618,11 +1618,19 @@ class InventoryOptimizer(BaseAgent):
             )
             dc = delivery_charges.get(supplier_id, 0.0)
 
-            # D: Derive group urgency from source planned rows — "uncoverable" wins
-            # over "at_risk"; stored on the PO so the Ordered section can badge it.
+            # D: Derive group urgency from source planned rows — "uncoverable" wins,
+            # then "critical" (a 1-day slip immediately shorts a dish, i.e. some line
+            # has shortage_if_late > 0), then plain "at_risk" (tight timing but a slip
+            # is still recoverable). Stored on the PO so the Ordered section can badge
+            # which delays actually stop production vs which are merely tight.
             _group_statuses = {d.get("status") for d in group}
+            _group_max_short_if_late = max(
+                (float(d.get("shortage_if_late", 0.0) or 0.0) for d in group), default=0.0
+            )
             if "uncoverable" in _group_statuses:
                 _group_urgency: Optional[str] = "uncoverable"
+            elif _group_max_short_if_late > 0.5:
+                _group_urgency = "critical"
             elif "at_risk" in _group_statuses or group_late:
                 _group_urgency = "at_risk"
             else:

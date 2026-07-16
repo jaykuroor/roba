@@ -32,7 +32,7 @@ interface PurchaseOrder {
   supplier_id: number;
   supplier_name: string;
   status: string;
-  urgency: "at_risk" | "uncoverable" | null;
+  urgency: "at_risk" | "uncoverable" | "critical" | null;
   created_at: number | null;
   expected_delivery: number | null;
   total_cost: number | null;
@@ -402,8 +402,9 @@ export function buildReport(bundle: StateBundle): string {
 
   const renderPO = (po: PurchaseOrder, prefix: string): void => {
     const urgencyTag =
-      po.urgency === "at_risk" ? "  [AT RISK]" :
-      po.urgency === "uncoverable" ? "  [UNCOVERABLE]" : "";
+      po.urgency === "uncoverable" ? "  [UNCOVERABLE]" :
+      po.urgency === "critical" ? "  [CRITICAL — 1-day delay stops dishes]" :
+      po.urgency === "at_risk" ? "  [AT RISK — recoverable]" : "";
     const deliver = po.expected_delivery != null ? dayLabel(po.expected_delivery) : "—";
     const cost = formatMoney(po.total_cost);
     parts.push(
