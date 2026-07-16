@@ -1656,3 +1656,29 @@ def test_robust_unavoidable_slip_falls_back_without_dropping_coverage():
     buffered = _run(**common, on_hand={1: 100.0}, params=p)
     assert buffered.robust_applied and buffered.robust_status == "applied"
     assert buffered.coverage_ok
+
+
+def test_freshness_defers_perishable_delivery_jit():
+    """Among equal-cash plans the freshness tiebreaker delivers a perishable
+    just-in-time (close to when it's needed) rather than front-loading it, so
+    shelf life isn't burned for no cost benefit. Demand falls only on day 4; a
+    long shelf life means early delivery wouldn't expire, so only freshness
+    separates 'deliver day 1' from 'deliver day 4' — it must pick the later day.
+    """
+    n = 6
+    sol = _run(
+        ingredients=[_ing(1, perishable=1, shelf_life=10)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0)],
+        # reliability < 1 + a positive margin so the pass-2 (stress) objective —
+        # which carries the freshness tiebreaker — actually runs.
+        suppliers=[_sup(1, lead=1.0, reliability=0.9)],
+        demand_by_day={1: {4: 200.0}},
+        on_hand={1: 0.0},
+        n_days=n,
+        params={"slack_penalty": 1000.0, "margin_by_ing": {1: 5.0}},
+    )
+    assert sol.orders, "expected an order to cover day-4 demand"
+    # JIT: nothing should be delivered days before it's needed (day 4).
+    assert all(o.delivery_day >= 3 for o in sol.orders), (
+        f"perishable front-loaded instead of JIT: {[(o.delivery_day, o.qty) for o in sol.orders]}"
+    )

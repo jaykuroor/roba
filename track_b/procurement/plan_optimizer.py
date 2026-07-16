@@ -1684,9 +1684,29 @@ def _solve_milp(
                 for d in range(n_days):
                     if (iid, d) in demand_short_rob:
                         delay_short_terms.append(_mw * demand_short_rob[iid, d])
+        # Freshness tiebreaker: among equal-cash plans, prefer just-in-time
+        # delivery of perishables (deliver closer to when they're needed) over
+        # front-loading, which needlessly burns shelf life for no cost benefit
+        # (the reviewer's "all lettuce piled on Day 2" regression). The
+        # coefficient is deliberately minuscule — well below both cash and the
+        # exposure lever — so it only separates otherwise-equal solutions and
+        # can never raise cost (the 1% cash cap above still binds).
+        freshness_terms: list = []
+        _FRESH_EPS = 1e-4
+        for _fiid in active_ids:
+            _ir = ing_by_id.get(_fiid, {})
+            if not (bool(_ir.get("perishable")) and float(_ir.get("shelf_life_days") or 0.0) > 0):
+                continue
+            _pr = float(ref_price.get(_fiid, 0.0)) or 1e-3
+            for _fsid in all_sup_ids:
+                for _fd in range(n_days):
+                    if (_fiid, _fsid, _fd) in q:
+                        # earlier delivery (smaller day) ⇒ more shelf life burned
+                        # ⇒ larger penalty, nudging delivery later toward need.
+                        freshness_terms.append(_FRESH_EPS * _pr * (n_days - _fd) * _x(_fiid, _fsid, _fd))
         # New objective: minimize margin-weighted exposure + modelled delay
-        # shortfall + penalties.
-        prob += pulp.lpSum(exposure_terms + delay_short_terms + penalty_terms)
+        # shortfall + penalties + a freshness tiebreaker.
+        prob += pulp.lpSum(exposure_terms + delay_short_terms + penalty_terms + freshness_terms)
         prob.solve(solver)
         if not _has_usable_incumbent():
             # Pass 2 infeasible / non-optimal: restore pass-1 result.
