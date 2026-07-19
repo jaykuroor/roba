@@ -29,7 +29,7 @@ import {
 } from "lucide-react";
 import { useVoiceLive } from "../voice/useVoiceLive";
 import { MicButton } from "../voice/MicButton";
-import { apiGet, apiPost } from "../api";
+import { apiGet, apiPost, instancePagePrefix } from "../api";
 import type { SupplierParty, CompetitorParty } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -411,7 +411,7 @@ export default function CallPage() {
           )}
         </div>
         <Link
-          to="/"
+          to={instancePagePrefix() || "/admin"}
           className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium text-text/50 hover:bg-muted/50 hover:text-text"
         >
           <LayoutDashboard size={13} />

@@ -9,7 +9,7 @@
  */
 import { useEffect, useState } from "react";
 import { ExternalLink, PhoneCall, Plus, RefreshCw } from "lucide-react";
-import { apiGet, apiPatch, apiPost } from "../../api";
+import { apiGet, apiPatch, apiPost, instancePagePrefix } from "../../api";
 import type { Ingredient, SupplierCatalogRow, SupplierRow } from "../../types";
 import { SectionHeading } from "./shared";
 
@@ -530,7 +530,7 @@ function AddSupplierForm({ onAdded }: { onAdded: () => void }) {
 
       // 3. Open the call tab immediately
       window.open(
-        `/call?call_id=${callRes.call_id}&role=onboarding_call&party_name=${encodeURIComponent(name.trim())}`,
+        `${instancePagePrefix()}/call?call_id=${callRes.call_id}&role=onboarding_call&party_name=${encodeURIComponent(name.trim())}`,
         "_blank",
       );
 
@@ -665,7 +665,7 @@ function NegotiateSection({
       });
       const supName = suppliers.find((s) => s.id === Number(supplierId))?.name ?? "";
       window.open(
-        `/call?call_id=${res.call_id}&role=supplier_call&party_name=${encodeURIComponent(supName)}`,
+        `${instancePagePrefix()}/call?call_id=${res.call_id}&role=supplier_call&party_name=${encodeURIComponent(supName)}`,
         "_blank",
       );
     } catch { /* ignore */ } finally { setBusy(false); }

@@ -13,6 +13,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { ChefHat, LayoutDashboard, Mic, UserCog } from "lucide-react";
 import { ManagerVoice } from "./ManagerVoice";
 import { CookVoice } from "./CookVoice";
+import { instancePagePrefix } from "../api";
 
 type Role = "manager" | "cook";
 
@@ -94,7 +95,7 @@ export default function VoicePage() {
             </button>
           )}
           <Link
-            to="/"
+            to={instancePagePrefix() || "/admin"}
             className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium text-text/50 hover:bg-muted/50 hover:text-text"
           >
             <LayoutDashboard size={13} />

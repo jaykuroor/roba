@@ -6,7 +6,7 @@
 // manager's per-instance proxy (/i/<id>/api/...). Derived from the URL at
 // request time so no component plumbing is needed.
 
-const INSTANCE_ID_RE = /^[a-z]+_[a-z]+\d*$/;
+export const INSTANCE_ID_RE = /^[a-z]+_[a-z]+\d*$/;
 
 /** The instance id from the current URL's first path segment, or null. */
 export function instanceId(): string | null {
@@ -18,6 +18,13 @@ export function instanceId(): string | null {
 export function instancePrefix(): string {
   const id = instanceId();
   return id ? `/i/${id}` : "";
+}
+
+/** "/<id>" for building page links/routes within the current instance
+ *  (vs. instancePrefix, which is the API/WS proxy prefix). */
+export function instancePagePrefix(): string {
+  const id = instanceId();
+  return id ? `/${id}` : "";
 }
 
 const RETRYABLE_STATUSES = new Set([500, 502, 503, 504]);

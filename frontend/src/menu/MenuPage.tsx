@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { apiGet } from "../api";
+import { apiGet, instancePagePrefix } from "../api";
 import type { MenuItem, SimState, MenuToggleEvent } from "../types";
 import { wsClient } from "../ws";
 
@@ -87,7 +87,7 @@ export default function MenuPage() {
       <header className="border-b border-stone-200 bg-white">
         <div className="mx-auto max-w-3xl px-6 py-6">
           <Link
-            to="/"
+            to={instancePagePrefix() || "/admin"}
             className="mb-4 inline-flex items-center gap-1 text-xs text-stone-400 hover:text-stone-600"
           >
             ← Operator console

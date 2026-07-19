@@ -12,6 +12,8 @@ export interface InstanceCard {
   title: string;
   online: boolean;
   status: "normal" | "warning" | "critical" | "offline";
+  /** Set when the instance process is alive but unresponsive (mid-solve). */
+  note?: string | null;
   sim?: { sim_time?: number; day_number?: number; status?: string } | null;
   sales_today: number | null;
   forecast_today: number | null;

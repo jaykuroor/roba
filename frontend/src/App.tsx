@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react";
-import { Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 import { OperatorLayout } from "./routes/OperatorLayout";
 import ConsolePage from "./routes/ConsolePage";
 import ControlPage from "./routes/ControlPage";
@@ -19,6 +19,8 @@ const VoicePage = lazy(() => import("./voice/VoicePage"));
 const CallPage = lazy(() => import("./call/CallPage"));
 
 // Manager dashboard for all restaurant instances (docs/fable/manager-dashboard.md).
+// This is the entry point: every restaurant is created and opened from here,
+// so `/` and any unknown path redirect to it.
 const AdminPage = lazy(() => import("./admin/AdminPage"));
 
 const Spinner = (
@@ -30,13 +32,6 @@ const Spinner = (
 export default function App() {
   return (
     <Routes>
-      {/* Operator routes share one WS connection + store via OperatorLayout. */}
-      <Route element={<OperatorLayout />}>
-        <Route path="/" element={<ConsolePage />} />
-        <Route path="/control" element={<ControlPage />} />
-        <Route path="/panels" element={<PanelsPage />} />
-      </Route>
-      {/* Manager dashboard — talks to the manager server, not one instance. */}
       <Route
         path="/admin"
         element={
@@ -45,14 +40,15 @@ export default function App() {
           </Suspense>
         }
       />
-      {/* Instance-scoped operator routes (/<instance_id>/...): the same
-          console, proxied to that instance's backend via /i/<id>/ (static
-          routes above always outrank the :instanceId param). */}
+      {/* Instance-scoped operator routes (/<instance_id>/...): one restaurant's
+          console; api/ws traffic is proxied via /i/<id>/. OperatorLayout
+          redirects to /admin when the segment is not a valid instance id. */}
       <Route path="/:instanceId" element={<OperatorLayout />}>
         <Route index element={<ConsolePage />} />
         <Route path="control" element={<ControlPage />} />
         <Route path="panels" element={<PanelsPage />} />
       </Route>
+      {/* Public customer menu — outside OperatorLayout, so no WS firehose. */}
       <Route
         path="/:instanceId/menu"
         element={
@@ -61,6 +57,7 @@ export default function App() {
           </Suspense>
         }
       />
+      {/* Voice interface — staff-facing, outside OperatorLayout (no WS firehose). */}
       <Route
         path="/:instanceId/voice"
         element={
@@ -69,6 +66,7 @@ export default function App() {
           </Suspense>
         }
       />
+      {/* Call page — dedicated live-voice call surface, auto-opened in a new tab. */}
       <Route
         path="/:instanceId/call"
         element={
@@ -77,33 +75,8 @@ export default function App() {
           </Suspense>
         }
       />
-      {/* Public customer menu — outside OperatorLayout, so no WS firehose. */}
-      <Route
-        path="/menu"
-        element={
-          <Suspense fallback={Spinner}>
-            <MenuPage />
-          </Suspense>
-        }
-      />
-      {/* Voice interface — staff-facing, outside OperatorLayout (no WS firehose). */}
-      <Route
-        path="/voice"
-        element={
-          <Suspense fallback={Spinner}>
-            <VoicePage />
-          </Suspense>
-        }
-      />
-      {/* Call page — dedicated live-voice call surface, auto-opened in a new tab. */}
-      <Route
-        path="/call"
-        element={
-          <Suspense fallback={Spinner}>
-            <CallPage />
-          </Suspense>
-        }
-      />
+      {/* Everything else (including /) lands on the manager dashboard. */}
+      <Route path="*" element={<Navigate to="/admin" replace />} />
     </Routes>
   );
 }

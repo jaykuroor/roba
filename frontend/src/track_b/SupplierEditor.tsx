@@ -22,7 +22,7 @@ import {
   Plus,
   X,
 } from "lucide-react";
-import { apiGet, apiPost } from "../api";
+import { apiGet, apiPost, instancePagePrefix } from "../api";
 import { wsClient } from "../ws";
 import type { SignalEnvelope } from "../types";
 
@@ -100,7 +100,7 @@ function NegotiateForm({
       });
       // Open the call tab synchronously in this click gesture to avoid popup blockers.
       window.open(
-        `/call?call_id=${res.call_id}&role=supplier_call&party_name=${encodeURIComponent(supplier.name)}`,
+        `${instancePagePrefix()}/call?call_id=${res.call_id}&role=supplier_call&party_name=${encodeURIComponent(supplier.name)}`,
         "_blank",
       );
       setDone(true);

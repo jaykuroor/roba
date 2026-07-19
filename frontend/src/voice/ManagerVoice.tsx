@@ -35,7 +35,7 @@ import { ForecastCard } from "./ForecastCard";
 import { ModeToggle } from "./ModeToggle";
 import { MicModeToggle } from "./MicModeToggle";
 import { ModelToggle } from "./ModelToggle";
-import { apiGet, apiPost } from "../api";
+import { apiGet, apiPost, instancePagePrefix } from "../api";
 import { useActiveCall, useCallTurns, useLastCompletedCall, useManagerChangeVersion, actions } from "../store";
 import type { ApprovalRequest, Call, ManagerChange } from "../types";
 import { SpectateOverlay } from "../shell/SpectateOverlay";
@@ -189,7 +189,7 @@ function ActiveCallCard() {
     call.counterparty_type === "competitor" ? "competitor_call" : "supplier_call";
 
   function openCallTab() {
-    window.open(`/call?call_id=${call!.id}&role=${callRole}`, "_blank");
+    window.open(`${instancePagePrefix()}/call?call_id=${call!.id}&role=${callRole}`, "_blank");
   }
 
   return (

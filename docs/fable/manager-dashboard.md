@@ -12,10 +12,11 @@ to the per-restaurant architecture were needed; a restaurant does not know it is
 managed.
 
 ```
-browser ── vite :5173 ──┬── /api, /ws            → legacy single backend :8000 (optional)
-                        ├── /admin/api/*         → manager :8100 (aggregation + registry)
-                        └── /i/<instance_id>/*   → manager :8100 → child backend :<port>
-                                                    (HTTP and WebSocket, incl. /ws/voice/live)
+browser ── vite :5173 ──┬── /admin/api/*         → manager :8100 (aggregation + registry)
+                        ├── /i/<instance_id>/*   → manager :8100 → child backend :<port>
+                        │                           (HTTP and WebSocket, incl. /ws/voice/live)
+                        └── /api, /ws            → bare backend :8000 (dev/debug only —
+                                                    no UI routes use it anymore)
 
 manager :8100
   ├─ registry: dbdata/manager_registry.json   {id, preset, port, title, created_at}
@@ -44,12 +45,23 @@ manager :8100
   (`ws.ts`, `voice/RobaLiveClient.ts`) are rewritten to `/i/<id>/...`.
   No component plumbing — a page mounted under `/<id>/...` is automatically
   instance-scoped.
-- Routes: `/admin` → manager dashboard; `/<id>`, `/<id>/control`,
-  `/<id>/panels`, `/<id>/menu`, `/<id>/voice`, `/<id>/call` → the existing
-  pages, scoped to that instance. Static routes always outrank `/:instanceId`.
+- Routes: `/admin` → manager dashboard (the **entry point**); `/<id>`,
+  `/<id>/control`, `/<id>/panels`, `/<id>/menu`, `/<id>/voice`, `/<id>/call` →
+  the existing pages, scoped to that instance. Static routes always outrank
+  `/:instanceId`. **Everything else — including `/` — redirects to `/admin`**,
+  and `OperatorLayout` bounces a first segment that is not a valid instance id
+  back to `/admin` too (covered by `src/admin/__tests__/routing.test.tsx`).
+  All restaurant creation/opening flows through the dashboard.
+- Restaurant identity: `shell/RestaurantLogo.tsx` renders a deterministic logo
+  (preset emoji, else title initials, on a color hashed from the instance id) —
+  used on the admin cards, the queue/approvals/incidents rows, and the instance
+  console nav, so "which restaurant am I in/acting on" is always visible. New
+  presets get an emoji by adding one line to `PRESET_EMOJI`.
 - Cross-instance navigation (admin → instance, instance → admin) uses plain
   `<a href>` full-page loads on purpose: the operator store is a singleton, and
-  a fresh load guarantees no state bleed between restaurants.
+  a fresh load guarantees no state bleed between restaurants. In-instance links
+  built from JS (e.g. `window.open` of the call tab) must use
+  `instancePagePrefix()` from `api.ts` so they stay inside the instance.
 
 ### Running it
 
