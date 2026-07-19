@@ -537,6 +537,19 @@ def health() -> Dict[str, Any]:
     return {"ok": True, "sim": ctx.clock.current_state()}
 
 
+@app.get("/api/ops/snapshot")
+def ops_snapshot() -> Dict[str, Any]:
+    """Compact operational snapshot (staff coverage, low stock, per-dish
+    forecast/revenue). Same builder the voice reasoner uses; also consumed by
+    the multi-restaurant manager dashboard (docs/fable/portfolio-overview.md)."""
+    from .ops_snapshot import build_ops_snapshot
+    return build_ops_snapshot(
+        db.new_session,
+        ctx.track_a.get("forecaster"),
+        bus=ctx.bus,
+    )
+
+
 class SpeedBody(BaseModel):
     speed: float
 

@@ -24,11 +24,27 @@ services:
       timeout: 3s
       retries: 12
       start_period: 5s
+  # Multi-restaurant manager (docs/fable/manager-dashboard.md). Spawns one
+  # core.api:app subprocess per restaurant inside this container and proxies
+  # /i/<instance>/... to it. Same image as backend, different entrypoint.
+  manager:
+    build: { context: ., dockerfile: Dockerfile.backend }
+    command: ["uvicorn", "manager:app", "--host", "0.0.0.0", "--port", "8100"]
+    ports: ["8100:8100"]
+    env_file: [.env]
+    environment:
+      MANAGER_STATE_DIR: /app/dbdata
+      GOOGLE_APPLICATION_CREDENTIALS: /app/roba.json
+    volumes:
+      - "dbdata:/app/dbdata"
+      - "./roba.json:/app/roba.json:ro"
   frontend:
     build: { context: ./frontend }
     ports: ["5173:5173"]
     depends_on:
       backend:
         condition: service_healthy
-    environment: { BACKEND_ORIGIN: http://backend:8000 }
+    environment:
+      BACKEND_ORIGIN: http://backend:8000
+      MANAGER_ORIGIN: http://manager:8100
 volumes: { dbdata: {} }

@@ -1,3 +1,4 @@
+import { instancePrefix } from "./api";
 import { actions } from "./store";
 import type { ApprovalRequest, Call, SimState, Weather } from "./types";
 
@@ -29,6 +30,14 @@ export class WsClient {
   }
 
   private url(): string {
+    // Instance-scoped pages must go through the manager's WS proxy so the
+    // connection reaches the right child backend (docs/fable/manager-dashboard.md).
+    const prefix = instancePrefix();
+    if (prefix) {
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      return `${proto}://${window.location.host}${prefix}/ws`;
+    }
+
     const explicitBackend = import.meta.env.VITE_BACKEND_ORIGIN as string | undefined;
     const devBackend =
       window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost"

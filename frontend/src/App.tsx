@@ -18,6 +18,9 @@ const VoicePage = lazy(() => import("./voice/VoicePage"));
 // a call is confirmed. Also supports direct-open with a party chooser.
 const CallPage = lazy(() => import("./call/CallPage"));
 
+// Manager dashboard for all restaurant instances (docs/fable/manager-dashboard.md).
+const AdminPage = lazy(() => import("./admin/AdminPage"));
+
 const Spinner = (
   <div className="flex min-h-screen items-center justify-center bg-primary text-text/50">
     Loading…
@@ -33,6 +36,47 @@ export default function App() {
         <Route path="/control" element={<ControlPage />} />
         <Route path="/panels" element={<PanelsPage />} />
       </Route>
+      {/* Manager dashboard — talks to the manager server, not one instance. */}
+      <Route
+        path="/admin"
+        element={
+          <Suspense fallback={Spinner}>
+            <AdminPage />
+          </Suspense>
+        }
+      />
+      {/* Instance-scoped operator routes (/<instance_id>/...): the same
+          console, proxied to that instance's backend via /i/<id>/ (static
+          routes above always outrank the :instanceId param). */}
+      <Route path="/:instanceId" element={<OperatorLayout />}>
+        <Route index element={<ConsolePage />} />
+        <Route path="control" element={<ControlPage />} />
+        <Route path="panels" element={<PanelsPage />} />
+      </Route>
+      <Route
+        path="/:instanceId/menu"
+        element={
+          <Suspense fallback={Spinner}>
+            <MenuPage />
+          </Suspense>
+        }
+      />
+      <Route
+        path="/:instanceId/voice"
+        element={
+          <Suspense fallback={Spinner}>
+            <VoicePage />
+          </Suspense>
+        }
+      />
+      <Route
+        path="/:instanceId/call"
+        element={
+          <Suspense fallback={Spinner}>
+            <CallPage />
+          </Suspense>
+        }
+      />
       {/* Public customer menu — outside OperatorLayout, so no WS firehose. */}
       <Route
         path="/menu"

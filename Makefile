@@ -14,6 +14,11 @@ reset: base
 seed:
 	curl -s -X POST http://localhost:8000/api/seed/preset/bellas_kitchen | python3 -m json.tool
 
+# Multi-restaurant manager (docs/fable/manager-dashboard.md).
+# Local dev: run this + `cd frontend && npm run dev`, then open /admin.
+manager:
+	.venv/bin/uvicorn manager:app --host 0.0.0.0 --port 8100
+
 demo-a: base
 	DEMO_MODE=track_a docker compose up --build
 

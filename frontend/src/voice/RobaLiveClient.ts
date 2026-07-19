@@ -8,6 +8,8 @@
  *   Server → browser: 24 kHz, mono, PCM16 LE  (decoded & queued for playback)
  */
 
+import { instancePrefix } from "../api";
+
 export type LiveClientEvent =
   | { type: "connected"; model?: string }
   | { type: "unavailable"; reason?: string }
@@ -154,7 +156,7 @@ export class RobaLiveClient {
     for (const [k, v] of Object.entries(this._extraParams)) {
       params.set(k, v);
     }
-    const url = `${proto}://${base}/ws/voice/live?${params.toString()}`;
+    const url = `${proto}://${base}${instancePrefix()}/ws/voice/live?${params.toString()}`;
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;

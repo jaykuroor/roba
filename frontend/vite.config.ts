@@ -20,6 +20,17 @@ export default defineConfig({
         target: process.env.BACKEND_ORIGIN ?? "http://localhost:8000",
         ws: true,
       },
+      // Manager server (multi-restaurant): /admin/api = dashboard endpoints,
+      // /i/<instance>/... = per-instance HTTP + WS proxy (docs/fable).
+      "/admin/api": {
+        target: process.env.MANAGER_ORIGIN ?? "http://localhost:8100",
+        changeOrigin: true,
+      },
+      "/i": {
+        target: process.env.MANAGER_ORIGIN ?? "http://localhost:8100",
+        changeOrigin: true,
+        ws: true,
+      },
     },
   },
 });
