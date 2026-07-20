@@ -34,6 +34,18 @@ logger = logging.getLogger(__name__)
 # Pending approvals expire after 6h sim-time (the §15 APPROVAL_REQUEST TTL).
 APPROVAL_TTL_SIM_S = 21600.0
 
+# Types with NO reactor acting on the decision — approve/reject is meaningless
+# for them; they are informational notices the manager *acknowledges*
+# (docs/fable/approvals.md). Everything else is a real decision: a reactor
+# fires on approval (PO placed, promo activated, call dialed, batch cooked,
+# forecast override applied).
+NOTICE_TYPES = {"kitchen_task", "staff_shift"}
+
+
+def kind_for(approval_type: Optional[str]) -> str:
+    """"notice" (acknowledge-only) or "decision" (approve/reject)."""
+    return "notice" if approval_type in NOTICE_TYPES else "decision"
+
 
 class ApprovalsHub:
     """The core approval queue + dispatch (§19.4)."""
@@ -105,6 +117,47 @@ class ApprovalsHub:
             source="human",
         )
         self._broadcast("approval_created", {"approval": self._to_dict(row)})
+        return row
+
+    # -- update (notices escalate in place) ---------------------------------
+
+    def update(
+        self,
+        approval_id: int,
+        *,
+        title: Optional[str] = None,
+        summary: Optional[str] = None,
+        urgency: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ApprovalRequest]:
+        """Update a *pending* row in place and broadcast ``approval_updated``.
+
+        Used by escalating notices (e.g. an overdue kitchen task climbing
+        severity tiers, or flipping to "done late") so the inbox shows one
+        evolving entry per underlying fact instead of a pile of duplicates.
+        No bus signal is emitted — this is not a new request and must not
+        re-fire reactors.
+        """
+        session = self.db_session_factory()
+        try:
+            row = session.get(ApprovalRequest, approval_id)
+            if row is None or row.status != "pending":
+                return None
+            if title is not None:
+                row.title = title
+            if summary is not None:
+                row.summary = summary
+            if urgency is not None:
+                row.urgency = urgency
+            if payload is not None:
+                row.payload = dict(payload)
+            session.commit()
+            session.refresh(row)
+            session.expunge(row)
+        finally:
+            session.close()
+
+        self._broadcast("approval_updated", {"approval": self._to_dict(row)})
         return row
 
     # -- resolve ------------------------------------------------------------
@@ -197,6 +250,7 @@ class ApprovalsHub:
         return {
             "id": row.id,
             "type": row.type,
+            "kind": kind_for(row.type),
             "title": row.title,
             "summary": row.summary,
             "payload": row.payload,

@@ -2,6 +2,30 @@
 
 Status: **implemented**.
 
+## Decisions vs notices
+
+Every `approval_requests` row now carries a `kind` (`core.approvals.kind_for`):
+
+- **decision** — a reactor acts on approve/reject, so the choice is real:
+  `purchase_order` (place PO), `promo` (activate), `batch` (cook), `outbound_call`
+  (dial), `forecast_override_proposal` (apply override). UI: Approve / Reject.
+- **notice** — nothing subscribes to the resolution; approve/reject would be
+  theater: `kitchen_task` (overdue / done late / not done) and `staff_shift`
+  (late / absent). UI: a single **Acknowledge** button (which resolves the row
+  as approved, `resolved_by=human` — same endpoint, honest label).
+
+The child inbox (`shell/ApprovalInbox.tsx`) renders two sections ("Needs
+decision" / "Notices"); the admin dashboard shows Acknowledge on notice rows in
+the queue and approvals tab, plus a decisions/notices filter. **When adding a
+new approval type, add it to `NOTICE_TYPES` iff no reactor consumes it** — the
+default is decision.
+
+Notices can also **escalate in place**: `ApprovalsHub.update()` edits a pending
+row (title/summary/urgency/payload) and broadcasts `approval_updated` (upserted
+by the store like `approval_created`). Kitchen-task notices use this — see
+[kitchen-task-notices.md](kitchen-task-notices.md) — so one fact is one inbox
+entry, never a pile of duplicates.
+
 ## What exists
 
 - `GET /admin/api/approvals?status=pending` — fans out to each child's

@@ -359,26 +359,37 @@ function ActionRow({
         <div className="text-xs text-text/40">→ {action.recommended_action}</div>
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
-        {action.approval_id != null && (
-          <>
+        {action.approval_id != null &&
+          (action.approval_kind === "notice" ? (
+            // Informational — nothing is gated on a decision; just acknowledge.
             <button
               type="button"
               disabled={busy}
               onClick={() => resolve("approve")}
-              className="flex items-center gap-1 rounded-md bg-success px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
+              className="flex items-center gap-1 rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-text disabled:opacity-50"
             >
-              <Check size={13} /> Approve
+              <Check size={13} /> Acknowledge
             </button>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => resolve("reject")}
-              className="flex items-center gap-1 rounded-md bg-danger px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
-            >
-              <X size={13} /> Reject
-            </button>
-          </>
-        )}
+          ) : (
+            <>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => resolve("approve")}
+                className="flex items-center gap-1 rounded-md bg-success px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
+              >
+                <Check size={13} /> Approve
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => resolve("reject")}
+                className="flex items-center gap-1 rounded-md bg-danger px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
+              >
+                <X size={13} /> Reject
+              </button>
+            </>
+          ))}
         <a
           href={`/${action.instance_id}`}
           className="rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-text/70"
@@ -411,6 +422,7 @@ function ApprovalRow({
     }
   }
 
+  const isNotice = approval.kind === "notice";
   return (
     <div className="rounded-lg border border-muted bg-surface p-3">
       <div className="flex items-center gap-2">
@@ -419,6 +431,11 @@ function ApprovalRow({
         <span className="rounded bg-muted px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-text/70">
           {approval.type}
         </span>
+        {isNotice && (
+          <span className="rounded bg-muted/60 px-2 py-0.5 text-xs text-text/50">
+            notice
+          </span>
+        )}
         {approval.urgency !== "normal" && (
           <span className="rounded bg-amber-500/20 px-2 py-0.5 text-xs text-amber-400">
             {approval.urgency}
@@ -428,22 +445,35 @@ function ApprovalRow({
       <h4 className="mt-1.5 text-sm font-semibold text-text">{approval.title}</h4>
       <p className="text-sm text-text/70">{approval.summary}</p>
       <div className="mt-2 flex gap-2">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => resolve("approve")}
-          className="flex flex-1 items-center justify-center gap-1 rounded-md bg-success px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
-          <Check size={15} /> Approve
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => resolve("reject")}
-          className="flex flex-1 items-center justify-center gap-1 rounded-md bg-danger px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
-          <X size={15} /> Reject
-        </button>
+        {isNotice ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => resolve("approve")}
+            className="flex flex-1 items-center justify-center gap-1 rounded-md bg-muted px-3 py-1.5 text-sm font-medium text-text disabled:opacity-50"
+          >
+            <Check size={15} /> Acknowledge
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => resolve("approve")}
+              className="flex flex-1 items-center justify-center gap-1 rounded-md bg-success px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            >
+              <Check size={15} /> Approve
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => resolve("reject")}
+              className="flex flex-1 items-center justify-center gap-1 rounded-md bg-danger px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            >
+              <X size={15} /> Reject
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -456,6 +486,7 @@ export default function AdminPage() {
   const [tab, setTab] = useState<Tab>("queue");
   const [restaurantFilter, setRestaurantFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
+  const [kindFilter, setKindFilter] = useState("all");
 
   const critical = data.instances.filter((c) => c.status === "critical").length;
   const warning = data.instances.filter((c) => c.status === "warning").length;
@@ -465,7 +496,8 @@ export default function AdminPage() {
   const filteredApprovals = data.approvals.filter(
     (a) =>
       (restaurantFilter === "all" || a.instance_id === restaurantFilter) &&
-      (typeFilter === "all" || a.type === typeFilter),
+      (typeFilter === "all" || a.type === typeFilter) &&
+      (kindFilter === "all" || (a.kind ?? "decision") === kindFilter),
   );
 
   const tabs: { id: Tab; label: string; count: number | null }[] = [
@@ -592,6 +624,16 @@ export default function AdminPage() {
                   </option>
                 ))}
               </select>
+              <select
+                value={kindFilter}
+                onChange={(e) => setKindFilter(e.target.value)}
+                className={selectClass}
+                aria-label="Filter decisions vs notices"
+              >
+                <option value="all">Decisions + notices</option>
+                <option value="decision">Decisions only</option>
+                <option value="notice">Notices only</option>
+              </select>
             </div>
             {filteredApprovals.length === 0 ? (
               <p className="py-8 text-center text-sm text-text/40">
@@ -632,9 +674,14 @@ export default function AdminPage() {
                       title={incident.restaurant}
                       size={22}
                     />
-                    <span className="min-w-0 flex-1 truncate text-text">
+                    <span className="min-w-0 flex-1 text-text">
                       {incident.summary}
                     </span>
+                    {incident.count > 1 && (
+                      <span className="shrink-0 rounded-full bg-muted px-1.5 text-[11px] font-semibold text-text/60">
+                        ×{incident.count}
+                      </span>
+                    )}
                     <span className="shrink-0 text-xs text-text/40">
                       {fmtSim(incident.created_at)}
                     </span>

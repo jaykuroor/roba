@@ -157,6 +157,10 @@ wsClient.on("weather_updated", (p) =>
 wsClient.on("approval_created", (p) =>
   actions.upsertApproval((p as { approval: ApprovalRequest }).approval),
 );
+// Escalating notices (overdue task tiers, done-late flips) update in place.
+wsClient.on("approval_updated", (p) =>
+  actions.upsertApproval((p as { approval: ApprovalRequest }).approval),
+);
 wsClient.on("approval_resolved", (p) => {
   const approval = (p as { approval: ApprovalRequest }).approval;
   if (approval) actions.removeApproval(approval.id);

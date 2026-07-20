@@ -10,8 +10,19 @@ import { ApprovalPreview } from "../voice/approvalPreviews";
 // the store + WS keep the list in sync (approval_created adds, approval_resolved
 // removes); this component just does the initial load and the action POSTs.
 
+const URGENCY_CHIP: Record<string, string> = {
+  high: "bg-amber-500/20 text-amber-400",
+  at_risk: "bg-amber-500/20 text-amber-400",
+  critical: "bg-danger/20 text-danger",
+  uncoverable: "bg-danger/20 text-danger",
+};
+
 function ApprovalCard({ approval }: { approval: ApprovalRequest }) {
   const [busy, setBusy] = useState(false);
+  // Notices (kitchen_task, staff_shift) carry no decision — nothing reacts to
+  // approve/reject, so they get a single Acknowledge (which resolves the row).
+  const isNotice = approval.kind === "notice";
+  const urgency = String(approval.urgency ?? "normal");
 
   async function resolve(decision: "approve" | "reject") {
     setBusy(true);
@@ -27,32 +38,50 @@ function ApprovalCard({ approval }: { approval: ApprovalRequest }) {
   return (
     <div className="rounded-lg border border-muted bg-surface p-3">
       <div className="flex items-start justify-between gap-2">
-        <div>
+        <div className="flex items-center gap-1.5">
           <span className="inline-block rounded bg-muted px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-text/70">
             {approval.type}
           </span>
-          <h3 className="mt-1 text-sm font-semibold text-text">{approval.title}</h3>
+          {URGENCY_CHIP[urgency] && (
+            <span className={`rounded px-2 py-0.5 text-xs font-semibold ${URGENCY_CHIP[urgency]}`}>
+              {urgency}
+            </span>
+          )}
         </div>
       </div>
+      <h3 className="mt-1 text-sm font-semibold text-text">{approval.title}</h3>
       <p className="mt-1 text-sm text-text/70">{approval.summary}</p>
       <ApprovalPreview approval={approval} />
       <div className="mt-3 flex gap-2">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => resolve("approve")}
-          className="flex flex-1 items-center justify-center gap-1 rounded-md bg-success px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
-          <Check size={16} /> Approve
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => resolve("reject")}
-          className="flex flex-1 items-center justify-center gap-1 rounded-md bg-danger px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
-          <X size={16} /> Reject
-        </button>
+        {isNotice ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => resolve("approve")}
+            className="flex flex-1 items-center justify-center gap-1 rounded-md bg-muted px-3 py-1.5 text-sm font-medium text-text disabled:opacity-50"
+          >
+            <Check size={16} /> Acknowledge
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => resolve("approve")}
+              className="flex flex-1 items-center justify-center gap-1 rounded-md bg-success px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            >
+              <Check size={16} /> Approve
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => resolve("reject")}
+              className="flex flex-1 items-center justify-center gap-1 rounded-md bg-danger px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            >
+              <X size={16} /> Reject
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -119,9 +148,34 @@ export function ApprovalInbox({
               No pending approvals.
             </p>
           ) : (
-            approvals.map((approval) => (
-              <ApprovalCard key={approval.id} approval={approval} />
-            ))
+            (() => {
+              const decisions = approvals.filter((a) => a.kind !== "notice");
+              const notices = approvals.filter((a) => a.kind === "notice");
+              return (
+                <>
+                  {decisions.length > 0 && (
+                    <>
+                      <h3 className="text-xs font-semibold uppercase tracking-wide text-text/40">
+                        Needs decision
+                      </h3>
+                      {decisions.map((approval) => (
+                        <ApprovalCard key={approval.id} approval={approval} />
+                      ))}
+                    </>
+                  )}
+                  {notices.length > 0 && (
+                    <>
+                      <h3 className="mt-2 text-xs font-semibold uppercase tracking-wide text-text/40">
+                        Notices
+                      </h3>
+                      {notices.map((approval) => (
+                        <ApprovalCard key={approval.id} approval={approval} />
+                      ))}
+                    </>
+                  )}
+                </>
+              );
+            })()
           )}
         </div>
       </aside>

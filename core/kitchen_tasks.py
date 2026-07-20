@@ -116,7 +116,14 @@ def ensure_tasks_for_day(session: Any, sim_day: int, cuisine: Optional[str]) -> 
 
 def _row_to_dict(t: models.KitchenTask, now: float, station_names: dict[int, str]) -> dict:
     overdue = t.status == "pending" and t.due_sim_time is not None and float(t.due_sim_time) < now
+    due = float(t.due_sim_time) if t.due_sim_time is not None else None
+    late_min = 0
+    if t.status == "done" and due is not None and t.done_at is not None:
+        late_min = max(0, int((float(t.done_at) - due) // 60))
     return {
+        "late": late_min > 0,
+        "late_min": late_min,
+        "overdue_min": max(0, int((now - due) // 60)) if overdue and due is not None else 0,
         "id": int(t.id),
         "template_key": t.template_key,
         "title": t.title,
@@ -148,10 +155,12 @@ def task_board(session: Any, *, now: float, cuisine: Optional[str]) -> dict:
     station_names = {int(s.id): s.name for s in session.query(models.Station).all()}
     tasks = [_row_to_dict(t, now, station_names) for t in rows]
 
-    counts = {"done": 0, "pending": 0, "overdue": 0, "not_done": 0, "skipped": 0}
+    counts = {"done": 0, "done_late": 0, "pending": 0, "overdue": 0, "not_done": 0, "skipped": 0}
     for t in tasks:
         if t["status"] == "done":
             counts["done"] += 1
+            if t["late"]:
+                counts["done_late"] += 1
         elif t["status"] == "not_done":
             counts["not_done"] += 1
         elif t["status"] == "skipped":
@@ -172,21 +181,88 @@ def task_board(session: Any, *, now: float, cuisine: Optional[str]) -> dict:
 # Severity → ApprovalRequest.urgency (drives the manager notice's indicative UI).
 _SEVERITY_URGENCY = {"high": "high", "medium": "normal", "low": "low"}
 
+# Escalation ladder for overdue/late notices. A task's single notice climbs
+# this as it stays overdue (docs/fable/approvals.md): tier 1 at 5 min past
+# due, tier 2 at 10, tier 3 at 15 (config.TASK_OVERDUE_NOTICE_TIERS_MIN).
+_TIER_URGENCY = ["normal", "high", "critical"]
 
-def _notify_not_done(approvals: Any, t: models.KitchenTask) -> None:
-    """Raise a manager notice that a task was reported not done (with the reason)."""
+
+def _tiers_min() -> list[int]:
+    from . import config
+    return list(config.TASK_OVERDUE_NOTICE_TIERS_MIN)
+
+
+def overdue_tier(overdue_min: float, tiers: Optional[list[int]] = None) -> int:
+    """0 = within grace (no notice); 1..len(tiers) = escalation tier."""
+    tiers = _tiers_min() if tiers is None else tiers
+    return sum(1 for threshold in tiers if overdue_min >= threshold)
+
+
+def tier_urgency(tier: int, category: Optional[str]) -> str:
+    """Urgency for a tier; temp/safety tasks run one tier hotter."""
+    idx = (tier - 1) + (1 if category in ("temp", "safety") else 0)
+    return _TIER_URGENCY[max(0, min(idx, len(_TIER_URGENCY) - 1))]
+
+
+def _find_pending_notice(session: Any, task_id: int) -> Optional[models.ApprovalRequest]:
+    return (
+        session.query(models.ApprovalRequest)
+        .filter(
+            models.ApprovalRequest.type == "kitchen_task",
+            models.ApprovalRequest.ref_id == int(task_id),
+            models.ApprovalRequest.status == "pending",
+        )
+        .order_by(models.ApprovalRequest.id.desc())
+        .first()
+    )
+
+
+def _upsert_task_notice(
+    approvals: Any,
+    session: Any,
+    t: models.KitchenTask,
+    *,
+    title: str,
+    summary: str,
+    urgency: str,
+    extra_payload: dict,
+) -> None:
+    """One evolving notice per task: update the pending row if it exists,
+    create it otherwise. ``approvals`` may be None (headless/tests)."""
     if approvals is None:
         return
+    payload = {
+        "task_id": int(t.id),
+        "category": t.category,
+        "template_key": t.template_key,
+        **extra_payload,
+    }
+    existing = _find_pending_notice(session, int(t.id))
+    if existing is not None:
+        approvals.update(
+            int(existing.id), title=title, summary=summary, urgency=urgency, payload=payload
+        )
+    else:
+        approvals.create(
+            type="kitchen_task",
+            title=title,
+            summary=summary,
+            payload=payload,
+            urgency=urgency,
+            ref_id=int(t.id),
+        )
+
+
+def _notify_not_done(approvals: Any, session: Any, t: models.KitchenTask) -> None:
+    """Raise/refresh the manager notice that a task was reported not done."""
     note = (t.note or "").strip()
     severity = t.severity or ("high" if t.category in ("temp", "safety") else "medium")
-    approvals.create(
-        type="kitchen_task",
+    _upsert_task_notice(
+        approvals, session, t,
         title=f"Task not done: {t.title}",
         summary=f"Kitchen reported this not done — {note}" if note else "Kitchen reported this task not done.",
-        payload={"task_id": int(t.id), "category": t.category, "template_key": t.template_key,
-                 "note": note, "outcome": "not_done", "severity": severity},
         urgency=_SEVERITY_URGENCY.get(severity, "normal"),
-        ref_id=int(t.id),
+        extra_payload={"note": note, "outcome": "not_done", "severity": severity},
     )
 
 
@@ -217,6 +293,20 @@ def set_outcome(
         t.severity = None
         if note is not None:
             t.note = note
+        # Done late past the first tier → the overdue notice (if any) flips to
+        # "done late" at the lateness-matched urgency instead of going stale.
+        late_min = (
+            (now - float(t.due_sim_time)) / 60.0 if t.due_sim_time is not None else 0.0
+        )
+        tier = overdue_tier(late_min)
+        if tier > 0:
+            _upsert_task_notice(
+                approvals, session, t,
+                title=f"Task done late: {t.title}",
+                summary=f"Completed by the kitchen {int(late_min)} min after its due time.",
+                urgency=tier_urgency(tier, t.category),
+                extra_payload={"outcome": "done_late", "late_min": int(late_min), "tier": tier},
+            )
     elif status == "not_done":
         was_not_done = t.status == "not_done"
         t.status = "not_done"
@@ -224,58 +314,97 @@ def set_outcome(
         t.severity = severity if severity in ("low", "medium", "high") else None
         t.done_at = now
         t.done_by = by
-        t.notified_manager = 1  # also stops reconcile re-escalating it as overdue
+        t.notified_manager = len(_tiers_min())  # stops reconcile re-escalating it
         if not was_not_done:
-            _notify_not_done(approvals, t)  # first transition → raise the reason once
+            _notify_not_done(approvals, session, t)  # first transition → raise once
     else:  # pending (revert)
         t.status = "pending"
         t.note = None
         t.severity = None
         t.done_at = None
         t.done_by = None
+        t.notified_manager = 0
     session.commit()
     return t
 
 
 def reconcile(session: Any, *, now: float, cuisine: Optional[str], approvals: Any) -> list[int]:
-    """Raise a manager alert for every task past due and still pending.
+    """Escalate every pending task past due through the notice tiers.
 
-    Idempotent per task via the ``notified_manager`` flag.  Returns the list of
-    KitchenTask ids newly escalated.  ``approvals`` may be None (headless/tests).
+    Each task owns ONE notice that is created at the first tier (5 min past
+    due) and updated in place as it crosses later tiers (10, 15 min) with
+    climbing urgency. ``notified_manager`` stores the last-notified tier, so
+    the sweep is idempotent per tier. Returns task ids escalated this call.
+    ``approvals`` may be None (headless/tests) — tiers still advance.
     """
     sim_day = int(now // SECONDS_PER_DAY)
     ensure_tasks_for_day(session, sim_day, cuisine)
 
+    tiers = _tiers_min()
     overdue = (
         session.query(models.KitchenTask)
         .filter(
             models.KitchenTask.sim_day == sim_day,
             models.KitchenTask.status == "pending",
-            models.KitchenTask.notified_manager == 0,
+            models.KitchenTask.notified_manager < len(tiers),
             models.KitchenTask.due_sim_time < now,
         )
         .all()
     )
     escalated: list[int] = []
     for t in overdue:
-        t.notified_manager = 1
+        overdue_min = (now - float(t.due_sim_time)) / 60.0
+        tier = overdue_tier(overdue_min, tiers)
+        if tier <= int(t.notified_manager or 0):
+            continue
+        t.notified_manager = tier
         escalated.append(int(t.id))
-        if approvals is not None:
-            mins_late = max(0, int((now - float(t.due_sim_time)) // 60))
-            approvals.create(
-                type="kitchen_task",
-                title=f"Overdue kitchen task: {t.title}",
-                summary=f"Not confirmed by the kitchen ({mins_late} min past due).",
-                payload={"task_id": int(t.id), "category": t.category, "template_key": t.template_key},
-                urgency="high" if t.category in ("temp", "safety") else "normal",
-                ref_id=int(t.id),
-            )
+        _upsert_task_notice(
+            approvals, session, t,
+            title=f"Overdue kitchen task: {t.title}",
+            summary=(
+                f"Not confirmed by the kitchen — {int(overdue_min)} min past due "
+                f"(escalation {tier}/{len(tiers)})."
+            ),
+            urgency=tier_urgency(tier, t.category),
+            extra_payload={"outcome": "overdue", "overdue_min": int(overdue_min), "tier": tier},
+        )
     session.commit()
     return escalated
 
 
+class _DemoHub:
+    """Minimal ApprovalsHub stand-in that persists real rows (for _demo/tests)."""
+
+    def __init__(self, session: Any):
+        self.session = session
+        self.creates: list = []
+        self.updates: list = []
+
+    def create(self, **kw):
+        row = models.ApprovalRequest(
+            type=kw["type"], title=kw["title"], summary=kw["summary"],
+            payload=kw.get("payload"), urgency=kw.get("urgency", "normal"),
+            status="pending", created_at=0.0, ref_id=kw.get("ref_id"),
+        )
+        self.session.add(row)
+        self.session.commit()
+        self.creates.append(kw)
+        return row
+
+    def update(self, approval_id, **kw):
+        row = self.session.get(models.ApprovalRequest, approval_id)
+        for key in ("title", "summary", "urgency", "payload"):
+            if kw.get(key) is not None:
+                setattr(row, key, kw[key])
+        self.session.commit()
+        self.updates.append((approval_id, kw))
+        return row
+
+
 def _demo() -> None:
-    """Self-check: templates materialize once, overdue escalates once."""
+    """Self-check: templates materialize once; ONE notice per task escalates
+    through tiers and flips to done-late; not_done notifies once."""
     from . import db
     db.reset_db(keep_reference=False)
     session = db.new_session()
@@ -294,34 +423,48 @@ def _demo() -> None:
         board2 = task_board(session, now=_hhmm(8, 5), cuisine="burger")
         assert len(board2["tasks"]) == n, len(board2["tasks"])
 
-        # After close — everything overdue; reconcile escalates once each.
-        esc = reconcile(session, now=_hhmm(23, 30), cuisine="burger", approvals=None)
-        assert len(esc) == n, (len(esc), n)
-        esc2 = reconcile(session, now=_hhmm(23, 31), cuisine="burger", approvals=None)
-        assert esc2 == [], esc2
+        hub = _DemoHub(session)
+        tid = board["tasks"][0]["id"]  # "Turn on & preheat" — due 08:15, category=opening
 
-        # Confirm one task clears its overdue state.
-        tid = board["tasks"][0]["id"]
-        set_outcome(session, tid, status="done", by="cook", now=_hhmm(23, 32))
-        board3 = task_board(session, now=_hhmm(23, 33), cuisine="burger")
-        assert board3["counts"]["done"] == 1, board3["counts"]
+        # 2 min past due: within grace, no notice.
+        assert reconcile(session, now=_hhmm(8, 17), cuisine="burger", approvals=hub) == []
+        # 6 min past due: tier 1 → ONE create, urgency normal.
+        assert reconcile(session, now=_hhmm(8, 21), cuisine="burger", approvals=hub) == [tid]
+        assert len(hub.creates) == 1 and hub.creates[0]["urgency"] == "normal", hub.creates
+        # 11 min past due: tier 2 → same notice UPDATED to high, no new create.
+        assert reconcile(session, now=_hhmm(8, 26), cuisine="burger", approvals=hub) == [tid]
+        assert len(hub.creates) == 1 and len(hub.updates) == 1, (hub.creates, hub.updates)
+        assert hub.updates[0][1]["urgency"] == "high", hub.updates
+        # Cook completes it 17 min late → notice flips to done-late, critical.
+        set_outcome(session, tid, status="done", by="cook", now=_hhmm(8, 32), approvals=hub)
+        assert hub.updates[-1][1]["title"].startswith("Task done late"), hub.updates[-1]
+        assert hub.updates[-1][1]["urgency"] == "critical", hub.updates[-1]
+        pending = session.query(models.ApprovalRequest).filter_by(status="pending").count()
+        assert pending == 1, pending  # one evolving notice, never a pile
+
+        board3 = task_board(session, now=_hhmm(8, 33), cuisine="burger")
+        t1 = next(t for t in board3["tasks"] if t["id"] == tid)
+        assert t1["late"] and t1["late_min"] == 17, t1
+        assert board3["counts"]["done_late"] == 1, board3["counts"]
+
+        # After close — everything else escalates straight to top tier once.
+        esc = reconcile(session, now=_hhmm(23, 30), cuisine="burger", approvals=None)
+        assert len(esc) == n - 1, (len(esc), n)
+        assert reconcile(session, now=_hhmm(23, 31), cuisine="burger", approvals=None) == []
 
         # Report a task not done → status + note + one manager notice.
-        class _Rec:
-            def __init__(self): self.calls = []
-            def create(self, **kw): self.calls.append(kw)
-        rec = _Rec()
         tid2 = board["tasks"][1]["id"]
+        before = len(hub.creates)
         set_outcome(session, tid2, status="not_done", note="ran out of degreaser",
-                    by="cook", now=_hhmm(23, 34), approvals=rec)
+                    by="cook", now=_hhmm(23, 34), approvals=hub)
         b4 = task_board(session, now=_hhmm(23, 35), cuisine="burger")
         t2 = next(t for t in b4["tasks"] if t["id"] == tid2)
         assert t2["status"] == "not_done" and t2["note"] == "ran out of degreaser", t2
-        assert len(rec.calls) == 1 and rec.calls[0]["type"] == "kitchen_task", rec.calls
+        assert len(hub.creates) == before + 1, hub.creates
         # Idempotent: repeat doesn't re-notify.
         set_outcome(session, tid2, status="not_done", note="still no degreaser",
-                    by="cook", now=_hhmm(23, 36), approvals=rec)
-        assert len(rec.calls) == 1, rec.calls
+                    by="cook", now=_hhmm(23, 36), approvals=hub)
+        assert len(hub.creates) == before + 1, hub.creates
         print("kitchen_tasks demo OK:", n, "tasks")
     finally:
         session.close()

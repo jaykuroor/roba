@@ -49,6 +49,9 @@ export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
 export interface ApprovalRequest {
   id: number;
   type: ApprovalType;
+  /** "decision" = approve/reject drives an action; "notice" = acknowledge-only
+   *  (kitchen_task, staff_shift — nothing reacts to the decision). */
+  kind?: "decision" | "notice";
   title: string;
   summary: string;
   payload: unknown;

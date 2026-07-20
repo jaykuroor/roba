@@ -142,15 +142,24 @@ def build_issues(
     for a in pending_approvals:
         severity = URGENCY_TO_SEVERITY.get(str(a.get("urgency")), "medium")
         created = a.get("created_at")
+        # "notice" = acknowledge-only (no reactor acts on a decision);
+        # "decision" = approve/reject drives a real action. The child tags
+        # each row (core.approvals.kind_for).
+        approval_kind = a.get("kind") or "decision"
         issues.append({
             "instance_id": instance_id,
             "restaurant": title,
             "kind": "approval",
+            "approval_kind": approval_kind,
             "problem": a.get("title") or a.get("type") or "Approval pending",
             "severity": severity,
             "deadline_sim": (created + APPROVAL_TTL_SIM_S) if isinstance(created, (int, float)) else None,
             "impact": a.get("summary") or "",
-            "recommended_action": "Approve if the numbers look right — Roba proposed this.",
+            "recommended_action": (
+                "Acknowledge — informational; nothing is gated on a decision."
+                if approval_kind == "notice"
+                else "Approve if the numbers look right — Roba proposed this."
+            ),
             "approval_id": a.get("id"),
         })
 
@@ -232,6 +241,116 @@ SIGNAL_TO_INCIDENT = {
     "INGREDIENT_UNCOVERABLE": "stockout",
     "EXPIRY_RISK": "food_safety",
 }
+
+# One manager-readable sentence per merged group; {names} is the ingredient
+# list. Raw statuses like "at_risk" never reach the UI.
+_GROUP_PHRASES = {
+    "INGREDIENT_UNCOVERABLE": "No supplier can deliver {names} in time — the kitchen will run short.",
+    "LOW_STOCK": "Running low on {names} (at or below safety stock).",
+    "STOCKOUT_RISK": "{names} projected to run out before the next delivery.",
+    "EXPIRY_RISK": "{names} close to expiry — use first or discard.",
+}
+_DELAY_PHRASES = {
+    "at_risk": "may arrive late — a one-day delivery slip would leave the kitchen short",
+    "uncoverable": "cannot be delivered in time by any supplier — dishes will run short",
+}
+
+
+def join_names(names: List[str]) -> str:
+    """Deterministic '"A", "B" and "C"' list (deduped, sorted)."""
+    unique = sorted({n for n in names if n})
+    if not unique:
+        return "some items"
+    if len(unique) == 1:
+        return unique[0]
+    return ", ".join(unique[:-1]) + " and " + unique[-1]
+
+
+def merge_incidents(
+    signals: List[Dict[str, Any]],
+    plan_items: List[Dict[str, Any]],
+    ingredient_names: Dict[int, str],
+) -> List[Dict[str, Any]]:
+    """Turn raw live signals + at-risk plan items into merged, human-readable
+    incidents: similar items are batched (per supplier / per signal type) and
+    phrased for a manager, never as raw status codes. Pure + deterministic
+    (tested in tests/test_manager.py)."""
+
+    def ingredient_name(payload: Dict[str, Any]) -> str:
+        return (
+            payload.get("ingredient_name")
+            or ingredient_names.get(payload.get("ingredient_id"))
+            or (f"ingredient #{payload['ingredient_id']}" if payload.get("ingredient_id") else "")
+        )
+
+    rows: List[Dict[str, Any]] = []
+
+    # --- signal groups batched by type: {names} phrased per _GROUP_PHRASES --
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for s in signals:
+        sig_type = str(s.get("type"))
+        category = SIGNAL_TO_INCIDENT.get(sig_type)
+        if category is None:
+            continue
+        payload = s.get("payload") or {}
+        if sig_type in _GROUP_PHRASES:
+            grouped.setdefault(sig_type, []).append(s)
+        elif sig_type == "STAFF_COVERAGE":
+            # Routine coverage broadcast — only a lost station is an incident.
+            if payload.get("covered", False) and not payload.get("shortfall"):
+                continue
+            station = payload.get("station_name") or payload.get("station_id")
+            rows.append({
+                "category": category, "signal_type": sig_type,
+                "summary": f"Station {station} has no qualified cover — its dishes are blocked.",
+                "count": 1, "names": [], "created_at": s.get("created_at"),
+            })
+        else:  # STAFF_AVAILABILITY
+            who = payload.get("staff_name") or payload.get("name") or "A staff member"
+            status = payload.get("status") or "absent"
+            reason = payload.get("reason")
+            summary = f"{who} is {status}" + (f" — {reason}." if reason else ".")
+            rows.append({
+                "category": category, "signal_type": sig_type,
+                "summary": summary,
+                "count": 1, "names": [], "created_at": s.get("created_at"),
+            })
+
+    for sig_type, members in grouped.items():
+        names = [ingredient_name(m.get("payload") or {}) for m in members]
+        rows.append({
+            "category": SIGNAL_TO_INCIDENT[sig_type],
+            "signal_type": sig_type,
+            "summary": _GROUP_PHRASES[sig_type].format(names=join_names(names)),
+            "count": len(members),
+            "names": sorted({n for n in names if n}),
+            "created_at": max((m.get("created_at") or 0) for m in members),
+        })
+
+    # --- supplier delays batched per (supplier, status) ---------------------
+    delays: Dict[tuple, List[Dict[str, Any]]] = {}
+    for item in plan_items:
+        if item.get("status") in _DELAY_PHRASES:
+            key = (item.get("supplier_name") or "a supplier", item["status"])
+            delays.setdefault(key, []).append(item)
+    for (supplier, status), members in delays.items():
+        names = [m.get("ingredient_name") or "?" for m in members]
+        rows.append({
+            "category": "supplier_delay",
+            "signal_type": "PLANNED_ORDER",
+            "summary": f"{join_names(names)} from {supplier} {_DELAY_PHRASES[status]}.",
+            "count": len(members),
+            "names": sorted(set(names)),
+            "created_at": max((m.get("order_date") or 0) for m in members),
+        })
+
+    # Dedupe identical summaries (e.g. repeated coverage signals), keep newest.
+    seen: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        prior = seen.get(r["summary"])
+        if prior is None or (r["created_at"] or 0) > (prior["created_at"] or 0):
+            seen[r["summary"]] = r
+    return sorted(seen.values(), key=lambda r: (r["category"], r["summary"]))
 
 
 # ---------------------------------------------------------------------------
@@ -554,47 +673,17 @@ async def resolve_approval(instance_id: str, approval_id: int, decision: str) ->
 @app.get("/admin/api/incidents")
 async def incidents() -> Dict[str, Any]:
     async def fetch(inst: Dict[str, Any]) -> List[Dict[str, Any]]:
-        signals = await _get(inst, "/api/signals?status=live") or []
-        plan = await _get(inst, "/api/track-b/procurement/plan") or {}
-        rows: List[Dict[str, Any]] = []
-        for s in signals:
-            category = SIGNAL_TO_INCIDENT.get(str(s.get("type")))
-            if category is None:
-                continue
-            payload = s.get("payload") or {}
-            # STAFF_COVERAGE is a routine status broadcast; it is only an
-            # incident when a station actually lost coverage.
-            if s.get("type") == "STAFF_COVERAGE" and payload.get("covered", False) \
-                    and not payload.get("shortfall"):
-                continue
-            summary = (
-                payload.get("reason")
-                or payload.get("summary")
-                or payload.get("ingredient_name")
-                or (f"station {payload['station_id']} coverage shortfall"
-                    if "station_id" in payload else None)
-                or s.get("type")
-            )
-            rows.append({
-                "instance_id": inst["id"], "restaurant": inst["title"],
-                "category": category, "signal_type": s.get("type"),
-                "summary": summary,
-                "created_at": s.get("created_at"),
-                "payload": payload,
-            })
-        for o in plan.get("items") or []:
-            if o.get("status") in ("at_risk", "uncoverable"):
-                rows.append({
-                    "instance_id": inst["id"], "restaurant": inst["title"],
-                    "category": "supplier_delay",
-                    "signal_type": "PLANNED_ORDER",
-                    "summary": f"{o.get('ingredient_name', '?')} from "
-                               f"{o.get('supplier_name', 'supplier')} is {o.get('status')}",
-                    "created_at": o.get("order_date"),
-                    "payload": {"planned_order_id": o.get("id"),
-                                "coverage_status": o.get("coverage_status")},
-                })
-        return rows
+        signals, plan, ingredients = await asyncio.gather(
+            _get(inst, "/api/signals?status=live"),
+            _get(inst, "/api/track-b/procurement/plan"),
+            _get(inst, "/api/ingredients"),
+        )
+        names = {int(i["id"]): i.get("name") for i in ingredients or [] if i.get("id")}
+        merged = merge_incidents(
+            signals or [], (plan or {}).get("items") or [], names
+        )
+        return [{**r, "instance_id": inst["id"], "restaurant": inst["title"]}
+                for r in merged]
 
     nested = await asyncio.gather(*(fetch(i) for i in registry.instances.values()))
     rows = [r for batch in nested for r in batch]

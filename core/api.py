@@ -1238,10 +1238,16 @@ def read_approvals(
     status: Optional[str] = Query(None),
     db_session: Any = Depends(db.get_db),
 ) -> List[Dict[str, Any]]:
+    from .approvals import kind_for
     query = db_session.query(models.ApprovalRequest)
     if status is not None:
         query = query.filter(models.ApprovalRequest.status == status)
-    return [_row_to_dict(r) for r in query.order_by(models.ApprovalRequest.created_at.asc()).all()]
+    rows = [_row_to_dict(r) for r in query.order_by(models.ApprovalRequest.created_at.asc()).all()]
+    for r in rows:
+        # "decision" (approve/reject) vs "notice" (acknowledge-only) — drives
+        # which buttons the inboxes render (docs/fable/approvals.md).
+        r["kind"] = kind_for(r.get("type"))
+    return rows
 
 
 @app.get("/api/events")

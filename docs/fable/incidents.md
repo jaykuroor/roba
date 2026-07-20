@@ -19,6 +19,27 @@ The mapping is `manager.SIGNAL_TO_INCIDENT`. The response also lists
 `food_safety_checks`) so the UI can label the gap honestly instead of showing
 a silent empty list.
 
+### Merging + human phrasing (`manager.merge_incidents`)
+
+Raw statuses never reach the manager. Similar items are batched
+deterministically and phrased as one sentence (tested in
+`tests/test_manager.py`):
+
+- Plan items group by **(supplier, status)**: *"Basil, Romaine Lettuce and
+  Tomato from GreenFarm Produce may arrive late — a one-day delivery slip
+  would leave the kitchen short."* (`at_risk`) / *"…cannot be delivered in
+  time by any supplier — dishes will run short."* (`uncoverable`).
+- Stock/expiry signals group by **type** with ingredient names resolved via
+  the child's `/api/ingredients`: *"Running low on Garlic and Pasta (at or
+  below safety stock)."*, *"Basil close to expiry — use first or discard."*
+- Staff signals stay per-person/station: *"Marco is sick."*, *"Station Grill
+  has no qualified cover — its dishes are blocked."* Routine
+  covered-station broadcasts are dropped.
+
+Each merged row carries `count` and `names`, so the UI can show a ×N badge.
+New phrasings belong in `_GROUP_PHRASES` / `_DELAY_PHRASES` — never in the
+frontend.
+
 ## Not implemented — guidance
 
 **Missing detectors** (each is: create the child-side signal, then add one line

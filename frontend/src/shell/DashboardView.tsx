@@ -13,6 +13,7 @@ import { ReviewPanel } from "../track_a/ReviewPanel";
 import { SignalFeed } from "../track_a/SignalFeed";
 import { StaffPanel } from "../track_a/StaffPanel";
 import { PosMonitor } from "../pos/PosMonitor";
+import { TasksPanel } from "./TasksPanel";
 import { TRACK_B_PANELS } from "../track_b";
 
 // ---------------------------------------------------------------------------
@@ -27,6 +28,7 @@ interface TabDef {
 const TABS: TabDef[] = [
   { id: "operations",  label: "Operations" },
   { id: "forecast",    label: "Forecast" },
+  { id: "tasks",       label: "Tasks" },
   { id: "staff",       label: "Staff" },
   { id: "inventory",   label: "Inventory" },
   { id: "expiry",      label: "Expiry" },
@@ -42,6 +44,7 @@ function Panel({ id }: { id: string }) {
   switch (id) {
     case "operations":  return <PosMonitor />;
     case "forecast":    return <ForecastDashboard />;
+    case "tasks":       return <TasksPanel />;
     case "staff":       return <StaffPanel />;
     case "inventory": {
       const p = TRACK_B_PANELS.find((p) => p.name === "Inventory");

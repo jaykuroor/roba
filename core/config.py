@@ -139,6 +139,14 @@ VOICE_EMIT_LEGACY_USER_FACT = os.getenv(
 # Voice planner (Stream B)
 VOICE_DEFAULT_MODE = os.getenv("VOICE_DEFAULT_MODE", "confirm")  # "confirm" | "auto"
 
+# Kitchen task overdue-notice escalation tiers, in sim-minutes past due.
+# A pending task raises/updates ONE manager notice as it crosses each tier
+# (5 min → first notice, 10/15 min → escalations). Urgency climbs
+# normal → high → critical per tier; temp/safety tasks start one tier hotter.
+TASK_OVERDUE_NOTICE_TIERS_MIN = [
+    int(x) for x in os.getenv("TASK_OVERDUE_NOTICE_TIERS_MIN", "5,10,15").split(",")
+]
+
 # Kitchen batch lifecycle (Stream B3)
 BATCH_APPROVAL_GATED = os.getenv("BATCH_APPROVAL_GATED", "0").lower() in {
     "1", "true", "yes", "on"

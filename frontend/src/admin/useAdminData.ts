@@ -33,6 +33,8 @@ export interface ActionItem {
   instance_id: string;
   restaurant: string;
   kind: "approval" | "stock" | "staff";
+  /** For kind==="approval": "decision" (approve/reject) or "notice" (acknowledge). */
+  approval_kind?: "decision" | "notice";
   problem: string;
   severity: "critical" | "high" | "medium" | "low";
   deadline_sim: number | null;
@@ -46,6 +48,7 @@ export interface AdminApproval {
   instance_id: string;
   restaurant: string;
   type: string;
+  kind?: "decision" | "notice";
   title: string;
   summary: string;
   urgency: string;
@@ -58,7 +61,10 @@ export interface Incident {
   restaurant: string;
   category: string;
   signal_type: string;
+  /** Human-readable, merged: similar items are batched per supplier/type. */
   summary: string;
+  count: number;
+  names: string[];
   created_at: number | null;
 }
 

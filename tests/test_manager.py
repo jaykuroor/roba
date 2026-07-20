@@ -85,3 +85,72 @@ def test_rank_issues_no_deadline_sorts_last_within_severity():
     ranked = manager.rank_issues(issues)
     assert ranked[0]["severity"] == "critical"
     assert ranked[1]["deadline_sim"] == 50.0
+
+
+def test_join_names_deterministic():
+    assert manager.join_names(["Tomato"]) == "Tomato"
+    assert manager.join_names(["Tomato", "Basil"]) == "Basil and Tomato"
+    assert manager.join_names(["Tomato", "Basil", "Tomato"]) == "Basil and Tomato"
+    assert manager.join_names([]) == "some items"
+
+
+def test_merge_incidents_batches_supplier_delays_and_kills_raw_status():
+    items = [
+        {"status": "at_risk", "supplier_name": "GreenFarm Produce", "ingredient_name": "Tomato", "order_date": 1.0},
+        {"status": "at_risk", "supplier_name": "GreenFarm Produce", "ingredient_name": "Basil", "order_date": 2.0},
+        {"status": "at_risk", "supplier_name": "GreenFarm Produce", "ingredient_name": "Romaine Lettuce", "order_date": 3.0},
+        {"status": "at_risk", "supplier_name": "GreenFarm Produce", "ingredient_name": "Romaine Lettuce", "order_date": 4.0},
+        {"status": "uncoverable", "supplier_name": "GreenFarm Produce", "ingredient_name": "Mascarpone", "order_date": 5.0},
+        {"status": "planned", "supplier_name": "GreenFarm Produce", "ingredient_name": "Flour"},
+    ]
+    rows = manager.merge_incidents([], items, {})
+    delays = [r for r in rows if r["category"] == "supplier_delay"]
+    # one merged row per (supplier, status); "planned" is not an incident
+    assert len(delays) == 2, delays
+    at_risk = next(r for r in delays if "may arrive late" in r["summary"])
+    assert at_risk["summary"].startswith(
+        "Basil, Romaine Lettuce and Tomato from GreenFarm Produce"
+    ), at_risk["summary"]
+    assert "at_risk" not in at_risk["summary"]
+    assert at_risk["count"] == 4 and at_risk["created_at"] == 4.0
+    uncoverable = next(r for r in delays if "cannot be delivered" in r["summary"])
+    assert uncoverable["names"] == ["Mascarpone"]
+
+
+def test_merge_incidents_batches_signals_and_humanizes():
+    signals = [
+        {"type": "LOW_STOCK", "payload": {"ingredient_id": 1}, "created_at": 10.0},
+        {"type": "LOW_STOCK", "payload": {"ingredient_id": 2}, "created_at": 11.0},
+        {"type": "INGREDIENT_UNCOVERABLE", "payload": {"ingredient_name": "Mascarpone"}, "created_at": 12.0},
+        {"type": "STAFF_COVERAGE", "payload": {"covered": True, "shortfall": 0.0}, "created_at": 13.0},
+        {"type": "STAFF_COVERAGE", "payload": {"covered": False, "station_name": "Grill"}, "created_at": 14.0},
+        {"type": "STAFF_AVAILABILITY", "payload": {"staff_name": "Marco", "status": "sick"}, "created_at": 15.0},
+        {"type": "DEMAND_FORECAST", "payload": {}, "created_at": 16.0},
+    ]
+    rows = manager.merge_incidents(signals, [], {1: "Milk", 2: "Butter"})
+    low = next(r for r in rows if r["signal_type"] == "LOW_STOCK")
+    assert low["summary"] == "Running low on Butter and Milk (at or below safety stock)."
+    assert low["count"] == 2 and low["created_at"] == 11.0
+    assert any("Grill has no qualified cover" in r["summary"] for r in rows)
+    assert any(r["summary"] == "Marco is sick." for r in rows)
+    # routine covered-station broadcast and unmapped signal types are dropped
+    staff_rows = [r for r in rows if r["category"] == "staff_no_show"]
+    assert len(staff_rows) == 2, staff_rows
+    assert not any(r["signal_type"] == "DEMAND_FORECAST" for r in rows)
+
+
+def test_build_issues_notice_kind_changes_recommendation():
+    approvals = [
+        {"id": 1, "title": "Overdue kitchen task: X", "kind": "notice",
+         "urgency": "high", "created_at": 0.0, "summary": ""},
+        {"id": 2, "title": "PO #9", "kind": "decision",
+         "urgency": "normal", "created_at": 0.0, "summary": ""},
+    ]
+    issues = manager.build_issues("running_fox", "Bella's", snapshot={},
+                                  warnings=[], pending_approvals=approvals)
+    notice = next(i for i in issues if i["approval_id"] == 1)
+    decision = next(i for i in issues if i["approval_id"] == 2)
+    assert notice["approval_kind"] == "notice"
+    assert "Acknowledge" in notice["recommended_action"]
+    assert decision["approval_kind"] == "decision"
+    assert "Approve" in decision["recommended_action"]
