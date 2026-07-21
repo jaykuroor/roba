@@ -29,6 +29,10 @@ REVIEW_SCHEMA: Dict[str, Any] = {
     ],
 }
 
+# Max LLM-analyzed reviews per scan; a seeded backlog drains over successive
+# 15-min scans instead of holding the clock at realtime for minutes.
+_LLM_BATCH_MAX = 3
+
 
 class ReviewAgent(BaseAgent):
     """Turns review rows into Track A insights and REVIEW_INSIGHT signals."""
@@ -67,6 +71,13 @@ class ReviewAgent(BaseAgent):
         rows: List[ReviewInsight] = []
         now = float(self.bus.sim_time)
         after_commit: List[tuple[str, Any]] = []
+        # Read-only snapshot, closed before any LLM work.  The previous
+        # implementation held ONE write transaction open across an LLM call per
+        # review; with a seeded backlog that pinned the sqlite write lock for
+        # minutes, starving the orchestrator tick ("database is locked" at
+        # ~08:15, clock frozen, panels stalled).  Now the query runs and closes
+        # first, LLM analysis happens with NO session open, and each review is
+        # persisted in its own short write transaction.
         session = self.db_session_factory()
         try:
             reviews = (
@@ -83,17 +94,29 @@ class ReviewAgent(BaseAgent):
                 .order_by(Review.sim_time.asc(), Review.id.asc())
                 .all()
             )
-            for review in reviews:
-                review_id, source, rating, text, dish_mentions, _sentiment, sim_time = review
-                review_data = {
-                    "id": review_id,
-                    "source": source,
-                    "rating": rating,
-                    "text": text,
-                    "dish_mentions": dish_mentions or [],
-                    "sim_time": sim_time,
-                }
-                parsed = self._analyze(review_data)
+        finally:
+            session.close()
+
+        if self.llm is not None and len(reviews) > _LLM_BATCH_MAX:
+            # ponytail: cap LLM analyses per scan so a seeded backlog can't hold
+            # the clock at realtime for minutes; the remainder drain on the next
+            # 15-min scan.  Deterministic (no-LLM) analysis is cheap — no cap.
+            reviews = reviews[:_LLM_BATCH_MAX]
+
+        for review in reviews:
+            review_id, source, rating, text, dish_mentions, _sentiment, sim_time = review
+            review_data = {
+                "id": review_id,
+                "source": source,
+                "rating": rating,
+                "text": text,
+                "dish_mentions": dish_mentions or [],
+                "sim_time": sim_time,
+            }
+            parsed = self._analyze(review_data)  # LLM call — no DB session held
+
+            session = self.db_session_factory()
+            try:
                 severity = self._trend_severity(session, parsed["dish_mentions"], parsed["severity"])
                 insight = ReviewInsight(
                     review_id=review_id,
@@ -109,50 +132,51 @@ class ReviewAgent(BaseAgent):
                     review_obj.processed = 1
                     review_obj.sentiment = parsed["sentiment"]
                     review_obj.dish_mentions = parsed["dish_mentions"]
-                session.flush()
+                session.commit()
                 session.refresh(insight)
-                insight_payload = {
-                    "id": insight.id,
-                    "review_id": review_id,
-                    "insight_type": "sentiment",
-                    "summary": parsed["summary"],
-                    "suggested_action": parsed["suggested_action"],
-                    "severity": severity,
-                    "sim_time": now,
-                }
-                review_payload = {
-                    "id": review_id,
-                    "source": source,
-                    "rating": rating,
-                    "text": text,
-                    "dish_mentions": parsed["dish_mentions"],
-                    "sentiment": parsed["sentiment"],
-                    "sim_time": sim_time,
-                    "processed": 1,
-                }
+                insight_id = insight.id
                 rows.append(insight)
+            finally:
+                session.close()
 
-                payload = {
-                    "review_id": review_id,
-                    "severity": severity,
-                    "summary": parsed["summary"],
-                    "suggested_action": parsed["suggested_action"],
-                    "dish_mentions": parsed["dish_mentions"],
-                }
-                key = "review:" + (parsed["dish_mentions"][0] if parsed["dish_mentions"] else "general")
-                after_commit.extend(
-                    [
-                        ("emit", (SignalType.REVIEW_INSIGHT, payload, {"dedup_key": key})),
-                        ("log", ("review", parsed["summary"], payload)),
-                        (
-                            "broadcast",
-                            ("review_insight", {"insight": insight_payload, "review": review_payload}),
-                        ),
-                    ]
-                )
-            session.commit()
-        finally:
-            session.close()
+            insight_payload = {
+                "id": insight_id,
+                "review_id": review_id,
+                "insight_type": "sentiment",
+                "summary": parsed["summary"],
+                "suggested_action": parsed["suggested_action"],
+                "severity": severity,
+                "sim_time": now,
+            }
+            review_payload = {
+                "id": review_id,
+                "source": source,
+                "rating": rating,
+                "text": text,
+                "dish_mentions": parsed["dish_mentions"],
+                "sentiment": parsed["sentiment"],
+                "sim_time": sim_time,
+                "processed": 1,
+            }
+
+            payload = {
+                "review_id": review_id,
+                "severity": severity,
+                "summary": parsed["summary"],
+                "suggested_action": parsed["suggested_action"],
+                "dish_mentions": parsed["dish_mentions"],
+            }
+            key = "review:" + (parsed["dish_mentions"][0] if parsed["dish_mentions"] else "general")
+            after_commit.extend(
+                [
+                    ("emit", (SignalType.REVIEW_INSIGHT, payload, {"dedup_key": key})),
+                    ("log", ("review", parsed["summary"], payload)),
+                    (
+                        "broadcast",
+                        ("review_insight", {"insight": insight_payload, "review": review_payload}),
+                    ),
+                ]
+            )
         self._run_after_commit(after_commit)
         return rows
 

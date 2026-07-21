@@ -150,6 +150,11 @@ class PlanSolution:
     robust_applied: bool = False
     robust_status: str = ""  # "applied" | "infeasible_fell_back" | "skipped"
     robust_premium: float = 0.0        # extra cash cost of pass-3 vs pass-2 plan
+    # True when any accepted pass used a wall-clock time-limited (non-optimal)
+    # CBC incumbent.  Such plans may contain avoidable shortfalls and are NOT
+    # reproducible across runs — callers should treat coverage claims as
+    # unproven (retry, and don't raise uncoverable alerts from them).
+    time_limited: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1560,6 +1565,10 @@ def _solve_milp(
     # ------------------------------------------------------------------
     milp_time_limit = float(params.get("milp_time_limit", 30))
     solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=milp_time_limit)
+    # Set True whenever an accepted solve was NOT proven optimal (wall-clock
+    # time limit hit under load).  Such incumbents can leave avoidable
+    # shortfalls and differ run-to-run — surfaced as PlanSolution.time_limited.
+    _accepted_time_limited = {"any": False}
 
     def _has_usable_incumbent() -> bool:
         """True when the current solve produced a usable plan (optimal, or a
@@ -1567,9 +1576,11 @@ def _solve_milp(
         q_vals = [pulp.value(v) for v in q.values()]
         usable = _incumbent_usable(prob.status, q_vals)
         if usable and prob.status != 1:
-            logger.info(
+            _accepted_time_limited["any"] = True
+            logger.warning(
                 "Time-phased MILP accepted a time-limited incumbent "
-                "(status=%d/%s, limit=%.0fs).",
+                "(status=%d/%s, limit=%.0fs) — plan may be suboptimal and "
+                "non-reproducible.",
                 prob.status, pulp.LpStatus.get(prob.status, "unknown"),
                 milp_time_limit,
             )
@@ -1755,6 +1766,8 @@ def _solve_milp(
             prob.constraints.pop("reliability_cash_cap", None)
             prob += pulp.lpSum([cash_real_expr] + penalty_terms)
             prob.solve(solver)
+            if prob.status != 1:
+                _accepted_time_limited["any"] = True
             run_pass2 = False
 
     # ------------------------------------------------------------------
@@ -1804,6 +1817,8 @@ def _solve_milp(
                 for cname in rob_hard_added:
                     prob.constraints.pop(cname, None)
                 prob.solve(solver)
+                if prob.status != 1:
+                    _accepted_time_limited["any"] = True
                 robust_applied = False
                 robust_status = "infeasible_fell_back"
 
@@ -2080,6 +2095,7 @@ def _solve_milp(
         robust_applied=robust_applied,
         robust_status=robust_status,
         robust_premium=robust_premium_val,
+        time_limited=_accepted_time_limited["any"],
     )
 
 

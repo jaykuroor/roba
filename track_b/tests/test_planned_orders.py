@@ -1593,3 +1593,52 @@ def test_post_open_build_expedites_within_grace(bus, session_factory):
 
     opt.execute_due_planned_orders()
     assert proc.calls, "expedited row did not convert to a PO"
+
+
+# ---------------------------------------------------------------------------
+# Time-limited (unproven) MILP solves must NOT drive uncoverable alerts: a
+# wall-clock-truncated CBC incumbent can leave avoidable shortfalls and differs
+# run-to-run (the "alert appears, clicking replan clears it" symptom).  Alert
+# state is frozen until a proven-optimal solve settles it.
+# ---------------------------------------------------------------------------
+
+
+def test_time_limited_solve_suppresses_uncoverable_alert(bus, session_factory, monkeypatch):
+    import track_b.procurement.plan_optimizer as _po
+
+    # Genuinely uncoverable: no stock, demand from day 0, 3-day lead.
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0, safety_stock=0.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=1.0)
+    _seed_supplier(session_factory, ing_id, lead_time_days=3.0, pack_size=100.0)
+
+    bus.sim_time = 0.0
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=100.0, days=7)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+
+    # Control: a proven solve DOES emit the alert for a real gap.
+    opt.build_procurement_plan(horizon_days=7.0)
+    assert bus.live(type=SignalType.INGREDIENT_UNCOVERABLE), "expected a real uncoverable alert"
+    for _s in bus.live(type=SignalType.INGREDIENT_UNCOVERABLE):
+        bus.consume(_s.signal_id)
+
+    # Now force every solve to report time_limited=True (CPU-starved box).
+    _real = _po.solve_time_phased_plan
+
+    def _tl(*a, **k):
+        sol = _real(*a, **k)
+        sol.time_limited = True
+        return sol
+
+    monkeypatch.setattr(_po, "solve_time_phased_plan", _tl)
+    opt.build_procurement_plan(horizon_days=7.0)
+    assert bus.live(type=SignalType.INGREDIENT_UNCOVERABLE) == [], (
+        "time-limited solve must not raise an uncoverable alert"
+    )
+
+    session = session_factory()
+    try:
+        run = session.query(ProcurementPlanRun).order_by(ProcurementPlanRun.id.desc()).first()
+        assert run is not None and run.method == "milp_tl", run and run.method
+    finally:
+        session.close()

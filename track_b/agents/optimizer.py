@@ -650,6 +650,7 @@ class InventoryOptimizer(BaseAgent):
         # ----------------------------------------------------------------
         new_orders: List[Dict] = []
         plan_method = "milp"
+        plan_time_limited = False
         plan_coverage_ok = True
         plan_total_short = 0.0
         _ing_name_by_id: Dict[int, str] = {}  # populated by MILP path; used by emit block
@@ -834,7 +835,29 @@ class InventoryOptimizer(BaseAgent):
                 )
                 _margin_by_ing = {}
 
-            _solution = _solve_time_phased(
+            _milp_params = {
+                "spoilage_penalty_multiplier": 2.0,
+                "slack_penalty": 1000.0,
+                "safety_penalty_multiplier": 0.0,  # safety buffer is a reporting target only; never drives a goods purchase
+                "reorder_interval_days": config.REORDER_INTERVAL_DAYS,
+                "lots_by_ing": _lots_map,
+                "reliability_cash_tolerance": config.RELIABILITY_CASH_TOLERANCE,
+                "stress_enabled": config.RELIABILITY_STRESS_ENABLED,
+                "margin_by_ing": _margin_by_ing,
+                "production_start_hour": config.PRODUCTION_START_HOUR,
+                "service_grace_h": config.PROCUREMENT_SERVICE_GRACE_H,
+                "scheduled_supplier_days": scheduled_supplier_days,
+                # Time-of-day so the solver never schedules a delivery whose
+                # order-by cutoff already passed (no born-late plan rows).
+                "now_time_of_day_s": now - now_day * SECONDS_PER_DAY,
+                "robust_hard_delay": (
+                    robust if robust is not None else config.RELIABILITY_ROBUST_HARD_DELAY
+                ),
+                "robust_min_reliability": config.RELIABILITY_ROBUST_MIN_RELIABILITY,
+                "free_goods_offers": _milp_free_goods,
+                "free_delivery_offers": _milp_free_delivery,
+            }
+            _solve_kwargs = dict(
                 n_days=n_days,
                 ingredients=milp_ingredients,
                 catalog=milp_catalog,
@@ -843,30 +866,26 @@ class InventoryOptimizer(BaseAgent):
                 inbound_by_day=inbound_by_day,
                 on_hand=_on_hand_map,
                 safety_stock=_safety_map,
-                params={
-                    "spoilage_penalty_multiplier": 2.0,
-                    "slack_penalty": 1000.0,
-                    "safety_penalty_multiplier": 0.0,  # safety buffer is a reporting target only; never drives a goods purchase
-                    "reorder_interval_days": config.REORDER_INTERVAL_DAYS,
-                    "lots_by_ing": _lots_map,
-                    "reliability_cash_tolerance": config.RELIABILITY_CASH_TOLERANCE,
-                    "stress_enabled": config.RELIABILITY_STRESS_ENABLED,
-                    "margin_by_ing": _margin_by_ing,
-                    "production_start_hour": config.PRODUCTION_START_HOUR,
-                    "service_grace_h": config.PROCUREMENT_SERVICE_GRACE_H,
-                    "scheduled_supplier_days": scheduled_supplier_days,
-                    # Time-of-day so the solver never schedules a delivery whose
-                    # order-by cutoff already passed (no born-late plan rows).
-                    "now_time_of_day_s": now - now_day * SECONDS_PER_DAY,
-                    "robust_hard_delay": (
-                        robust if robust is not None else config.RELIABILITY_ROBUST_HARD_DELAY
-                    ),
-                    "robust_min_reliability": config.RELIABILITY_ROBUST_MIN_RELIABILITY,
-                    "free_goods_offers": _milp_free_goods,
-                    "free_delivery_offers": _milp_free_delivery,
-                },
             )
+            _solution = _solve_time_phased(params=_milp_params, **_solve_kwargs)
+            if bool(getattr(_solution, "time_limited", False)):
+                # A wall-clock-truncated incumbent (CPU-starved box) can leave
+                # avoidable shortfalls and differs run-to-run — the "alert
+                # appears, replan makes it vanish" symptom.  One retry with a
+                # longer limit usually reaches proven optimality.
+                logger.warning(
+                    "MILP hit its time limit (short=%.1f); retrying once with 90s.",
+                    float(getattr(_solution, "total_short", 0.0)),
+                )
+                _retry = _solve_time_phased(
+                    params={**_milp_params, "milp_time_limit": 90.0}, **_solve_kwargs
+                )
+                if not bool(getattr(_retry, "time_limited", False)):
+                    _solution = _retry
+            plan_time_limited = bool(getattr(_solution, "time_limited", False))
             plan_method = _solution.method
+            if plan_time_limited and plan_method == "milp":
+                plan_method = "milp_tl"  # observable in procurement_plan_runs.method
             plan_coverage_ok = bool(getattr(_solution, "coverage_ok", True))
             plan_total_short = float(getattr(_solution, "total_short", 0.0))
             plan_reliability_premium = float(getattr(_solution, "reliability_premium", 0.0))
@@ -1344,10 +1363,24 @@ class InventoryOptimizer(BaseAgent):
             # Only nominal_uncoverable ingredients trigger the signal; delay-exposed
             # items do NOT — this prevents false "coffee short 135ml"-style warnings.
             # The short_qty is the per-ingredient nominal shortfall (not plan-wide total).
+            # A time-limited (unproven) solve may contain avoidable shortfalls, so it
+            # can neither raise new alerts nor retract existing ones — alert state is
+            # left untouched until a proven-optimal solve (retry above, or the next
+            # scheduled replan) settles the question.
+            if plan_time_limited:
+                logger.warning(
+                    "Skipping uncoverable-alert update: solve was time-limited "
+                    "(unproven); %d ingredient(s) currently flagged short.",
+                    sum(
+                        1 for v in _coverage_by_ing.values()
+                        if v.get("status") == "nominal_uncoverable"
+                    ),
+                )
             try:
                 from core.signals import IngredientUncoverablePayload  # noqa: PLC0415
                 _emitted_iids: set = set()
-                for _co_iid, _co_info in _coverage_by_ing.items():
+                _alert_items = [] if plan_time_limited else list(_coverage_by_ing.items())
+                for _co_iid, _co_info in _alert_items:
                     if _co_info.get("status") != "nominal_uncoverable":
                         continue
                     if _co_iid in _emitted_iids:
@@ -1407,9 +1440,11 @@ class InventoryOptimizer(BaseAgent):
                 # earlier rebuild but is covered now keeps a live signal until its
                 # 24h TTL — consume it so the sourcing panel reflects the current
                 # plan (fixes phantom "Basil 7g short" after the gap is closed).
-                for _live in self.bus.live(type=SignalType.INGREDIENT_UNCOVERABLE):
-                    if (_live.payload or {}).get("ingredient_id") not in _emitted_iids:
-                        self.bus.consume(_live.signal_id)
+                # Skipped for time-limited solves (alert state frozen, see above).
+                if not plan_time_limited:
+                    for _live in self.bus.live(type=SignalType.INGREDIENT_UNCOVERABLE):
+                        if (_live.payload or {}).get("ingredient_id") not in _emitted_iids:
+                            self.bus.consume(_live.signal_id)
             except Exception:  # noqa: BLE001
                 logger.warning("build_procurement_plan: failed to emit INGREDIENT_UNCOVERABLE signals")
 
