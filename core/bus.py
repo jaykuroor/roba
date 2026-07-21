@@ -11,6 +11,7 @@ drain. It also carries the in-process order-line callback (§10) and the current
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -89,6 +90,48 @@ class SignalBus:
         # synchronously inside ``_notify`` for every emitted signal of a type.
         self._subscribers: Dict[str, List[Callable[[Signal], None]]] = {}
         self._sim_time: float = 0.0
+        # While non-empty, the orchestrator tick runs the clock at realtime
+        # (1 sim-min = 1 real-min). token -> {"label", "expires"} where label
+        # is shown in the UI ("Live call", "Demand forecast (LLM)", …) and
+        # expires is a wall-clock leak guard pruned by the tick. Dict ops are
+        # GIL-atomic, so the tick loop and worker threads share this safely.
+        self.realtime_holds: Dict[str, Dict[str, Any]] = {}
+
+    # -- realtime holds (§6.3 realtime-task mode) ----------------------------
+
+    def hold_realtime(self, token: str, label: str, ttl_s: float = 900.0) -> None:
+        """Hold the sim clock at realtime speed under ``token`` until released.
+        ``ttl_s`` is a wall-clock leak guard; the tick prunes expired holds."""
+        self.realtime_holds[token] = {"label": label, "expires": time.time() + ttl_s}
+
+    def release_realtime(self, token: str) -> None:
+        self.realtime_holds.pop(token, None)
+
+    def realtime_task_labels(self) -> List[str]:
+        """UI labels of the currently-held realtime tasks (dedup, ordered)."""
+        return list(dict.fromkeys(h.get("label", "task") for h in self.realtime_holds.values()))
+
+    def run_realtime_task(self, label: str, fn: Callable[[], Any], token: Optional[str] = None) -> bool:
+        """Run ``fn`` on a daemon thread while holding a labelled realtime hold.
+
+        Used for slow agent work (LLM review/competitor analysis) that would
+        otherwise block the tick loop and stop the clock. Returns False when a
+        run with the same token is still in flight (that cadence is skipped)."""
+        token = token or f"task:{label}"
+        if token in self.realtime_holds:
+            return False
+        self.hold_realtime(token, label)
+
+        def _run() -> None:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 — isolate background task failures.
+                logger.exception("Realtime task %r failed", label)
+            finally:
+                self.release_realtime(token)
+
+        threading.Thread(target=_run, daemon=True, name=f"rt-{token}").start()
+        return True
 
     # -- clock bridge -------------------------------------------------------
 

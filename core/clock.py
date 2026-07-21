@@ -155,6 +155,7 @@ class SimClock:
                 "active_seed_id": state.active_seed_id,
                 "operating_window": _operating_window_snapshot(state.operating_window),
                 "skip_closed_hours": bool(state.skip_closed_hours),
+                "realtime_tasks": self.bus.realtime_task_labels(),
             }
         finally:
             session.close()
@@ -274,21 +275,28 @@ class SimClock:
     # -- call freeze/restore (§6.3) ----------------------------------------
 
     def freeze_for_call(self) -> Tuple[str, float]:
-        """Enter ``CALL_FROZEN`` (sim time stops). Returns ``(prior_status,
-        prior_speed)`` so the caller can restore them with
-        :meth:`unfreeze_from_call`."""
+        """Enter the call clock mode. With ``call_mode="realtime"`` (default)
+        the clock keeps running and the orchestrator tick syncs to realtime
+        (1 sim-min = 1 real-min) via ``bus.realtime_holds``; other modes stop
+        sim time via ``CALL_FROZEN``. Returns ``(prior_status, prior_speed)``
+        so the caller can restore them with :meth:`unfreeze_from_call`."""
         session = self.db_session_factory()
         try:
             state = get_or_create_sim_state(session)
             prior_status, prior_speed = state.status, state.speed
-            state.status = CALL_FROZEN
-            session.commit()
+            if (state.call_mode or config.CALL_MODE) == "realtime":
+                self.bus.hold_realtime("call", "Live call")
+            else:
+                state.status = CALL_FROZEN
+                session.commit()
             return prior_status, prior_speed
         finally:
             session.close()
 
     def unfreeze_from_call(self, prior_status: str, prior_speed: float) -> Dict[str, Any]:
-        """Restore the state/speed captured before a call's ``CALL_FROZEN``."""
+        """Restore the state/speed captured before a call's ``CALL_FROZEN``
+        (a no-op write in realtime mode, where only the hold is released)."""
+        self.bus.release_realtime("call")
         session = self.db_session_factory()
         try:
             state = get_or_create_sim_state(session)

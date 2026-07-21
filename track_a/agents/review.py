@@ -48,7 +48,9 @@ class ReviewAgent(BaseAgent):
     def register(self, orchestrator: Any) -> None:
         orchestrator.register(
             "interval",
-            self.process_unprocessed,
+            # LLM-bound scan runs off the tick thread; the clock drops to
+            # realtime (1 sim-min = 1 real-min) instead of stalling.
+            lambda: self.bus.run_realtime_task("Review analysis", self.process_unprocessed),
             interval_sim_s=900.0,
             name="track_a_review_scan",
         )

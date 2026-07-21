@@ -94,3 +94,25 @@ def test_sa_path_default_roba_json_when_missing(monkeypatch, tmp_path):
     # (Unless the repo root happens to have one, which is fine to skip.)
     result = vertex.service_account_path()
     assert result is None or result.name == "roba.json"
+
+
+def test_call_with_timeout_returns_at_deadline_not_call_duration():
+    """The old `with ThreadPoolExecutor` pattern joined the worker on exit, so a
+    'timed out' call still blocked for its full duration. The helper must return
+    control at the deadline."""
+    import time
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        vertex.call_with_timeout(lambda: time.sleep(5.0), timeout_s=0.2)
+    assert time.monotonic() - t0 < 1.0, "caller must not wait for the abandoned call"
+
+
+def test_call_with_timeout_returns_result_and_propagates_errors():
+    assert vertex.call_with_timeout(lambda: 42, timeout_s=2.0) == 42
+
+    def _boom():
+        raise ValueError("inner")
+
+    with pytest.raises(ValueError, match="inner"):
+        vertex.call_with_timeout(_boom, timeout_s=2.0)

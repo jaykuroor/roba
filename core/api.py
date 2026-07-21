@@ -215,6 +215,7 @@ def _migrate_schema() -> None:
         ("sim_settings", "staff_checkin_mode", "ALTER TABLE sim_settings ADD COLUMN staff_checkin_mode TEXT DEFAULT 'sim_auto'"),
         ("kitchen_tasks", "note", "ALTER TABLE kitchen_tasks ADD COLUMN note TEXT"),
         ("kitchen_tasks", "severity", "ALTER TABLE kitchen_tasks ADD COLUMN severity TEXT"),
+        ("sim_settings", "auto_plan_on_forecast", "ALTER TABLE sim_settings ADD COLUMN auto_plan_on_forecast INTEGER DEFAULT 1"),
     ]
     with db.engine.connect() as conn:
         for table, column, ddl in migrations:
@@ -563,6 +564,7 @@ class PosBody(BaseModel):
     anomaly_injections: Optional[List[Dict[str, Any]]] = None
     availability_oos_mode: Optional[str] = None  # "threshold" | "zero"
     batch_auto_qty: Optional[bool] = None  # forecaster adjusts batch quantities without manager approval
+    auto_plan_on_forecast: Optional[bool] = None  # every forecast triggers procurement plan + due orders
 
     @field_validator("availability_oos_mode")
     @classmethod
@@ -3215,9 +3217,12 @@ def run_procurement_plan(
     if optimizer is None:
         raise HTTPException(status_code=503, detail="Optimizer not active")
     # Execute overdue planned orders first (converts at_risk / past-due rows into POs),
-    # then rebuild the plan so the UI reflects the updated state.
+    # rebuild the plan, then execute again so any rows the rebuild itself produced
+    # with an already-passed order-by window become POs immediately instead of
+    # sitting as "Late" plans until the next reorder sweep.
     executed = optimizer.execute_due_planned_orders()
     count = optimizer.build_procurement_plan(robust=robust)
+    executed += optimizer.execute_due_planned_orders()
     return {"ok": True, "items_planned": count, "orders_executed": executed}
 
 

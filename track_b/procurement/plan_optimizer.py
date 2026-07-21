@@ -231,7 +231,7 @@ def project_fefo_coverage(
         total_short = 0.0
         short_by_ing: Dict[int, float] = {}
 
-        all_iids = set(demand_map.keys()) | set(arrivals_by_day.keys())
+        all_iids = sorted(set(demand_map.keys()) | set(arrivals_by_day.keys()))
         for iid in all_iids:
             d_map = demand_map.get(iid) or {}
             arr_map = arrivals_by_day.get(iid) or {}
@@ -413,6 +413,10 @@ def solve_time_phased_plan(
                             robust_min_reliability (default 0.95)
                               reliability_score threshold below which a supplier is
                               considered "qualifying" for the delay scenario.
+                            now_time_of_day_s (default 0.0)
+                              seconds since midnight of the current sim day; delivery
+                              days whose order-by cutoff (delivery − lead) is already
+                              in the past are excluded, so plans are never born late.
     """
     p = params or {}
     if _PULP_AVAILABLE:
@@ -747,6 +751,22 @@ def _solve_milp(
         for s_id, dh in delivery_hour_by_sup.items()
     }
 
+    # Earliest delivery-day offset whose order-by cutoff has NOT already passed.
+    # A delivery on day d at delivery_hour dh must be ordered by
+    # (now_day + d)·S + dh·3600 − lead·S.  With the plain lead ceiling the solver
+    # happily schedules deliveries whose cutoff is hours in the past — rows that
+    # are born "late" (order_date < now) and sit as plans instead of orders.
+    # first_day[s] = max(lead_ceil, ceil(lead + (now_tod − dh·3600)/S)).
+    # Default now_time_of_day_s=0 keeps historic behaviour (first_day == lead_ceil).
+    _now_tod = float(params.get("now_time_of_day_s", 0.0))
+    first_day: Dict[int, int] = {}
+    for s in suppliers:
+        _s_id = int(s["id"])
+        _lead = float(s.get("lead_time_days") or 1.0)
+        _dh = delivery_hour_by_sup.get(_s_id, 8.0)
+        _d_min = math.ceil(_lead + (_now_tod - _dh * 3600.0) / 86400.0)
+        first_day[_s_id] = max(lead_ceil[_s_id], _d_min)
+
     # Active ingredients: those with any demand OR on_hand < safety_stock
     active_ids: List[int] = []
     for i in ingredients:
@@ -760,7 +780,7 @@ def _solve_milp(
         return PlanSolution(orders=[], total_cost=0.0, method="milp",
                             rationale="No active ingredients require ordering.")
 
-    all_sup_ids = list({int(s["id"]) for s in suppliers})
+    all_sup_ids = sorted({int(s["id"]) for s in suppliers})  # deterministic var order
 
     # Cheapest available unit price per ingredient — used to value-scale the
     # soft safety-buffer and waste penalties.
@@ -945,7 +965,7 @@ def _solve_milp(
                     )
 
     for s_id in all_sup_ids:
-        ld = lead_ceil[s_id]
+        ld = first_day[s_id]  # time-of-day aware: never open a day already past its order-by cutoff
         sup = sup_by_id.get(s_id, {})
         vd = sup.get("volume_discount") or []
         for d in range(ld, n_days):
@@ -968,7 +988,7 @@ def _solve_milp(
         for s_id in all_sup_ids:
             if (iid, s_id) not in cat_by_is:
                 continue
-            ld = lead_ceil[s_id]
+            ld = first_day[s_id]  # matches the deliver-day window above
             _disc_tiers = cat_by_is[(iid, s_id)].get("discount") or []
             for d in range(ld, n_days):
                 q[iid, s_id, d] = pulp.LpVariable(
@@ -1704,9 +1724,18 @@ def _solve_milp(
                         # earlier delivery (smaller day) ⇒ more shelf life burned
                         # ⇒ larger penalty, nudging delivery later toward need.
                         freshness_terms.append(_FRESH_EPS * _pr * (n_days - _fd) * _x(_fiid, _fsid, _fd))
+        # Cash tiebreaker: without a cash term, any solution within the 1% cap is
+        # equally good to pass 2, so the solver may pay up to the full cap for zero
+        # exposure benefit — and replans wander between such near-ties, which reads
+        # as nondeterminism.  A small cash coefficient (well below the exposure
+        # lever's per-unit weights) picks the cheapest among exposure-equal plans.
+        _CASH_TIE_EPS = 1e-3
         # New objective: minimize margin-weighted exposure + modelled delay
-        # shortfall + penalties + a freshness tiebreaker.
-        prob += pulp.lpSum(exposure_terms + delay_short_terms + penalty_terms + freshness_terms)
+        # shortfall + penalties + freshness and cash tiebreakers.
+        prob += pulp.lpSum(
+            exposure_terms + delay_short_terms + penalty_terms + freshness_terms
+            + [_CASH_TIE_EPS * cash_real_expr]
+        )
         prob.solve(solver)
         if not _has_usable_incumbent():
             # Pass 2 infeasible / non-optimal: restore pass-1 result.
@@ -1900,7 +1929,7 @@ def _solve_milp(
                     cand = (s_id, pr)
         s_id = cand[0] if cand else 0
         price = cand[1] if cand else 0.0
-        ld = lead_ceil.get(s_id, 1)
+        ld = first_day.get(s_id, lead_ceil.get(s_id, 1))
         days_short = short_days_by_ing.get(iid, [])
         deliver_day = min(max(ld, min(days_short) if days_short else 0), n_days - 1)
         orders.append(PlanOrder(

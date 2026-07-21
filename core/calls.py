@@ -377,7 +377,25 @@ class CallSubsystem:
         return self._finalize(call_id, "auto_resolved")
 
     def _finalize(self, call_id: int, status: str) -> Optional[Dict[str, Any]]:
-        """Shared completion path for ``end_call`` / ``auto_resolve``."""
+        """Shared completion path for ``end_call`` / ``auto_resolve``.
+
+        The clock restore is deferred to ``finally`` so an exception (or early
+        return) anywhere in extraction / signal dispatch / summary building can
+        never leave the clock frozen or holding its realtime hold."""
+        try:
+            return self._finalize_inner(call_id, status)
+        finally:
+            restore = self._clock_restore.pop(call_id, None)
+            if restore is not None:
+                self.clock.unfreeze_from_call(*restore)
+            # A call queued while this one ran can now start — after the
+            # restore above, so its own freeze/hold isn't clobbered.
+            try:
+                self._start_next_pending()
+            except Exception:  # noqa: BLE001 — never mask the original error.
+                logger.exception("Queued call start failed after finalize")
+
+    def _finalize_inner(self, call_id: int, status: str) -> Optional[Dict[str, Any]]:
         outcome = self._extract_outcome(call_id)
         now = float(self.bus.sim_time)
 
@@ -442,11 +460,6 @@ class CallSubsystem:
             finally:
                 _s.close()
 
-        # Restore the clock to its pre-call state/speed (§6.3).
-        restore = self._clock_restore.pop(call_id, None)
-        if restore is not None:
-            self.clock.unfreeze_from_call(*restore)
-
         self._broadcast("call_ended", {"call": self._to_dict(call), "outcome": outcome})
 
         # Persist a narrative event_log row so the history view can surface this
@@ -469,8 +482,6 @@ class CallSubsystem:
         except Exception as _le_exc:  # noqa: BLE001
             logger.warning("call event_log write failed: %s", _le_exc)
 
-        # A second call that was queued while this one ran can now start.
-        self._start_next_pending()
         return outcome
 
     def _build_call_summary(self, call_id: int, call: Call) -> str:

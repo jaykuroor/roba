@@ -97,7 +97,7 @@ def interpret(
     # Once we've already asked once, force a decision (no repeat questions).
     allow_question = not prior_qa
     try:
-        from .vertex import build_genai_client, vertex_available
+        from .vertex import build_genai_client, call_with_timeout, vertex_available
         from .config import GEMINI_REASONER_MODEL
 
         if not vertex_available():
@@ -118,8 +118,6 @@ def interpret(
             lines.append("You have already asked once. DECIDE now; needs_clarification must be false.")
         prompt = "\n".join(lines)
 
-        import concurrent.futures
-
         def _call():
             return client.models.generate_content(
                 model=GEMINI_REASONER_MODEL,
@@ -131,12 +129,10 @@ def interpret(
                 },
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_call)
-            try:
-                resp = future.result(timeout=timeout_s)
-            except concurrent.futures.TimeoutError:
-                return _fallback(text)
+        try:
+            resp = call_with_timeout(_call, timeout_s)
+        except TimeoutError:
+            return _fallback(text)
 
         raw = (resp.text or "").strip() if resp else ""
         if not raw:

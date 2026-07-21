@@ -57,15 +57,21 @@ class CompetitorAgent(BaseAgent):
         self.subscribe(["sensing", "forecasting"])
 
     def register(self, orchestrator: Any) -> None:
+        # Analysis passes run off the tick thread as realtime tasks; the clock
+        # drops to realtime (1 sim-min = 1 real-min) instead of stalling.
         orchestrator.register(
             "interval",
-            self.passive_monitor,
+            lambda: self.bus.run_realtime_task(
+                "Competitor analysis", self.passive_monitor, token="task:competitor_monitor"
+            ),
             interval_sim_s=10800.0,
             name="track_a_competitor_monitor",
         )
         orchestrator.register(
             "interval",
-            self.poll_aggregators,
+            lambda: self.bus.run_realtime_task(
+                "Competitor analysis", self.poll_aggregators, token="task:competitor_aggregators"
+            ),
             interval_sim_s=config.COMPETITOR_AGGREGATOR_POLL_SIM_S,
             name="track_a_competitor_aggregators",
         )

@@ -168,7 +168,10 @@ class Orchestrator:
         now = self.bus.sim_time
         for t in self.triggers:
             if t.trigger_type == "interval" and t.interval_sim_s is not None:
-                t.next_due = now + float(t.interval_sim_s)
+                # Triggers registered with an explicit start anchor (due_at)
+                # re-fire at the rewound start (e.g. the demand forecast runs
+                # at 08:00 itself); the rest resume one interval out.
+                t.next_due = now if t.due_at is not None else now + float(t.interval_sim_s)
 
     def next_due_at(self, now: float) -> Optional[float]:
         """Earliest scheduled trigger due time strictly after ``now`` (used by
@@ -251,12 +254,24 @@ class Orchestrator:
         try:
             state = get_or_create_sim_state(session)
             speed = state.speed if state.speed is not None else 1.0
+            # Prune realtime holds past their wall-clock leak guard, then: a
+            # live call or background agent task syncs the clock to realtime
+            # (1 sim-min per real-min ⇒ effective speed 1/60). The user's
+            # chosen speed in sim_state is untouched — still reported as
+            # ``speed`` — and resumes the moment the last hold is released.
+            now_wall = time.time()
+            for token, hold in list(self.bus.realtime_holds.items()):
+                if float(hold.get("expires") or 0.0) < now_wall:
+                    logger.warning("Pruning expired realtime hold %r", token)
+                    self.bus.realtime_holds.pop(token, None)
+            realtime_tasks = self.bus.realtime_task_labels()
+            effective_speed = (1.0 / 60.0) if realtime_tasks else float(speed)
             skip_closed = bool(state.skip_closed_hours)
             sim_time = state.sim_time if state.sim_time is not None else 0.0
 
             # (1) advance by Δsim = 60 × speed × 0.25 (§6.1 tick math),
             #     with the closed-hours auto-jump 23:00 → next day 08:00.
-            delta = 60.0 * float(speed) * 0.25
+            delta = 60.0 * effective_speed * 0.25
             candidate = sim_time + delta
             day = int(sim_time // SECONDS_PER_DAY)
             day_close = day * SECONDS_PER_DAY + DAY_CLOSE_OFFSET
@@ -312,6 +327,10 @@ class Orchestrator:
                     "time_of_day": time_of_day,
                     "speed": tick_speed,
                     "status": status,
+                    # Non-empty while a call/agent task pins the clock to
+                    # realtime; the UI shows the mode and locks the speed
+                    # selector on this.
+                    "realtime_tasks": realtime_tasks,
                 },
             }
         ]
@@ -404,16 +423,26 @@ class Orchestrator:
         self._loop_running = True
         try:
             while self._loop_running:
-                guard = self.coordinator or nullcontext()
-                with guard:
-                    if self.clock.current_state()["status"] != RUNNING:
-                        events = None
-                    else:
-                        events = self.tick()
-                if events is not None:
-                    result = broadcast_fn(events)
-                    if inspect.isawaitable(result):
-                        await result
+                # One bad tick must never kill the loop: an escaped exception in
+                # an asyncio task is stored, never logged (ctx.loop_task keeps a
+                # strong ref), and the sim silently freezes at its last sim_time
+                # while status still reads "running" — unrecoverable from the UI.
+                # Log it and keep ticking (transient causes like SQLite
+                # "database is locked" under agent-thread write contention heal
+                # on the next tick).
+                try:
+                    guard = self.coordinator or nullcontext()
+                    with guard:
+                        if self.clock.current_state()["status"] != RUNNING:
+                            events = None
+                        else:
+                            events = self.tick()
+                    if events is not None:
+                        result = broadcast_fn(events)
+                        if inspect.isawaitable(result):
+                            await result
+                except Exception:  # noqa: BLE001 — CancelledError passes through.
+                    logger.exception("Orchestrator tick failed; continuing.")
                 await asyncio.sleep(interval_s)
         except asyncio.CancelledError:
             self._loop_running = False

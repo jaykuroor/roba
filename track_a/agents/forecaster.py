@@ -11,6 +11,7 @@ This module owns the Track A forecasting stack:
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import statistics
@@ -46,6 +47,8 @@ from core.signals import (
     HorizonDayItem,
     SignalType,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _hhmm(value: str) -> int:
@@ -112,8 +115,16 @@ class DemandForecaster(BaseAgent):
     def register(self, orchestrator: Any) -> None:
         orchestrator.register(
             "interval",
-            lambda: self._enqueue_or_run_forecast("deterministic_forecast", "interval"),
+            # LLM-authoritative by default; deterministic only when the LLM
+            # auto-mode toggle is off.
+            lambda: self._enqueue_or_run_forecast(
+                LLM_AUTHORITY_FORECAST if self.llm_auto_mode else "deterministic_forecast",
+                "interval",
+            ),
             interval_sim_s=config.FORECAST_INTERVAL_SIM_S,
+            # Anchor at the current sim_time so the first forecast fires at
+            # day open (08:00) itself, not one interval later.
+            due_at=orchestrator.bus.sim_time,
             name="track_a_forecast_interval",
         )
         orchestrator.register(
@@ -452,6 +463,10 @@ class DemandForecaster(BaseAgent):
         # and the current time is within the first 35 sim-minutes of day open.
         if self.llm_auto_mode:
             self._maybe_suggest_day_batches()
+        # Every completed forecast refreshes the rolling horizon so procurement
+        # re-plans (and places now-due orders) off the new demand immediately,
+        # instead of waiting for the standalone horizon-emit interval.
+        self.emit_rolling_horizon()
         return rows
 
     def optimize_forecast(self, trigger_reason: str = "manual") -> List[Forecast]:
@@ -2299,8 +2314,8 @@ class DemandForecaster(BaseAgent):
             "required": ["global_notes", "memory_updates"],
         }
         try:
-            import concurrent.futures as _cf  # noqa: PLC0415
             import json as _json  # noqa: PLC0415
+            from core.vertex import call_with_timeout  # noqa: PLC0415
             client = build_genai_client()
 
             def _call():
@@ -2315,12 +2330,14 @@ class DemandForecaster(BaseAgent):
                     },
                 )
 
-            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(_call)
-                try:
-                    resp = future.result(timeout=30.0)
-                except _cf.TimeoutError:
-                    return {}
+            try:
+                resp = call_with_timeout(_call, config.LLM_AUTHORITY_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning(
+                    "LLM authority forecast timed out after %.0fs; deterministic fallback.",
+                    config.LLM_AUTHORITY_TIMEOUT_S,
+                )
+                return {}
 
             if not resp or not resp.text:
                 return {}

@@ -87,6 +87,39 @@ class Procurement:
 
     # -- pricing helpers ------------------------------------------------------
 
+    @staticmethod
+    def _term_live(t: Any, now: float) -> bool:
+        """A SupplierTerm still in effect (mirrors terms.apply_supplier_terms)."""
+        if t.expiry_kind == "date" and t.expires_at is not None:
+            return float(t.expires_at) >= now
+        if t.expiry_kind == "orders":
+            return (t.remaining_orders or 0) > 0
+        return True
+
+    def _live_terms(self, session: Any, supplier_id: int, term_type: str) -> List[Any]:
+        now = self.sim_time
+        rows = (
+            session.query(SupplierTerm)
+            .filter(
+                SupplierTerm.supplier_id == supplier_id,
+                SupplierTerm.status == "active",
+                SupplierTerm.term_type == term_type,
+            )
+            .all()
+        )
+        return [t for t in rows if self._term_live(t, now)]
+
+    def _free_delivery_applies(self, supplier_id: int, goods_value: float) -> bool:
+        """True when a live free_delivery term's spend threshold is met."""
+        session = self.db_session_factory()
+        try:
+            return any(
+                goods_value >= float(t.min_order_value or 0.0)
+                for t in self._live_terms(session, supplier_id, "free_delivery")
+            )
+        finally:
+            session.close()
+
     def _discounted_goods_total(
         self, supplier_id: int, lines: List[Dict[str, Any]]
     ) -> float:
@@ -131,6 +164,13 @@ class Procurement:
                 pct = float(tier.get("discount_pct") or 0.0)
                 if subtotal >= min_value > 0 and pct > best_pct:
                     best_pct = pct
+            # Negotiated threshold_discount terms act as extra volume tiers so the
+            # billed PO total matches the plan the optimizer costed against.
+            for t in self._live_terms(session, supplier_id, "threshold_discount"):
+                mov = float(t.min_order_value or 0.0)
+                pct = float(t.value or 0.0) * 100.0
+                if subtotal >= mov > 0 and pct > best_pct:
+                    best_pct = pct
             return subtotal * (1.0 - best_pct / 100.0)
         finally:
             session.close()
@@ -167,7 +207,13 @@ class Procurement:
         """
         now = self.sim_time
         goods_total = self._discounted_goods_total(supplier_id, lines)
-        total = goods_total + float(delivery_charge or 0.0)
+        raw_goods = sum(float(l["qty"]) * float(l["unit_price"] or 0.0) for l in lines)
+        delivery = float(delivery_charge or 0.0)
+        # Honour a live free-delivery promo: waive the fee when the order value
+        # clears the promo's spend threshold (same gate the plan MILP used).
+        if delivery > 0 and self._free_delivery_applies(supplier_id, raw_goods):
+            delivery = 0.0
+        total = goods_total + delivery
 
         session = self.db_session_factory()
         try:
@@ -260,7 +306,17 @@ class Procurement:
             po.status = "placed"
             po.expected_delivery = expected_delivery
 
-            # Decrement order-bounded SupplierTerms for this supplier.
+            lines = (
+                session.query(PurchaseOrderLine)
+                .filter(PurchaseOrderLine.po_id == po_id)
+                .all()
+            )
+
+            # Decrement order-bounded SupplierTerms — but only those this order
+            # actually USES (goods value ≥ the term's spend threshold).  A small
+            # order below a promo's MOV gets none of its benefit and must not
+            # burn one of its remaining uses.
+            po_goods = sum(float(l.line_total or 0.0) for l in lines)
             order_terms = (
                 session.query(SupplierTerm)
                 .filter(
@@ -271,18 +327,14 @@ class Procurement:
                 .all()
             )
             for ot in order_terms:
+                if po_goods < float(ot.min_order_value or 0.0):
+                    continue  # order didn't qualify for this promo — keep its uses
                 if ot.remaining_orders is not None and ot.remaining_orders > 0:
                     ot.remaining_orders -= 1
                     if ot.remaining_orders <= 0:
                         ot.status = "expired"
 
             session.commit()
-
-            lines = (
-                session.query(PurchaseOrderLine)
-                .filter(PurchaseOrderLine.po_id == po_id)
-                .all()
-            )
             line_payload = [{"ingredient_id": l.ingredient_id, "qty": l.qty} for l in lines]
             total = po.total_cost
             supplier_id = po.supplier_id
@@ -368,6 +420,10 @@ class Procurement:
                 for l in existing_lines
             ] + lines
             new_goods = self._discounted_goods_total(supplier_id, all_lines)
+            # Merged lines may now clear a free-delivery promo threshold.
+            raw_goods = sum(float(l["qty"]) * float(l["unit_price"] or 0.0) for l in all_lines)
+            if delivery_charge > 0 and self._free_delivery_applies(supplier_id, raw_goods):
+                delivery_charge = 0.0
             po.total_cost = new_goods + delivery_charge
 
             session.commit()

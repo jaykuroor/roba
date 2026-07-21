@@ -1706,3 +1706,48 @@ def test_free_delivery_rebate_fires_above_threshold():
     })
     # The promo plan buys the same goods but rebates at least one €20 delivery.
     assert promo.total_cost < base.total_cost - 1e-6, (base.total_cost, promo.total_cost)
+
+
+def test_order_cutoff_respects_time_of_day():
+    """A delivery day whose order-by cutoff has already passed must not be
+    planned (no born-'Late' rows).  At 14:00 with lead=1 day and delivery at
+    08:00, tomorrow's cutoff (yesterday's 08:00 + lead) passed 6h ago — the
+    earliest honest delivery is day 2."""
+    ings = [_ing(1)]
+    cats = [_cat(1, 1, price=1.0, pack=100.0)]
+    sups = [_sup(1, lead=1.0, delivery_hour=8.0)]
+    demand = _flat_demand(1, 100.0, 7)
+
+    late = _run(ings, cats, sups, demand, n_days=7,
+                params={"slack_penalty": 1000.0, "now_time_of_day_s": 14 * 3600.0})
+    assert late.method == "milp"
+    days = {o.delivery_day for o in late.orders if o.qty > 0}
+    assert days, "demand must still be ordered for the reachable days"
+    assert min(days) >= 2, f"day-1 delivery is past its cutoff at 14:00: {sorted(days)}"
+
+    # Before the day's cutoff (default 0 = midnight) day 1 is still available.
+    early = _run(ings, cats, sups, _flat_demand(1, 100.0, 7), n_days=7)
+    assert min(o.delivery_day for o in early.orders if o.qty > 0) == 1
+
+
+def test_repeated_solve_is_deterministic():
+    """Identical inputs must yield the identical plan — the 'one optimal plan'
+    invariant users rely on when re-running procurement."""
+    def _solve():
+        ings = [_ing(1), _ing(2, perishable=1, shelf_life=3)]
+        cats = [
+            _cat(1, 1, price=1.0), _cat(2, 1, price=1.05),
+            _cat(1, 2, price=2.0), _cat(2, 2, price=2.02),
+        ]
+        sups = [
+            _sup(1, lead=1.0, reliability=0.9, dc=5.0),
+            _sup(2, lead=2.0, reliability=0.99, dc=4.0),
+        ]
+        demand = {1: {d: 120.0 for d in range(7)}, 2: {d: 80.0 for d in range(7)}}
+        sol = _run(ings, cats, sups, demand, n_days=7, params=None)
+        return sorted(
+            (o.ingredient_id, o.supplier_id, o.delivery_day, round(o.qty, 3))
+            for o in sol.orders
+        )
+
+    assert _solve() == _solve()

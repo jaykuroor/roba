@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core import config
 from core.agent_base import BaseAgent
@@ -40,6 +40,7 @@ from core.models import (
     PurchaseOrderLine,
     Recipe,
     RecipeLine,
+    SimSettings,
     SourcingRun,
     Supplier,
     SupplierCatalog,
@@ -57,6 +58,24 @@ GROUPS = ["inventory", "procurement"]
 def _import_solve_sourcing() -> Any:
     from track_b.procurement.sourcing import solve_sourcing  # noqa: PLC0415
     return solve_sourcing
+
+
+def _horizon_day_offset(day: Dict[str, Any], now_day: int) -> int:
+    """Offset of a horizon day from *today*, anchored on the day's absolute
+    ``start`` timestamp.
+
+    ``day_index`` is relative to when the horizon was GENERATED, not to when it
+    is consumed.  Mapping day_index directly onto today shifts all demand when
+    the horizon is stale (e.g. plan rebuilt after a day rollover but before the
+    morning forecast) — yesterday's demand lands on today, producing spurious
+    "cannot be supplied" shortfalls that flip on the next replan.  Negative
+    offsets mean the day is already in the past and must be dropped.
+    """
+    start = day.get("start")
+    if start is not None:
+        return int(float(start) // SECONDS_PER_DAY) - now_day
+    return int(day.get("day_index") or 0)
+
 
 # JSON schema for the LLM optimizer action list.
 _OPTIMIZE_SCHEMA: Dict[str, Any] = {
@@ -156,11 +175,27 @@ class InventoryOptimizer(BaseAgent):
             payload["ingredient_id"] = ingredient_id
             self._propose_promo(payload)
         elif signal.type == SignalType.DEMAND_FORECAST_HORIZON.value:
-            # Re-plan when the forecaster emits a fresh horizon (e.g. after a parade event).
+            # Re-plan when the forecaster emits a fresh horizon — which now
+            # happens after every completed forecast run. With auto-plan on
+            # (sim_settings.auto_plan_on_forecast, default), also re-run the
+            # sourcing solver and place any now-due planned orders so a fresh
+            # forecast immediately turns into POs when valid.  Due rows are
+            # executed BEFORE the build too: their order-by window has passed,
+            # so the rebuild can no longer regenerate them — converting them to
+            # POs first keeps that supply credited as inbound.
+            _auto = self._auto_plan_on_forecast()
+            if _auto:
+                self.execute_due_planned_orders()
             self.build_procurement_plan()
+            if _auto:
+                self.run_sourcing_plan()
+                self.execute_due_planned_orders()
         elif signal.type == SignalType.WASTE_EVENT.value:
-            # Sudden spoilage: stock dropped unexpectedly — re-plan immediately.
+            # Sudden spoilage: stock dropped unexpectedly — re-plan immediately
+            # and place any now-due rows (a spoilage gap must not sit as a plan).
+            self.execute_due_planned_orders()
             self.build_procurement_plan()
+            self.execute_due_planned_orders()
         elif signal.type == SignalType.MENU_TOGGLE_REQUEST.value:
             payload = signal.payload or {}
             menu_item_id = payload.get("menu_item_id") or self._resolve_menu_item_id(
@@ -180,6 +215,8 @@ class InventoryOptimizer(BaseAgent):
             # A supplier offer was applied (manually or auto) — re-cost the forward plan,
             # re-run the sourcing solver, then immediately place any now-due orders so
             # at-risk stock is secured without waiting for the next reorder sweep (§W1a).
+            # Due rows are converted BEFORE the build (see the horizon branch above).
+            self.execute_due_planned_orders()
             self.build_procurement_plan()
             self.run_sourcing_plan()
             self.execute_due_planned_orders()
@@ -217,6 +254,18 @@ class InventoryOptimizer(BaseAgent):
         # a full FORECAST_INTERVAL_SIM_S.  No recursion — execute never calls build.
         self.execute_due_planned_orders()
 
+    def _auto_plan_on_forecast(self) -> bool:
+        """sim_settings.auto_plan_on_forecast (default on when unset)."""
+        session = self.db_session_factory()
+        try:
+            settings = session.get(SimSettings, 1)
+            if settings is None:
+                return True
+            value = getattr(settings, "auto_plan_on_forecast", None)
+            return True if value is None else bool(value)
+        finally:
+            session.close()
+
     def _on_hand_above_reorder(self, ingredient_id: int) -> bool:
         session = self.db_session_factory()
         try:
@@ -232,6 +281,112 @@ class InventoryOptimizer(BaseAgent):
             session.close()
 
     # -- forward planner (WS4) -----------------------------------------------
+
+    def _open_po_pipeline_rows(
+        self, session: Any, ingredient_ids: List[int], now: float
+    ) -> List[Tuple[int, Optional[int], int, int, float]]:
+        """Open-PO pipeline after the C1 phantom-overdue exclusion, one row per
+        (ingredient, supplier, expected arrival).
+
+        Returns ``(ingredient_id, supplier_id, phys_day, service_day, qty)``:
+        ``phys_day`` is the physical arrival-day offset (keys
+        ``scheduled_supplier_days`` — the MILP's ``deliver`` binaries are
+        indexed by physical delivery day); ``service_day`` moves arrivals
+        landing after production start to the next day, mirroring the MILP's
+        ``service_shift``.
+
+        Both the inbound snapshot and the R1 reconciliation gate MUST source
+        open-PO supply from here: R1's residual compares gross open-PO qty
+        against the snapshot credit, and any filter asymmetry (e.g. counting
+        an overdue/stuck PO in gross but not in the credit) creates a
+        permanent phantom residual that silently suppresses legitimate
+        planned rows (chronic under-ordering).
+        """
+        from sqlalchemy import func as _sa_func  # local import; avoids top-level dep
+
+        now_day = int(now // SECONDS_PER_DAY)
+        prod_start_s = float(config.PRODUCTION_START_HOUR) * 3600.0
+        rows: List[Tuple[int, Optional[int], int, int, float]] = []
+
+        def _add(ing_id: Any, sup_id: Any, delivery_sim_s: float, qty: float) -> None:
+            arr_day = int(delivery_sim_s // SECONDS_PER_DAY) - now_day
+            # C1: POs overdue by more than 1 day are treated as stuck (never
+            # delivered) so the planner re-orders instead of relying on stock
+            # that may never arrive.
+            if arr_day < -1:
+                logger.debug(
+                    "Excluding overdue in-flight PO (arr_day=%d) for ingredient %s "
+                    "from projection — treating as undelivered.",
+                    arr_day, ing_id,
+                )
+                return
+            shift = 1 if (delivery_sim_s % SECONDS_PER_DAY) > prod_start_s else 0
+            rows.append((
+                int(ing_id),
+                int(sup_id) if sup_id is not None else None,
+                max(arr_day, 0),
+                max(arr_day + shift, 0),
+                float(qty or 0.0),
+            ))
+
+        in_transit = (
+            session.query(
+                PurchaseOrderLine.ingredient_id,
+                PurchaseOrder.supplier_id,
+                PurchaseOrder.expected_delivery,
+                _sa_func.sum(PurchaseOrderLine.qty).label("total_qty"),
+            )
+            .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
+            .filter(
+                PurchaseOrderLine.ingredient_id.in_(ingredient_ids),
+                PurchaseOrder.status.in_(("proposed", "approved", "placed")),
+                PurchaseOrder.expected_delivery.isnot(None),
+            )
+            .group_by(
+                PurchaseOrderLine.ingredient_id,
+                PurchaseOrder.supplier_id,
+                PurchaseOrder.expected_delivery,
+            )
+            .all()
+        )
+        for ing_id_t, sup_id_t, exp_delivery, total_qty in in_transit:
+            if exp_delivery is None:
+                continue
+            _add(ing_id_t, sup_id_t, float(exp_delivery), total_qty)
+
+        # W4: Also credit POs awaiting approval (proposed/approved,
+        # expected_delivery=None): estimate arrival = created_at + supplier
+        # lead_time so they count as pipeline supply and the MILP doesn't
+        # re-order the same ingredient.
+        null_transit = (
+            session.query(
+                PurchaseOrderLine.ingredient_id,
+                PurchaseOrder.supplier_id,
+                PurchaseOrder.created_at,
+                Supplier.lead_time_days,
+                _sa_func.sum(PurchaseOrderLine.qty).label("total_qty"),
+            )
+            .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
+            .join(Supplier, Supplier.id == PurchaseOrder.supplier_id)
+            .filter(
+                PurchaseOrderLine.ingredient_id.in_(ingredient_ids),
+                PurchaseOrder.status.in_(("proposed", "approved")),
+                PurchaseOrder.expected_delivery.is_(None),
+            )
+            .group_by(
+                PurchaseOrderLine.ingredient_id,
+                PurchaseOrder.supplier_id,
+                PurchaseOrder.created_at,
+                Supplier.lead_time_days,
+            )
+            .all()
+        )
+        for ing_id_t, sup_id_t, created_at, lead_days, total_qty in null_transit:
+            lead = float(lead_days or 1.0)
+            est_delivery = float(created_at or now) + lead * SECONDS_PER_DAY
+            _add(ing_id_t, sup_id_t, est_delivery, total_qty)
+
+        return rows
 
     def build_procurement_plan(
         self,
@@ -267,7 +422,9 @@ class InventoryOptimizer(BaseAgent):
         # beyond where we have real data (which caused back-half zero-demand rows
         # and under-sized orders).  If the caller provides an explicit horizon_days,
         # cap it at the forecast span; with no live forecast fall back gracefully.
-        forecast_span = (max(d.get("day_index", 0) for d in days_payload) + 1) if days_payload else 0
+        # Offsets are anchored on each day's absolute start (stale-horizon safe).
+        day_offsets = [_horizon_day_offset(d, now_day) for d in days_payload]
+        forecast_span = (max(day_offsets) + 1) if days_payload else 0
         if forecast_span > 0:
             n_days = forecast_span if horizon_days is None else min(math.ceil(float(horizon_days)), forecast_span)
         else:
@@ -284,7 +441,8 @@ class InventoryOptimizer(BaseAgent):
         session = self.db_session_factory()
         try:
             catalog_entries = session.query(SupplierCatalog).all()
-            ingredient_ids = list({c.ingredient_id for c in catalog_entries})
+            # Sorted for deterministic solver-input (and plan-row) ordering.
+            ingredient_ids = sorted({c.ingredient_id for c in catalog_entries})
 
             for ing_id in ingredient_ids:
                 per_day_demand[ing_id] = {}
@@ -319,9 +477,9 @@ class InventoryOptimizer(BaseAgent):
                     recipe_qty[mid][ing_id] = raw_q / yield_factors.get(ing_id, 1.0)
 
             # Accumulate per-day ingredient demand from horizon signal.
-            for day in days_payload:
-                day_idx = int(day.get("day_index") or 0)
-                if day_idx >= n_days:
+            # day_idx < 0 = demand for a day already in the past (stale horizon) — drop.
+            for day, day_idx in zip(days_payload, day_offsets):
+                if day_idx < 0 or day_idx >= n_days:
                     continue
                 for item_entry in day.get("items") or []:
                     menu_item_id = item_entry.get("menu_item_id")
@@ -355,6 +513,7 @@ class InventoryOptimizer(BaseAgent):
                 catalog = (
                     session.query(SupplierCatalog)
                     .filter(SupplierCatalog.ingredient_id == ing_id)
+                    .order_by(SupplierCatalog.supplier_id)
                     .all()
                 )
                 specs = [
@@ -458,92 +617,23 @@ class InventoryOptimizer(BaseAgent):
         # lines can piggyback without triggering a new delivery fee or MOV enforcement.
         scheduled_supplier_days: set = set()
         if ingredient_ids:
-            from sqlalchemy import func as _sa_func  # local import; avoids top-level sqlalchemy dep
             session = self.db_session_factory()
             try:
-                in_transit = (
-                    session.query(
-                        PurchaseOrderLine.ingredient_id,
-                        PurchaseOrder.supplier_id,
-                        PurchaseOrder.expected_delivery,
-                        _sa_func.sum(PurchaseOrderLine.qty).label("total_qty"),
-                    )
-                    .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
-                    .filter(
-                        PurchaseOrderLine.ingredient_id.in_(ingredient_ids),
-                        PurchaseOrder.status.in_(("proposed", "approved", "placed")),
-                        PurchaseOrder.expected_delivery.isnot(None),
-                    )
-                    .group_by(
-                        PurchaseOrderLine.ingredient_id,
-                        PurchaseOrder.supplier_id,
-                        PurchaseOrder.expected_delivery,
-                    )
-                    .all()
-                )
-                for ing_id_t, sup_id_t, exp_delivery, total_qty in in_transit:
-                    if exp_delivery is None:
-                        continue
-                    arr_day = int(float(exp_delivery) // SECONDS_PER_DAY) - now_day
-                    # C1: Phantom-inventory fix — only credit POs expected to arrive
-                    # within the horizon.  POs overdue by more than 1 day are treated
-                    # as stuck (never delivered) so the planner re-orders instead of
-                    # relying on stock that may never arrive.
-                    if arr_day < -1:
-                        logger.debug(
-                            "Excluding overdue in-flight PO (arr_day=%d) for ingredient %s "
-                            "from projection — treating as undelivered.",
-                            arr_day, ing_id_t,
-                        )
-                        continue
-                    arr_day = max(arr_day, 0)
+                for ing_id_t, sup_id_t, phys_day, service_day, po_qty in (
+                    self._open_po_pipeline_rows(session, ingredient_ids, now)
+                ):
                     if ing_id_t in inbound_by_day:
-                        inbound_by_day[ing_id_t][arr_day] = (
-                            inbound_by_day[ing_id_t].get(arr_day, 0.0) + float(total_qty or 0.0)
+                        # Credit supply on the SERVICE day (arrival after
+                        # production start serves the next day) so inbound POs
+                        # and the MILP's own service-shifted plan arrivals are
+                        # valued with one convention.
+                        inbound_by_day[ing_id_t][service_day] = (
+                            inbound_by_day[ing_id_t].get(service_day, 0.0) + po_qty
                         )
-                    # Track the supplier-day as already scheduled
+                    # Track the supplier-day as already scheduled (physical
+                    # delivery day — the MILP's deliver binaries use it).
                     if sup_id_t is not None:
-                        scheduled_supplier_days.add((int(sup_id_t), arr_day))
-
-                # W4: Also credit POs awaiting approval (proposed/approved, expected_delivery=None).
-                # estimate arrival = created_at + supplier lead_time so they count as pipeline
-                # supply and the MILP doesn't re-order the same ingredient.
-                null_transit = (
-                    session.query(
-                        PurchaseOrderLine.ingredient_id,
-                        PurchaseOrder.supplier_id,
-                        PurchaseOrder.created_at,
-                        Supplier.lead_time_days,
-                        _sa_func.sum(PurchaseOrderLine.qty).label("total_qty"),
-                    )
-                    .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
-                    .join(Supplier, Supplier.id == PurchaseOrder.supplier_id)
-                    .filter(
-                        PurchaseOrderLine.ingredient_id.in_(ingredient_ids),
-                        PurchaseOrder.status.in_(("proposed", "approved")),
-                        PurchaseOrder.expected_delivery.is_(None),
-                    )
-                    .group_by(
-                        PurchaseOrderLine.ingredient_id,
-                        PurchaseOrder.supplier_id,
-                        PurchaseOrder.created_at,
-                        Supplier.lead_time_days,
-                    )
-                    .all()
-                )
-                for ing_id_t, sup_id_t, created_at, lead_days, total_qty in null_transit:
-                    lead = float(lead_days or 1.0)
-                    est_delivery = float(created_at or now) + lead * SECONDS_PER_DAY
-                    arr_day = int(est_delivery // SECONDS_PER_DAY) - now_day
-                    if arr_day < -1:
-                        continue
-                    arr_day = max(arr_day, 0)
-                    if ing_id_t in inbound_by_day:
-                        inbound_by_day[ing_id_t][arr_day] = (
-                            inbound_by_day[ing_id_t].get(arr_day, 0.0) + float(total_qty or 0.0)
-                        )
-                    if sup_id_t is not None:
-                        scheduled_supplier_days.add((int(sup_id_t), arr_day))
+                        scheduled_supplier_days.add((sup_id_t, phys_day))
             finally:
                 session.close()
 
@@ -574,15 +664,19 @@ class InventoryOptimizer(BaseAgent):
             session = self.db_session_factory()
             try:
                 _active_ing_ids = list(ingredients_data.keys())
+                # Deterministic ordering: solver input row order must not depend
+                # on DB insertion order, so rebuilds on any DB yield one plan.
                 _all_cat_rows = (
                     session.query(SupplierCatalog)
                     .filter(SupplierCatalog.ingredient_id.in_(_active_ing_ids))
+                    .order_by(SupplierCatalog.ingredient_id, SupplierCatalog.supplier_id)
                     .all()
                 )
                 _all_sup_ids = {c.supplier_id for c in _all_cat_rows}
                 _all_sup_rows = (
                     session.query(Supplier)
                     .filter(Supplier.id.in_(_all_sup_ids))
+                    .order_by(Supplier.id)
                     .all()
                 )
                 _ing_rows = (
@@ -759,6 +853,9 @@ class InventoryOptimizer(BaseAgent):
                     "margin_by_ing": _margin_by_ing,
                     "production_start_hour": config.PRODUCTION_START_HOUR,
                     "scheduled_supplier_days": scheduled_supplier_days,
+                    # Time-of-day so the solver never schedules a delivery whose
+                    # order-by cutoff already passed (no born-late plan rows).
+                    "now_time_of_day_s": now - now_day * SECONDS_PER_DAY,
                     "robust_hard_delay": (
                         robust if robust is not None else config.RELIABILITY_ROBUST_HARD_DELAY
                     ),
@@ -861,6 +958,12 @@ class InventoryOptimizer(BaseAgent):
         # First-time orders (zero existing pipeline) are NEVER suppressed.
         # Default JITTER_FRACTION = 0.0 — disabled unless explicitly configured.
         # ----------------------------------------------------------------
+        # Orders suppressed by anti-jitter / R1 are recorded (not discarded) so
+        # the post-FEFO self-heal can restore them if suppression opened a gap.
+        _jitter_dropped: List[Dict] = []
+        _r1_dropped: List[Dict] = []
+        _r1_superseded_ids: set = set()
+
         _jitter_frac = float(getattr(config, "PROCUREMENT_JITTER_FRACTION", 0.0))
         if _jitter_frac > 0 and new_orders:
             _filtered_orders: List[Dict] = []
@@ -881,6 +984,7 @@ class InventoryOptimizer(BaseAgent):
                             "ingredient %s (unrounded shortfall %.1f < threshold %.1f).",
                             _jiid, _unrounded_short, _jitter_threshold,
                         )
+                        _jitter_dropped.append(_jod)
                         continue  # skip this top-up — within jitter tolerance
                 _filtered_orders.append(_jod)
             if len(_filtered_orders) < len(new_orders):
@@ -989,21 +1093,17 @@ class InventoryOptimizer(BaseAgent):
             # Keyed on ingredient_id only (not ingredient+supplier) so a cross-supplier
             # PO still suppresses the plan row.
             try:
-                from sqlalchemy import func as _sa_func_r1  # local import; avoids top-level dep
+                # Gross open-PO supply from the SAME helper (and thus the same
+                # overdue/estimation filters) as the inbound snapshot — any
+                # asymmetry here (e.g. a stuck PO counted in gross but excluded
+                # from the credit) leaves a permanent phantom residual that
+                # suppresses legitimate planned rows on every rebuild.
                 _open_po_coverage: Dict[int, float] = {}   # {ingredient_id: total_qty}
-                _open_po_rows = (
-                    session.query(
-                        PurchaseOrderLine.ingredient_id,
-                        _sa_func_r1.sum(PurchaseOrderLine.qty).label("total_qty"),
-                    )
-                    .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderLine.po_id)
-                    .filter(PurchaseOrder.status.in_(("proposed", "approved", "placed")))
-                    .group_by(PurchaseOrderLine.ingredient_id)
-                    .all()
-                )
-                for _r1_ing, _r1_qty in _open_po_rows:
-                    _open_po_coverage[int(_r1_ing)] = (
-                        _open_po_coverage.get(int(_r1_ing), 0.0) + float(_r1_qty or 0.0)
+                for _r1_ing, _r1_sup, _r1_pd, _r1_sd, _r1_qty in (
+                    self._open_po_pipeline_rows(session, ingredient_ids, now)
+                ):
+                    _open_po_coverage[_r1_ing] = (
+                        _open_po_coverage.get(_r1_ing, 0.0) + _r1_qty
                     )
 
                 # How much of each ingredient the solver already credited (inbound_by_day
@@ -1029,6 +1129,7 @@ class InventoryOptimizer(BaseAgent):
                                 _r1_iid, _r1_residual, _r1_gross,
                                 _inbound_credited.get(_r1_iid, 0.0), _r1_need,
                             )
+                            _r1_dropped.append(_od)
                         else:
                             _r1_filtered.append(_od)
                     final_new_orders = _r1_filtered
@@ -1049,20 +1150,11 @@ class InventoryOptimizer(BaseAgent):
                             )
                             kept_ids.discard(_r1_row_id)
                             superseded_ids.add(_r1_row_id)
+                            _r1_superseded_ids.add(_r1_row_id)
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "build_procurement_plan: R1 open-PO reconciliation query failed; skipping."
                 )
-
-            for row_id in superseded_ids:
-                row = session.get(PlannedOrder, row_id)
-                if row:
-                    row.status = "superseded"
-
-            n_new = len(final_new_orders)
-            n_kept = len(kept_ids)
-            n_superseded = len(superseded_ids)
-            total_active = n_new + n_kept
 
             # WS2/WS3: Authoritative FEFO coverage check — replaces the aggregate
             # horizon-sum recompute with a day-by-day FEFO inventory simulation that
@@ -1083,28 +1175,38 @@ class InventoryOptimizer(BaseAgent):
                     project_fefo_coverage as _fefo_check,
                 )
 
-                # Build plan_arrivals_by_day from final persisted orders.
-                _plan_arr_by_day: Dict[int, Dict[int, float]] = {}
-                for _pao in final_new_orders:
-                    _pa_iid = int(_pao["ingredient_id"])
-                    _pa_dd = int(float(_pao.get("delivery_date") or 0.0) // SECONDS_PER_DAY) - now_day
-                    _pa_dd = max(_pa_dd, 0)
-                    _plan_arr_by_day.setdefault(_pa_iid, {})
-                    _plan_arr_by_day[_pa_iid][_pa_dd] = (
-                        _plan_arr_by_day[_pa_iid].get(_pa_dd, 0.0)
-                        + float(_pao.get("qty") or 0.0)
-                    )
-                for _kr_id in kept_ids:
-                    _kr = session.get(PlannedOrder, _kr_id)
-                    if _kr is not None:
-                        _kr_iid = int(_kr.ingredient_id)
-                        _kr_dd = int(float(_kr.delivery_date or 0.0) // SECONDS_PER_DAY) - now_day
-                        _kr_dd = max(_kr_dd, 0)
-                        _plan_arr_by_day.setdefault(_kr_iid, {})
-                        _plan_arr_by_day[_kr_iid][_kr_dd] = (
-                            _plan_arr_by_day[_kr_iid].get(_kr_dd, 0.0)
-                            + float(_kr.qty or 0.0)
+                def _assemble_plan_arrivals() -> Dict[int, Dict[int, float]]:
+                    """plan_arrivals_by_day from the CURRENT final_new_orders + kept rows."""
+                    _paa: Dict[int, Dict[int, float]] = {}
+                    for _pao in final_new_orders:
+                        _pa_iid = int(_pao["ingredient_id"])
+                        _pa_dd = int(float(_pao.get("delivery_date") or 0.0) // SECONDS_PER_DAY) - now_day
+                        _pa_dd = max(_pa_dd, 0)
+                        _paa.setdefault(_pa_iid, {})
+                        _paa[_pa_iid][_pa_dd] = (
+                            _paa[_pa_iid].get(_pa_dd, 0.0)
+                            + float(_pao.get("qty") or 0.0)
                         )
+                    for _kr_id in kept_ids:
+                        _kr = session.get(PlannedOrder, _kr_id)
+                        if _kr is not None:
+                            # kept_updates holds the refreshed qty/delivery for this
+                            # rebuild; the DB row is only updated later (persistence
+                            # phase), so reading it here would undercount arrivals
+                            # whenever the new plan raised a kept row's quantity and
+                            # emit a false INGREDIENT_UNCOVERABLE.
+                            _ku = kept_updates.get(_kr_id) or {}
+                            _kr_iid = int(_kr.ingredient_id)
+                            _kr_deliv = float(_ku.get("delivery_date") or _kr.delivery_date or 0.0)
+                            _kr_qty = float(_ku.get("qty") or _kr.qty or 0.0)
+                            _kr_dd = int(_kr_deliv // SECONDS_PER_DAY) - now_day
+                            _kr_dd = max(_kr_dd, 0)
+                            _paa.setdefault(_kr_iid, {})
+                            _paa[_kr_iid][_kr_dd] = (
+                                _paa[_kr_iid].get(_kr_dd, 0.0)
+                                + _kr_qty
+                            )
+                    return _paa
 
                 # Ingredient shelf life map for arrival-lot expiry calculation.
                 _fefo_sl: Dict[int, Optional[float]] = {
@@ -1112,20 +1214,52 @@ class InventoryOptimizer(BaseAgent):
                     for iid, data in ingredients_data.items()
                 }
 
-                _fefo_result = _fefo_check(
-                    n_days=n_days,
-                    # Use the same robust demand the MILP optimised for (max of
-                    # forecast and baseline) so the coverage flag and the solve
-                    # measure the same demand.  per_day_demand (raw forecast) alone
-                    # would be inconsistent with a plan that targets the robust max.
-                    demand_by_day=_demand_map,
-                    on_hand={iid: d["on_hand"] for iid, d in ingredients_data.items()},
-                    lots_by_ing={iid: d["lots"] for iid, d in ingredients_data.items()},
-                    open_po_arrivals_by_day=inbound_by_day,
-                    plan_arrivals_by_day=_plan_arr_by_day,
-                    safety_stock={iid: d["safety_stock"] for iid, d in ingredients_data.items()},
-                    ingredient_shelf_life=_fefo_sl,
-                )
+                def _run_fefo() -> Dict[str, Any]:
+                    return _fefo_check(
+                        n_days=n_days,
+                        # Use the same robust demand the MILP optimised for (max of
+                        # forecast and baseline) so the coverage flag and the solve
+                        # measure the same demand.  per_day_demand (raw forecast) alone
+                        # would be inconsistent with a plan that targets the robust max.
+                        demand_by_day=_demand_map,
+                        on_hand={iid: d["on_hand"] for iid, d in ingredients_data.items()},
+                        lots_by_ing={iid: d["lots"] for iid, d in ingredients_data.items()},
+                        open_po_arrivals_by_day=inbound_by_day,
+                        plan_arrivals_by_day=_assemble_plan_arrivals(),
+                        safety_stock={iid: d["safety_stock"] for iid, d in ingredients_data.items()},
+                        ingredient_shelf_life=_fefo_sl,
+                    )
+
+                _fefo_result = _run_fefo()
+
+                # Self-heal: a gap the solver did NOT have is an artifact of our
+                # own suppression stages (anti-jitter / R1), not a supply failure.
+                # Restore the suppressed rows for the short ingredients and
+                # re-validate instead of emitting a false "no supplier can
+                # deliver" alert (which also strands demand behind qty=0
+                # sentinel rows that never convert to POs).
+                if not _fefo_result["coverage_ok"] and plan_coverage_ok:
+                    _short_iids = {int(k) for k in (_fefo_result.get("short_by_ing") or {})}
+                    _restored = 0
+                    for _od in _r1_dropped + _jitter_dropped:
+                        if int(_od["ingredient_id"]) in _short_iids:
+                            final_new_orders.append(_od)
+                            _restored += 1
+                    for _rs_id in list(_r1_superseded_ids):
+                        _rs_row = session.get(PlannedOrder, _rs_id)
+                        if _rs_row is not None and int(_rs_row.ingredient_id) in _short_iids:
+                            superseded_ids.discard(_rs_id)
+                            kept_ids.add(_rs_id)
+                            _restored += 1
+                    if _restored:
+                        logger.warning(
+                            "Coverage gap introduced by post-solver suppression "
+                            "(%.1f units): restored %d suppressed plan row(s) and "
+                            "re-validating.",
+                            float(_fefo_result["total_short"]), _restored,
+                        )
+                        _fefo_result = _run_fefo()
+
                 _reconciled_total_short = float(_fefo_result["total_short"])
                 _reconciled_coverage_ok = bool(_fefo_result["coverage_ok"])
                 _coverage_depends_on_planned = bool(_fefo_result["coverage_depends_on_planned"])
@@ -1141,8 +1275,8 @@ class InventoryOptimizer(BaseAgent):
                         )
                     if plan_coverage_ok:
                         logger.warning(
-                            "Coverage gap INTRODUCED by post-solver reconciliation: "
-                            "%.1f units uncoverable after R1/hysteresis (solver claimed full coverage).",
+                            "Coverage gap PERSISTS after restoring suppressed rows: "
+                            "%.1f units uncoverable (solver claimed full coverage).",
                             _reconciled_total_short,
                         )
             except Exception:  # noqa: BLE001
@@ -1150,6 +1284,18 @@ class InventoryOptimizer(BaseAgent):
                     "build_procurement_plan: FEFO coverage check failed; "
                     "falling back to solver total_short=%.1f.", plan_total_short,
                 )
+
+            # Persist supersede flags only now — the self-heal above may have
+            # moved R1-superseded rows back to kept.
+            for row_id in superseded_ids:
+                row = session.get(PlannedOrder, row_id)
+                if row:
+                    row.status = "superseded"
+
+            n_new = len(final_new_orders)
+            n_kept = len(kept_ids)
+            n_superseded = len(superseded_ids)
+            total_active = n_new + n_kept
 
             # ----------------------------------------------------------------
             # Post-FEFO: derive authoritative coverage_by_ing and update orders
@@ -1213,8 +1359,9 @@ class InventoryOptimizer(BaseAgent):
                             short_qty=_sn,
                             unit=_uo_unit,
                             reason=(
-                                f"No lead-feasible / in-stock supply: "
-                                f"{_sn:.0f}{_uo_unit} short on time"
+                                f"{_sn:.0f}{_uo_unit} of near-term demand cannot be covered "
+                                f"in time — no supplier can deliver before it is needed "
+                                f"(lead time / availability)"
                             ),
                         ).model_dump(),
                         dedup_key=f"uncoverable:{_co_iid}",
@@ -1252,6 +1399,8 @@ class InventoryOptimizer(BaseAgent):
 
             # Apply refreshed data to kept rows (supplier, qty, status, etc.)
             for row_id, updates in kept_updates.items():
+                if row_id not in kept_ids:
+                    continue  # matched but later superseded (e.g. R1) — don't resurrect
                 row = session.get(PlannedOrder, row_id)
                 if row:
                     for field, value in updates.items():
@@ -1295,13 +1444,13 @@ class InventoryOptimizer(BaseAgent):
     _PROMO_TERM_TYPES = ("free_goods", "free_delivery", "threshold_discount")
 
     @staticmethod
-    def _promo_expiry_phrase(term: Any) -> str:
+    def _promo_expiry_phrase(term: Any, now: float) -> str:
         """Human phrase describing how much of a multi-use promo remains."""
         if term.expiry_kind == "orders":
             n = int(term.remaining_orders or 0)
             return f"still available for {n} more order{'s' if n != 1 else ''}"
         if term.expiry_kind == "date" and term.expires_at:
-            days = max(0, round((float(term.expires_at) - float(term.effective_at or 0)) / SECONDS_PER_DAY))
+            days = max(0, round((float(term.expires_at) - now) / SECONDS_PER_DAY))
             return f"still available for ~{days} more day{'s' if days != 1 else ''}"
         return "still available"
 
@@ -1338,7 +1487,7 @@ class InventoryOptimizer(BaseAgent):
             )
             .all()
         )
-        live = [t for t in terms if self._term_is_live(t)]
+        live = [t for t in terms if self._term_is_live(t, now)]
 
         # Max single-delivery order value per supplier from the planned orders.
         ov_by_sup: Dict[int, float] = {}
@@ -1371,7 +1520,7 @@ class InventoryOptimizer(BaseAgent):
                 ).all()
             }
             offer_lines = [self._promo_offer_desc(t, ing_names.get(t.free_ingredient_id, "")) for t in unused]
-            avail = "; ".join(sorted({self._promo_expiry_phrase(t) for t in unused}))
+            avail = "; ".join(sorted({self._promo_expiry_phrase(t, now) for t in unused}))
             mov = max(float(t.min_order_value or 0.0) for t in unused)
             summary = (
                 f"Promotion from {sup_name} evaluated but not used — "
@@ -1412,10 +1561,10 @@ class InventoryOptimizer(BaseAgent):
                 session.delete(c)
 
     @staticmethod
-    def _term_is_live(t: Any) -> bool:
+    def _term_is_live(t: Any, now: float) -> bool:
         """Mirror terms.apply_supplier_terms._term_is_live (order/date expiry)."""
         if t.expiry_kind == "date" and t.expires_at is not None:
-            return True  # date validity already filtered by status; treat as live
+            return float(t.expires_at) >= now
         if t.expiry_kind == "orders":
             return (t.remaining_orders or 0) > 0
         return True
@@ -1951,12 +2100,15 @@ class InventoryOptimizer(BaseAgent):
         payload = sig.payload or {}
         days = payload.get("days") or []
         coverage_days = math.ceil(lead_days + config.REORDER_INTERVAL_DAYS)
+        now_day = int(float(self.bus.sim_time) // SECONDS_PER_DAY)
 
         total_usage = 0.0
         session = self.db_session_factory()
         try:
             for day in days:
-                day_idx = day.get("day_index", 999)
+                day_idx = _horizon_day_offset(day, now_day)
+                if day_idx < 0:
+                    continue  # stale horizon: day already past
                 if day_idx >= coverage_days:
                     break
                 for item_entry in day.get("items") or []:
@@ -1988,12 +2140,15 @@ class InventoryOptimizer(BaseAgent):
         payload = sig.payload or {}
         days = payload.get("days") or []
         cap_days = math.ceil(shelf_life_days)
+        now_day = int(float(self.bus.sim_time) // SECONDS_PER_DAY)
 
         total_usage = 0.0
         session = self.db_session_factory()
         try:
             for day in days:
-                day_idx = day.get("day_index", 999)
+                day_idx = _horizon_day_offset(day, now_day)
+                if day_idx < 0:
+                    continue  # stale horizon: day already past
                 if day_idx >= cap_days:
                     break
                 for item_entry in day.get("items") or []:
@@ -3038,32 +3193,17 @@ class InventoryOptimizer(BaseAgent):
                 for s in supplier_rows
             ]
 
-            # Overlay active threshold_discount terms as extra volume_discount tiers,
-            # and collect free_goods offers for the solver (mirrors build_procurement_plan).
-            _sourcing_free_goods: list = []
+            # Overlay active threshold_discount terms as extra volume_discount tiers.
+            # (free_goods offers are consumed by the forward-plan MILP only —
+            # solve_sourcing has no free-goods model.)
             for _sup_dict in suppliers:
                 _s_id = int(_sup_dict["id"])
-                _all_scope_terms = _term_map.get((_s_id, None), [])
-                for _t in _all_scope_terms:
+                for _t in _term_map.get((_s_id, None), []):
                     if _t.term_type == "threshold_discount":
                         _disc_pct = round(float(_t.value) * 100.0, 4)
                         _mov = float(_t.min_order_value or 0.0)
                         if _disc_pct > 0 and _mov > 0:
                             _sup_dict["volume_discount"].append({"min_value": _mov, "discount_pct": _disc_pct})
-                    elif _t.term_type == "free_goods":
-                        if _t.free_ingredient_id and _t.free_qty_g:
-                            try:
-                                from track_b.procurement.terms import FreeGoodsOffer as _FGO  # noqa: PLC0415
-                            except ImportError:
-                                from procurement.terms import FreeGoodsOffer as _FGO  # type: ignore[no-redef]
-                            _sourcing_free_goods.append(_FGO(
-                                supplier_id=_s_id,
-                                free_ingredient_id=int(_t.free_ingredient_id),
-                                free_qty_g=float(_t.free_qty_g),
-                                min_order_value=float(_t.min_order_value or 0.0),
-                                remaining_orders=_t.remaining_orders,
-                                term_id=int(_t.id),
-                            ))
                 # Normalise: keep None when list is empty (solver expects None or list)
                 if not _sup_dict["volume_discount"]:
                     _sup_dict["volume_discount"] = None

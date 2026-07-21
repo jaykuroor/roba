@@ -104,6 +104,38 @@ def vertex_available() -> bool:
     return bool(vertex_project())
 
 
+def call_with_timeout(fn: Any, timeout_s: float) -> Any:
+    """Run ``fn()`` on a daemon thread; return its result or raise ``TimeoutError``.
+
+    The obvious ``with ThreadPoolExecutor() as ex: ex.submit(fn).result(timeout)``
+    pattern does NOT enforce the timeout: the ``with`` block's ``__exit__`` calls
+    ``shutdown(wait=True)``, which joins the worker — so a timed-out LLM call
+    still blocks for its full duration and then the response is discarded.  A
+    daemon thread lets the caller return at the deadline; the abandoned call
+    finishes (or dies) in the background without pinning process shutdown.
+    """
+    import threading  # noqa: PLC0415
+
+    box: list = []
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            box.append(("ok", fn()))
+        except BaseException as exc:  # noqa: BLE001 — carried to the caller.
+            box.append(("err", exc))
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, daemon=True, name="llm-call").start()
+    if not done.wait(timeout_s):
+        raise TimeoutError(f"call did not complete within {timeout_s:.0f}s")
+    kind, value = box[0]
+    if kind == "err":
+        raise value
+    return value
+
+
 def build_genai_client() -> Any:
     """Build and return a ``google.genai.Client`` configured for Vertex AI.
 
