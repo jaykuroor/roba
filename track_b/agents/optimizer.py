@@ -306,6 +306,7 @@ class InventoryOptimizer(BaseAgent):
 
         now_day = int(now // SECONDS_PER_DAY)
         prod_start_s = float(config.PRODUCTION_START_HOUR) * 3600.0
+        grace_s = float(config.PROCUREMENT_SERVICE_GRACE_H) * 3600.0
         rows: List[Tuple[int, Optional[int], int, int, float]] = []
 
         def _add(ing_id: Any, sup_id: Any, delivery_sim_s: float, qty: float) -> None:
@@ -320,7 +321,7 @@ class InventoryOptimizer(BaseAgent):
                     arr_day, ing_id,
                 )
                 return
-            shift = 1 if (delivery_sim_s % SECONDS_PER_DAY) > prod_start_s else 0
+            shift = 1 if (delivery_sim_s % SECONDS_PER_DAY) > prod_start_s + grace_s else 0
             rows.append((
                 int(ing_id),
                 int(sup_id) if sup_id is not None else None,
@@ -852,6 +853,7 @@ class InventoryOptimizer(BaseAgent):
                     "stress_enabled": config.RELIABILITY_STRESS_ENABLED,
                     "margin_by_ing": _margin_by_ing,
                     "production_start_hour": config.PRODUCTION_START_HOUR,
+                    "service_grace_h": config.PROCUREMENT_SERVICE_GRACE_H,
                     "scheduled_supplier_days": scheduled_supplier_days,
                     # Time-of-day so the solver never schedules a delivery whose
                     # order-by cutoff already passed (no born-late plan rows).
@@ -901,10 +903,17 @@ class InventoryOptimizer(BaseAgent):
                 _order_sim_s = _delivery_sim_s - _lead * SECONDS_PER_DAY
                 # C: distinguish genuinely uncoverable (no supply, qty==0 sentinel)
                 # from late/expedite orders (buyable but order-by window has passed).
+                _reason = _order.reason
                 if _order.at_risk and (_order.qty or 0) <= 0:
                     _status = "uncoverable"   # no lead-feasible / in-stock supply
                 elif _order.at_risk or _order_sim_s < now:
                     _status = "at_risk"       # order window passed, but supply exists
+                    if _order_sim_s < now:
+                        # Order-by already passed (within the service grace window):
+                        # expedite — due immediately, so the post-build execute pass
+                        # places the PO now instead of leaving a stale past date.
+                        _order_sim_s = now
+                        _reason = f"{_reason} — expedited (order-by passed, placing immediately)"
                 else:
                     _status = "planned"
                 _covers_until = float(
@@ -935,7 +944,7 @@ class InventoryOptimizer(BaseAgent):
                     "covers_from": _delivery_sim_s,
                     "covers_until": _covers_until,
                     "status": _status,
-                    "reason": _order.reason,
+                    "reason": _reason,
                     "projected_stock_before": float(getattr(_order, "projected_stock_before", 0.0) or 0.0),
                     "qty_needed_before": float(getattr(_order, "qty_needed_before", 0.0) or 0.0),
                     "shortage_if_late": float(getattr(_order, "shortage_if_late", 0.0) or 0.0),
@@ -1351,6 +1360,38 @@ class InventoryOptimizer(BaseAgent):
                         "g",
                     )
                     _sn = float(_co_info.get("short_nominal", 0.0))
+                    # Earliest incoming supply (planned rows + open POs) so the
+                    # alert says what IS being done, not just what can't be.
+                    _supply_days: List[int] = [
+                        int(float(_od.get("delivery_date") or 0.0) // SECONDS_PER_DAY) - now_day
+                        for _od in final_new_orders
+                        if int(_od.get("ingredient_id", 0)) == _co_iid
+                        and float(_od.get("qty") or 0.0) > 0
+                    ]
+                    _supply_days += [
+                        _sd for _sd, _sq in (inbound_by_day.get(_co_iid) or {}).items()
+                        if _sq > 0
+                    ]
+                    for _kr_id in kept_ids:
+                        _kr = session.get(PlannedOrder, _kr_id)
+                        if _kr is not None and int(_kr.ingredient_id) == _co_iid:
+                            _ku = kept_updates.get(_kr_id) or {}
+                            if float(_ku.get("qty") or _kr.qty or 0.0) > 0:
+                                _kd = float(_ku.get("delivery_date") or _kr.delivery_date or 0.0)
+                                _supply_days.append(int(_kd // SECONDS_PER_DAY) - now_day)
+                    if _supply_days:
+                        _first_arr = max(min(_supply_days), 0)
+                        _uo_reason = (
+                            f"{_sn:.0f}{_uo_unit} of near-term demand will run short before "
+                            f"the first possible delivery (day {_first_arr}) — supply is "
+                            f"ordered/planned to cover the remainder from then on"
+                        )
+                    else:
+                        _uo_reason = (
+                            f"{_sn:.0f}{_uo_unit} of near-term demand cannot be covered "
+                            f"in time — no supplier can deliver before it is needed "
+                            f"(lead time / availability)"
+                        )
                     self.emit(
                         SignalType.INGREDIENT_UNCOVERABLE,
                         IngredientUncoverablePayload(
@@ -1358,11 +1399,7 @@ class InventoryOptimizer(BaseAgent):
                             ingredient_name=_uo_name,
                             short_qty=_sn,
                             unit=_uo_unit,
-                            reason=(
-                                f"{_sn:.0f}{_uo_unit} of near-term demand cannot be covered "
-                                f"in time — no supplier can deliver before it is needed "
-                                f"(lead time / availability)"
-                            ),
+                            reason=_uo_reason,
                         ).model_dump(),
                         dedup_key=f"uncoverable:{_co_iid}",
                     )

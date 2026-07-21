@@ -741,13 +741,20 @@ def _solve_milp(
     # day d+1.  With default delivery_hour=8.0 and production_start=8.0 the shift is
     # 0 — all arrivals serve the same day (identical to historic behaviour).
     _prod_start = float(params.get("production_start_hour", 8.0))
+    # Grace window (hours): an arrival within it after production start still
+    # serves the same day (sales run all day), and an order-by cutoff missed by
+    # less than it still makes its delivery slot (the market clamps
+    # expected_delivery to the planned slot, ≥ now).  Without it the morning
+    # plan — built minutes after day-open — slips every supplier's first
+    # feasible delivery a full day.
+    _grace_h = float(params.get("service_grace_h", 0.0))
     delivery_hour_by_sup: Dict[int, float] = {
         int(s["id"]): float(s.get("delivery_hour") or 8.0)
         for s in suppliers
     }
-    # service_shift[s_id] = 0 if arrives before/at production start, else 1
+    # service_shift[s_id] = 0 if arrives before/at production start (+ grace), else 1
     service_shift: Dict[int, int] = {
-        s_id: (0 if dh <= _prod_start else 1)
+        s_id: (0 if dh <= _prod_start + _grace_h else 1)
         for s_id, dh in delivery_hour_by_sup.items()
     }
 
@@ -756,7 +763,9 @@ def _solve_milp(
     # (now_day + d)·S + dh·3600 − lead·S.  With the plain lead ceiling the solver
     # happily schedules deliveries whose cutoff is hours in the past — rows that
     # are born "late" (order_date < now) and sit as plans instead of orders.
-    # first_day[s] = max(lead_ceil, ceil(lead + (now_tod − dh·3600)/S)).
+    # first_day[s] = max(lead_ceil, ceil(lead + (now_tod − dh·3600 − grace)/S)).
+    # The grace term keeps a cutoff missed by minutes (the 08:0x morning plan)
+    # from pushing the first feasible slot out a whole day.
     # Default now_time_of_day_s=0 keeps historic behaviour (first_day == lead_ceil).
     _now_tod = float(params.get("now_time_of_day_s", 0.0))
     first_day: Dict[int, int] = {}
@@ -764,7 +773,7 @@ def _solve_milp(
         _s_id = int(s["id"])
         _lead = float(s.get("lead_time_days") or 1.0)
         _dh = delivery_hour_by_sup.get(_s_id, 8.0)
-        _d_min = math.ceil(_lead + (_now_tod - _dh * 3600.0) / 86400.0)
+        _d_min = math.ceil(_lead + (_now_tod - _dh * 3600.0 - _grace_h * 3600.0) / 86400.0)
         first_day[_s_id] = max(lead_ceil[_s_id], _d_min)
 
     # Active ingredients: those with any demand OR on_hand < safety_stock

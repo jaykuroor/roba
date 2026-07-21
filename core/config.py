@@ -172,6 +172,15 @@ PROMO_SLOW_MOVER_PCT = int(os.getenv("PROMO_SLOW_MOVER_PCT", "15"))
 # historical DAY_OPEN_OFFSET assumption; no behavioral change unless a supplier's
 # delivery_hour is set above this threshold).
 PRODUCTION_START_HOUR = float(os.getenv("PRODUCTION_START_HOUR", "8.0"))
+# Grace window (hours) past PRODUCTION_START_HOUR during which an arrival still
+# serves the SAME day, and past an order-by cutoff during which the order can
+# still make its delivery slot.  The morning forecast+plan runs minutes after
+# day-open (LLM realtime holds advance the sim clock), so without slack every
+# supplier's first feasible delivery slips a full day at 08:0x — all order
+# dates land tomorrow (zero POs today), rows are born at_risk, and near-term
+# demand shows phantom "uncoverable" gaps.  Sales run all day, so an arrival
+# shortly after open genuinely serves that day.
+PROCUREMENT_SERVICE_GRACE_H = float(os.getenv("PROCUREMENT_SERVICE_GRACE_H", "2.0"))
 
 RELIABILITY_CASH_TOLERANCE = float(os.getenv("RELIABILITY_CASH_TOLERANCE", "0.01"))
 # RELIABILITY_STRESS_ENABLED: when True, run the two-pass lexicographic solve (pass 1

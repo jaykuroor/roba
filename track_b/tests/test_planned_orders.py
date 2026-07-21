@@ -1428,7 +1428,8 @@ def test_open_po_pipeline_rows_service_shift_and_overdue(bus, session_factory):
             ))
 
         _po(float(2 * SECONDS_PER_DAY + 6 * 3600))    # day 2 @ 06:00 → before prod start
-        _po(float(2 * SECONDS_PER_DAY + 10 * 3600))   # day 2 @ 10:00 → after prod start
+        _po(float(2 * SECONDS_PER_DAY + 9 * 3600))    # day 2 @ 09:00 → within grace window
+        _po(float(2 * SECONDS_PER_DAY + 14 * 3600))   # day 2 @ 14:00 → past grace
         _po(float(-3 * SECONDS_PER_DAY))              # 3 days overdue → excluded
         session.commit()
     finally:
@@ -1443,9 +1444,9 @@ def test_open_po_pipeline_rows_service_shift_and_overdue(bus, session_factory):
         session.close()
 
     days = sorted((phys, service) for _iid, _sup, phys, service, _q in rows)
-    # 06:00 arrival serves day 2; 10:00 arrival (after 08:00 production start)
-    # serves day 3; the overdue PO is excluded entirely.
-    assert days == [(2, 2), (2, 3)], days
+    # 06:00 and 09:00 (inside the 2h service grace past 08:00 production start)
+    # serve day 2; 14:00 (past grace) serves day 3; the overdue PO is excluded.
+    assert days == [(2, 2), (2, 2), (2, 3)], days
 
 
 # ---------------------------------------------------------------------------
@@ -1544,3 +1545,51 @@ def test_plan_deterministic_across_fresh_dbs():
             session.close()
 
     assert _one_run() == _one_run()
+
+
+# ---------------------------------------------------------------------------
+# Service grace: the morning plan runs minutes after day-open (realtime holds
+# advance the clock during the LLM forecast).  Within the grace window the
+# first feasible delivery must NOT slip a full day — demand tight against the
+# lead time stays covered, and the passed-cutoff row is expedited (order_date
+# clamped to now → the execute pass places its PO immediately).
+# ---------------------------------------------------------------------------
+
+
+def test_post_open_build_expedites_within_grace(bus, session_factory):
+    ing_id = _seed_ingredient(session_factory, on_hand=300.0, safety_stock=0.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=1.0)
+    _seed_supplier(session_factory, ing_id, lead_time_days=3.0, pack_size=100.0)
+
+    now = float(DAY_OPEN_OFFSET + 16 * 60)  # 08:16, day 0
+    bus.sim_time = now
+    # on_hand 300 covers days 0-2 at 100/day; day 3+ needs the day-3 delivery.
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=100.0, days=7)
+
+    opt, proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=7.0)
+
+    assert bus.live(type=SignalType.INGREDIENT_UNCOVERABLE) == [], (
+        "16 minutes past open must not slip the first delivery a full day"
+    )
+    session = session_factory()
+    try:
+        rows = (
+            session.query(PlannedOrder)
+            .filter(PlannedOrder.status.in_(["planned", "at_risk", "uncoverable"]))
+            .order_by(PlannedOrder.delivery_date)
+            .all()
+        )
+        assert rows, "no planned rows built"
+        first = rows[0]
+        # First delivery keeps the day-3 slot (inside grace), not day 4.
+        assert int(float(first.delivery_date) // SECONDS_PER_DAY) == 3, first.delivery_date
+        # Order-by (day 0 08:00) already passed → expedited, due immediately.
+        assert first.status == "at_risk"
+        assert float(first.order_date) == now
+        assert "expedited" in (first.reason or "")
+    finally:
+        session.close()
+
+    opt.execute_due_planned_orders()
+    assert proc.calls, "expedited row did not convert to a PO"
