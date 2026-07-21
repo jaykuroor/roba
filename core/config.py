@@ -217,6 +217,14 @@ PROCUREMENT_JITTER_FRACTION = float(os.getenv("PROCUREMENT_JITTER_FRACTION", "0.
 # (~1e-8) but below any operationally meaningful shortage (e.g. 1g flour).
 COVERAGE_EPSILON = float(os.getenv("COVERAGE_EPSILON", "0.01"))
 
+# PROCUREMENT_COVERAGE_TOLERANCE: per-ingredient shortfall (base units) the plan's
+# FEFO cross-check treats as rounding noise between the integer-pack MILP and the
+# continuous day-by-day sim, rather than a real gap.  0.01 (COVERAGE_EPSILON) is
+# too tight here — it flips coverage_ok and fires a false INGREDIENT_UNCOVERABLE on
+# a sub-gram discrepancy that is un-orderable anyway (packs are ≥1000g).  1g is far
+# below any operationally meaningful shortage yet absorbs the model-rounding jitter.
+PROCUREMENT_COVERAGE_TOLERANCE = float(os.getenv("PROCUREMENT_COVERAGE_TOLERANCE", "1.0"))
+
 # Vertex AI Live API (Stream B5)
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio")
 GEMINI_LIVE_CALL_MODEL = os.getenv("GEMINI_LIVE_CALL_MODEL", "gemini-live-2.5-flash-native-audio")

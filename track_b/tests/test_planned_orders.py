@@ -1547,6 +1547,59 @@ def test_plan_deterministic_across_fresh_dbs():
     assert _one_run() == _one_run()
 
 
+def test_replan_same_db_is_idempotent():
+    """A re-run on an UNCHANGED world must not churn — the exact user complaint
+    that "the plan right after the forecaster and the plan after re-run are
+    vastly different".  Build twice on the SAME db: the active plan must be
+    identical and the re-run must supersede nothing.
+
+    Regression for the CBC non-determinism (no fixed seed / multi-threaded
+    incumbent) that made consecutive solves of the same problem diverge.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import core.db as db
+    from core.bus import SignalBus
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    db.Base.metadata.create_all(bind=engine)
+    sf = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    b = SignalBus(sf)
+    ing_id = _seed_ingredient(sf, on_hand=300.0, safety_stock=0.0)
+    item_id = _seed_dish(sf, ing_id, recipe_qty=1.0)
+    _seed_supplier(sf, ing_id, lead_time_days=1.0, pack_size=500.0)
+    b.sim_time = 0.0
+    _emit_horizon(b, menu_item_id=item_id, daily_qty=100.0, days=7)
+    opt, _ = _make_optimizer(b, sf)
+
+    def _active():
+        s = sf()
+        try:
+            return sorted(
+                (p.ingredient_id, p.supplier_id, round(float(p.qty), 3),
+                 round(float(p.delivery_date or 0.0), 1), p.status)
+                for p in s.query(PlannedOrder).all()
+                if p.status in ("planned", "at_risk", "uncoverable")
+            )
+        finally:
+            s.close()
+
+    opt.build_procurement_plan(horizon_days=7.0)
+    first = _active()
+    opt.build_procurement_plan(horizon_days=7.0)   # re-run, identical world
+    assert _active() == first, "re-run on an unchanged world changed the plan"
+
+    s = sf()
+    try:
+        superseded = (
+            s.query(PlannedOrder).filter(PlannedOrder.status == "superseded").count()
+        )
+    finally:
+        s.close()
+    assert superseded == 0, f"idempotent re-run must supersede nothing, got {superseded}"
+
+
 # ---------------------------------------------------------------------------
 # Service grace: the morning plan runs minutes after day-open (realtime holds
 # advance the clock during the LLM forecast).  Within the grace window the

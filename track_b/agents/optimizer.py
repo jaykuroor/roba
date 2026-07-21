@@ -1256,6 +1256,7 @@ class InventoryOptimizer(BaseAgent):
                         plan_arrivals_by_day=_assemble_plan_arrivals(),
                         safety_stock={iid: d["safety_stock"] for iid, d in ingredients_data.items()},
                         ingredient_shelf_life=_fefo_sl,
+                        coverage_tolerance=config.PROCUREMENT_COVERAGE_TOLERANCE,
                     )
 
                 _fefo_result = _run_fefo()

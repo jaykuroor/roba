@@ -1708,6 +1708,37 @@ def test_free_delivery_rebate_fires_above_threshold():
     assert promo.total_cost < base.total_cost - 1e-6, (base.total_cost, promo.total_cost)
 
 
+def test_free_delivery_flips_supplier_choice():
+    """When a pricier-per-unit supplier's free-delivery promo makes its LANDED
+    cost the lowest, the cost-optimal plan must switch to it — promotions are
+    utilised exactly when (and only when) they yield the cheapest plan.
+
+    100u demand.  sup1 goods €1.00 + €8 deliv = €108; sup2 goods €0.99 + €6 =
+    €105 → without a promo sup2 wins.  sup1 free delivery → €100 < €105 → sup1.
+    """
+    from track_b.procurement.terms import FreeDeliveryOffer
+    n = 4
+    common = dict(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=1.0, pack=100.0), _cat(2, 1, price=0.99, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0, dc=8.0), _sup(2, lead=1.0, dc=6.0)],
+        demand_by_day={1: {d: 25.0 for d in range(n)}},   # 100 units total
+        on_hand={1: 0.0},
+        n_days=n,
+    )
+    base = _run(**common, params={"slack_penalty": 1000.0})
+    assert {o.supplier_id for o in base.orders if o.qty > 0} == {2}, "cheaper goods win without promo"
+
+    promo = _run(**common, params={
+        "slack_penalty": 1000.0,
+        "free_delivery_offers": [FreeDeliveryOffer(supplier_id=1, min_order_value=50.0,
+                                                   remaining_orders=None, term_id=1)],
+    })
+    assert {o.supplier_id for o in promo.orders if o.qty > 0} == {1}, (
+        "sup1's free delivery makes it cheapest → plan must switch to it")
+    assert promo.total_cost < base.total_cost - 1e-6
+
+
 def test_order_cutoff_respects_time_of_day():
     """A delivery day whose order-by cutoff has already passed must not be
     planned (no born-'Late' rows).  At 14:00 with lead=1 day and delivery at

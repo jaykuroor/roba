@@ -63,6 +63,39 @@ def test_mascarpone_covered_with_3000g():
     assert 12 not in result["short_by_ing"]
 
 
+def test_subunit_gap_absorbed_by_coverage_tolerance():
+    """A sub-unit shortfall (integer-pack MILP vs continuous FEFO rounding) must
+    NOT flip coverage_ok or emit a short when a pack-scale tolerance is passed.
+
+    Reproduces the live 0.3g "Basil" phantom that flipped coverage_ok=False and
+    fired a false INGREDIENT_UNCOVERABLE on an otherwise-covered plan.
+    """
+    common = dict(
+        n_days=2,
+        demand_by_day={4: {0: 100.3}},        # 0.3 more than on-hand
+        on_hand={4: 100.0},
+        lots_by_ing={4: [[100.0, _INF]]},
+        open_po_arrivals_by_day={},
+        plan_arrivals_by_day={},
+        safety_stock={},
+    )
+    tight = project_fefo_coverage(**common)                 # default tight epsilon
+    assert not tight["coverage_ok"]
+    assert abs(tight["total_short"] - 0.3) < 1e-6
+
+    toler = project_fefo_coverage(**common, coverage_tolerance=1.0)
+    assert toler["coverage_ok"], "sub-unit rounding gap must be tolerated"
+    assert toler["total_short"] == 0.0
+    assert 4 not in toler["short_by_ing"]
+
+    # A real (pack-scale) shortage still surfaces despite the tolerance.
+    big = dict(common)
+    big["demand_by_day"] = {4: {0: 250.0}}
+    real = project_fefo_coverage(**big, coverage_tolerance=1.0)
+    assert not real["coverage_ok"]
+    assert abs(real["total_short"] - 150.0) < 1e-6
+
+
 def test_mascarpone_covered_depends_on_planned():
     """coverage_depends_on_planned must be True when the second pack is still a planned order."""
     result = _fefo(

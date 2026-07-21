@@ -171,6 +171,7 @@ def project_fefo_coverage(
     plan_arrivals_by_day: Dict[int, Dict[int, float]],
     safety_stock: Dict[int, float],
     ingredient_shelf_life: Optional[Dict[int, Optional[float]]] = None,
+    coverage_tolerance: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Day-by-day FEFO inventory simulation — the single source of truth for
     coverage after all netting, R1 reconciliation, and hysteresis is done.
@@ -204,6 +205,14 @@ def project_fefo_coverage(
                                    covers demand (conservative: open POs also shifted).
     """
     _sl = ingredient_shelf_life or {}
+
+    # Coverage tolerance: a per-ingredient shortfall below this is rounding noise
+    # between the integer-pack MILP and this continuous day-by-day sim (observed:
+    # a 0.3g Basil "gap" flipping coverage_ok=False and emitting a false
+    # INGREDIENT_UNCOVERABLE).  Callers pass a sane pack-scale value; default is
+    # the tight COVERAGE_EPSILON so existing callers are unaffected.
+    from core.config import COVERAGE_EPSILON as _COV_EPS  # noqa: PLC0415
+    _tol = float(coverage_tolerance) if coverage_tolerance is not None else _COV_EPS
 
     # ---- helpers ----
 
@@ -285,7 +294,7 @@ def project_fefo_coverage(
                 if remaining > 1e-6:
                     ing_short += remaining
 
-            if ing_short > 1e-6:
+            if ing_short > _tol:
                 short_by_ing[iid] = ing_short
                 total_short += ing_short
 
@@ -311,7 +320,6 @@ def project_fefo_coverage(
         {iid: dict(d_map) for iid, d_map in open_po_arrivals_by_day.items()},
         demand_by_day,
     )
-    from core.config import COVERAGE_EPSILON as _COV_EPS  # noqa: PLC0415
     coverage_depends_on_planned = committed_short > _COV_EPS
 
     # ---- +1-day delay simulation (shift ALL arrivals one day later) ----
@@ -1564,7 +1572,18 @@ def _solve_milp(
     # Pass 1 — cash-optimal solve
     # ------------------------------------------------------------------
     milp_time_limit = float(params.get("milp_time_limit", 30))
-    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=milp_time_limit)
+    # Deterministic solve: a single CBC thread with fixed random seeds so
+    # identical inputs always yield the identical plan.  CBC's multi-threaded
+    # search is wall-clock-nondeterministic (different incumbents per run), which
+    # is the low-level source of "the re-run gives a different plan".  Proven-
+    # optimal solves are pinned by the objective's tiebreakers; the seed only
+    # matters for the time-limited incumbent path, but we fix it regardless.
+    solver = pulp.PULP_CBC_CMD(
+        msg=0,
+        timeLimit=milp_time_limit,
+        threads=1,
+        options=["randomCbcSeed", "42", "randomSeed", "42"],
+    )
     # Set True whenever an accepted solve was NOT proven optimal (wall-clock
     # time limit hit under load).  Such incumbents can leave avoidable
     # shortfalls and differ run-to-run — surfaced as PlanSolution.time_limited.
