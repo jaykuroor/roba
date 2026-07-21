@@ -1270,3 +1270,277 @@ def test_stale_horizon_days_mapped_by_start_not_index(bus, session_factory):
         )
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# FEFO validator must value kept rows at their REFRESHED qty (kept_updates),
+# not the stale DB qty — otherwise a rebuild that raises a kept row's quantity
+# undercounts plan arrivals and emits a false INGREDIENT_UNCOVERABLE.
+# ---------------------------------------------------------------------------
+
+
+def test_fefo_check_uses_refreshed_kept_row_qty(bus, session_factory):
+    ing_id = _seed_ingredient(session_factory, on_hand=300.0, safety_stock=0.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=1.0)
+    _seed_supplier(session_factory, ing_id, lead_time_days=1.0, pack_size=500.0)
+
+    bus.sim_time = 0.0
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=100.0, days=7)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=7.0)
+    assert bus.live(type=SignalType.INGREDIENT_UNCOVERABLE) == []
+
+    # Shrink one planned row by a pack — simulates an older plan whose kept row
+    # the current rebuild must top back up via kept_updates.
+    session = session_factory()
+    try:
+        row = (
+            session.query(PlannedOrder)
+            .filter(PlannedOrder.status.in_(["planned", "at_risk"]))
+            .order_by(PlannedOrder.delivery_date)
+            .first()
+        )
+        assert row is not None
+        row_id, orig_qty = row.id, float(row.qty)
+        row.qty = max(0.0, orig_qty - 500.0)
+        session.commit()
+    finally:
+        session.close()
+
+    # Same horizon → hysteresis keeps the row and refreshes its qty. The FEFO
+    # check must see the refreshed qty, not the shrunken DB value.
+    opt.build_procurement_plan(horizon_days=7.0)
+
+    assert bus.live(type=SignalType.INGREDIENT_UNCOVERABLE) == [], (
+        "FEFO validator read the stale kept-row qty and flagged a phantom gap"
+    )
+    session = session_factory()
+    try:
+        run = (
+            session.query(ProcurementPlanRun)
+            .order_by(ProcurementPlanRun.id.desc())
+            .first()
+        )
+        assert run is not None and bool(run.coverage_ok), (
+            f"coverage_ok={run and run.coverage_ok}, total_short={run and run.total_short}"
+        )
+        kept = session.get(PlannedOrder, row_id)
+        assert kept is not None and float(kept.qty) == orig_qty, (
+            f"kept row qty not refreshed: {kept and kept.qty} != {orig_qty}"
+        )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# R1 residual must use the SAME overdue exclusion as the inbound credit: a
+# stuck PO (overdue > 1 day) is excluded from both, so it can never leave a
+# phantom residual that suppresses legitimate planned rows.
+# ---------------------------------------------------------------------------
+
+
+def _emit_horizon_at(bus, menu_item_id, daily_qty, days, start_day):
+    day_entries = [
+        {
+            "day_index": d,
+            "start": float((start_day + d) * SECONDS_PER_DAY),
+            "end": float((start_day + d + 1) * SECONDS_PER_DAY),
+            "items": [{"menu_item_id": menu_item_id, "qty": daily_qty, "baseline": daily_qty}],
+        }
+        for d in range(days)
+    ]
+    bus.emit(
+        type=SignalType.DEMAND_FORECAST_HORIZON,
+        payload={
+            "horizon_days": days,
+            "generated_at": float(bus.sim_time),
+            "days": day_entries,
+            "item_daily_baseline_median": {str(menu_item_id): daily_qty},
+        },
+        source="test",
+    )
+
+
+def test_overdue_stuck_po_does_not_suppress_plan(bus, session_factory):
+    ing_id = _seed_ingredient(session_factory, on_hand=300.0, safety_stock=0.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=1.0)
+    sup_id = _seed_supplier(session_factory, ing_id, lead_time_days=1.0, pack_size=500.0)
+
+    # A placed PO that is 4 days overdue: the C1 phantom filter excludes it from
+    # inbound credit, so R1 must exclude it from gross too.
+    session = session_factory()
+    try:
+        po = PurchaseOrder(
+            supplier_id=sup_id, status="placed", created_at=0.0,
+            expected_delivery=float(1 * SECONDS_PER_DAY), total_cost=100.0,
+            created_by="test",
+        )
+        session.add(po)
+        session.flush()
+        session.add(PurchaseOrderLine(
+            po_id=po.id, ingredient_id=ing_id, qty=100000.0,
+            unit="g", unit_price=1.0, line_total=100000.0,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    bus.sim_time = float(5 * SECONDS_PER_DAY)
+    _emit_horizon_at(bus, item_id, daily_qty=100.0, days=7, start_day=5)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=7.0)
+
+    session = session_factory()
+    try:
+        active_rows = session.query(PlannedOrder).filter(
+            PlannedOrder.status.in_(["planned", "at_risk"])
+        ).count()
+        assert active_rows >= 1, (
+            "stuck overdue PO left a phantom R1 residual that suppressed the plan"
+        )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# _open_po_pipeline_rows: overdue exclusion + service-day shift semantics.
+# ---------------------------------------------------------------------------
+
+
+def test_open_po_pipeline_rows_service_shift_and_overdue(bus, session_factory):
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0)
+    sup_id = _seed_supplier(session_factory, ing_id, lead_time_days=1.0)
+
+    session = session_factory()
+    try:
+        def _po(exp):
+            po = PurchaseOrder(
+                supplier_id=sup_id, status="placed", created_at=0.0,
+                expected_delivery=exp, total_cost=1.0, created_by="test",
+            )
+            session.add(po)
+            session.flush()
+            session.add(PurchaseOrderLine(
+                po_id=po.id, ingredient_id=ing_id, qty=10.0,
+                unit="g", unit_price=1.0, line_total=10.0,
+            ))
+
+        _po(float(2 * SECONDS_PER_DAY + 6 * 3600))    # day 2 @ 06:00 → before prod start
+        _po(float(2 * SECONDS_PER_DAY + 10 * 3600))   # day 2 @ 10:00 → after prod start
+        _po(float(-3 * SECONDS_PER_DAY))              # 3 days overdue → excluded
+        session.commit()
+    finally:
+        session.close()
+
+    bus.sim_time = 0.0
+    opt, _proc = _make_optimizer(bus, session_factory)
+    session = session_factory()
+    try:
+        rows = opt._open_po_pipeline_rows(session, [ing_id], now=0.0)
+    finally:
+        session.close()
+
+    days = sorted((phys, service) for _iid, _sup, phys, service, _q in rows)
+    # 06:00 arrival serves day 2; 10:00 arrival (after 08:00 production start)
+    # serves day 3; the overdue PO is excluded entirely.
+    assert days == [(2, 2), (2, 3)], days
+
+
+# ---------------------------------------------------------------------------
+# Self-heal: a coverage gap introduced by our own suppression (anti-jitter here)
+# must be repaired by restoring the suppressed rows — not surfaced as a false
+# "no supplier can deliver" alert.
+# ---------------------------------------------------------------------------
+
+
+def test_self_heal_restores_jitter_suppressed_orders(bus, session_factory, monkeypatch):
+    monkeypatch.setattr(config, "PROCUREMENT_JITTER_FRACTION", 0.95)
+
+    ing_id = _seed_ingredient(session_factory, on_hand=300.0, safety_stock=0.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=1.0)
+    sup_id = _seed_supplier(session_factory, ing_id, lead_time_days=1.0, pack_size=500.0)
+
+    # Existing pipeline (200g arriving day 1) → the anti-jitter filter applies to
+    # top-ups; with a 0.95 fraction it wrongly suppresses a needed 200g top-up.
+    session = session_factory()
+    try:
+        po = PurchaseOrder(
+            supplier_id=sup_id, status="placed", created_at=0.0,
+            expected_delivery=float(1 * SECONDS_PER_DAY), total_cost=2.0,
+            created_by="test",
+        )
+        session.add(po)
+        session.flush()
+        session.add(PurchaseOrderLine(
+            po_id=po.id, ingredient_id=ing_id, qty=200.0,
+            unit="g", unit_price=1.0, line_total=200.0,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    bus.sim_time = 0.0
+    _emit_horizon(bus, menu_item_id=item_id, daily_qty=100.0, days=7)
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan(horizon_days=7.0)
+
+    assert bus.live(type=SignalType.INGREDIENT_UNCOVERABLE) == [], (
+        "suppression-introduced gap surfaced as a false uncoverable alert"
+    )
+    session = session_factory()
+    try:
+        run = (
+            session.query(ProcurementPlanRun)
+            .order_by(ProcurementPlanRun.id.desc())
+            .first()
+        )
+        assert run is not None and bool(run.coverage_ok)
+        active_rows = session.query(PlannedOrder).filter(
+            PlannedOrder.status.in_(["planned", "at_risk"])
+        ).count()
+        assert active_rows >= 1, "suppressed top-up was not restored"
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Determinism: identical seeds on two fresh DBs must yield identical plans.
+# ---------------------------------------------------------------------------
+
+
+def test_plan_deterministic_across_fresh_dbs():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import core.db as db
+    from core.bus import SignalBus
+
+    def _one_run():
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        db.Base.metadata.create_all(bind=engine)
+        sf = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        b = SignalBus(sf)
+        ing_id = _seed_ingredient(sf, on_hand=300.0, safety_stock=0.0)
+        item_id = _seed_dish(sf, ing_id, recipe_qty=1.0)
+        _seed_supplier(sf, ing_id, lead_time_days=1.0, pack_size=500.0)
+        b.sim_time = 0.0
+        _emit_horizon(b, menu_item_id=item_id, daily_qty=100.0, days=7)
+        opt, _ = _make_optimizer(b, sf)
+        opt.build_procurement_plan(horizon_days=7.0)
+        session = sf()
+        try:
+            return [
+                (round(float(p.qty), 3), round(float(p.order_date), 1),
+                 round(float(p.delivery_date or 0.0), 1), p.status)
+                for p in session.query(PlannedOrder)
+                .order_by(PlannedOrder.id)
+                .all()
+                if p.status != "superseded"
+            ]
+        finally:
+            session.close()
+
+    assert _one_run() == _one_run()

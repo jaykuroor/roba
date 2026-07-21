@@ -231,7 +231,7 @@ def project_fefo_coverage(
         total_short = 0.0
         short_by_ing: Dict[int, float] = {}
 
-        all_iids = set(demand_map.keys()) | set(arrivals_by_day.keys())
+        all_iids = sorted(set(demand_map.keys()) | set(arrivals_by_day.keys()))
         for iid in all_iids:
             d_map = demand_map.get(iid) or {}
             arr_map = arrivals_by_day.get(iid) or {}
@@ -780,7 +780,7 @@ def _solve_milp(
         return PlanSolution(orders=[], total_cost=0.0, method="milp",
                             rationale="No active ingredients require ordering.")
 
-    all_sup_ids = list({int(s["id"]) for s in suppliers})
+    all_sup_ids = sorted({int(s["id"]) for s in suppliers})  # deterministic var order
 
     # Cheapest available unit price per ingredient — used to value-scale the
     # soft safety-buffer and waste penalties.
