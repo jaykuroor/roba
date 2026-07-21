@@ -157,12 +157,24 @@ class ForecastJobRunner:
             self._finish(job_id, "stale", result={"reason": "window_changed_before_start"})
             return
 
-        if job["kind"] == DETERMINISTIC_FORECAST:
-            self._run_deterministic(job)
-        elif job["kind"] == LLM_AUTHORITY_FORECAST:
-            self._run_llm_authority(job)
-        elif job["kind"] == LLM_FINALIZER:
-            self._run_llm_finalizer(job)
+        # While a forecast/agent job runs, the orchestrator syncs the sim
+        # clock to realtime (1 sim-min = 1 real-min).
+        hold = f"forecast:{job_id}"
+        labels = {
+            DETERMINISTIC_FORECAST: "Demand forecast",
+            LLM_AUTHORITY_FORECAST: "Demand forecast (LLM)",
+            LLM_FINALIZER: "Forecast review (LLM)",
+        }
+        self.bus.hold_realtime(hold, labels.get(job["kind"], "Forecast job"))
+        try:
+            if job["kind"] == DETERMINISTIC_FORECAST:
+                self._run_deterministic(job)
+            elif job["kind"] == LLM_AUTHORITY_FORECAST:
+                self._run_llm_authority(job)
+            elif job["kind"] == LLM_FINALIZER:
+                self._run_llm_finalizer(job)
+        finally:
+            self.bus.release_realtime(hold)
 
     def _run_deterministic(self, job: Dict[str, Any]) -> None:
         try:

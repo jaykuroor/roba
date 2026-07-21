@@ -1050,6 +1050,7 @@ class SimSettings(Base):
     availability_oos_mode = mapped_column(String, default="threshold")  # "threshold" | "zero"
     batch_auto_qty = mapped_column(Integer, default=0)  # bool 0/1 — forecaster may adjust batch quantities without approval
     staff_checkin_mode = mapped_column(String, default="sim_auto")  # "sim_auto" | "manual" — cook-desk staff board
+    auto_plan_on_forecast = mapped_column(Integer, default=1)  # bool 0/1 — every forecast triggers procurement plan + due orders
 
     def __repr__(self):
         return (f"<SimSettings id={self.id} base_orders_per_day={self.base_orders_per_day} "

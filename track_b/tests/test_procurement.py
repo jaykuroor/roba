@@ -188,3 +188,95 @@ def test_po_total_reflects_item_and_volume_discounts(bus, session_factory, orche
         )
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# Promo terms at billing time (free_delivery waiver, threshold_discount,
+# MOV-gated remaining_orders consumption)
+# ---------------------------------------------------------------------------
+
+
+def _seed_term(session_factory, supplier_id, term_type, value=0.0, mov=0.0,
+               remaining_orders=3):
+    from core.models import SupplierTerm
+    session = session_factory()
+    try:
+        t = SupplierTerm(
+            supplier_id=supplier_id, ingredient_id=None, term_type=term_type,
+            value=value, scope="all", effective_at=0.0, expiry_kind="orders",
+            remaining_orders=remaining_orders, status="active",
+            min_order_value=mov, created_at=0.0,
+        )
+        session.add(t)
+        session.commit()
+        return t.id
+    finally:
+        session.close()
+
+
+def _term_state(session_factory, term_id):
+    from core.models import SupplierTerm
+    session = session_factory()
+    try:
+        t = session.get(SupplierTerm, term_id)
+        return t.remaining_orders, t.status
+    finally:
+        session.close()
+
+
+def test_free_delivery_waived_and_consumed_only_when_qualifying(bus, session_factory, orchestrator):
+    """A 'free delivery on orders ≥ €100, next 3 orders' promo: a €20 order pays
+    the fee and keeps all 3 uses; a €150 order ships free and consumes one use."""
+    supplier_id = _seed_supplier(session_factory)
+    term_id = _seed_term(session_factory, supplier_id, "free_delivery",
+                         mov=100.0, remaining_orders=3)
+    proc = Procurement(bus, session_factory, orchestrator, _FakeLedger(), approvals=_FakeApprovals())
+    bus.sim_time = 0.0
+
+    small = proc.create_po(
+        supplier_id=supplier_id,
+        lines=[{"ingredient_id": 1, "qty": 20.0, "unit": "g", "unit_price": 1.0}],
+        delivery_charge=5.0,
+    )
+    session = session_factory()
+    try:
+        assert session.get(PurchaseOrder, small.id).total_cost == pytest.approx(25.0)
+    finally:
+        session.close()
+    assert _term_state(session_factory, term_id) == (3, "active"), (
+        "an order below the promo MOV must not burn a promo use"
+    )
+
+    big = proc.create_po(
+        supplier_id=supplier_id,
+        lines=[{"ingredient_id": 1, "qty": 150.0, "unit": "g", "unit_price": 1.0}],
+        delivery_charge=5.0,
+    )
+    session = session_factory()
+    try:
+        assert session.get(PurchaseOrder, big.id).total_cost == pytest.approx(150.0), (
+            "delivery fee must be waived when the promo threshold is met"
+        )
+    finally:
+        session.close()
+    assert _term_state(session_factory, term_id) == (2, "active")
+
+
+def test_threshold_discount_term_applied_to_po_total(bus, session_factory, orchestrator):
+    """A negotiated '10% off orders ≥ €100' term must show up on the billed PO
+    total, not just in the planner's objective."""
+    supplier_id = _seed_supplier(session_factory)
+    _seed_term(session_factory, supplier_id, "threshold_discount",
+               value=0.10, mov=100.0, remaining_orders=5)
+    proc = Procurement(bus, session_factory, orchestrator, _FakeLedger(), approvals=_FakeApprovals())
+    bus.sim_time = 0.0
+
+    po = proc.create_po(
+        supplier_id=supplier_id,
+        lines=[{"ingredient_id": 1, "qty": 200.0, "unit": "g", "unit_price": 1.0}],
+    )
+    session = session_factory()
+    try:
+        assert session.get(PurchaseOrder, po.id).total_cost == pytest.approx(180.0)
+    finally:
+        session.close()

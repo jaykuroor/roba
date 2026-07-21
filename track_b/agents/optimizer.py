@@ -40,6 +40,7 @@ from core.models import (
     PurchaseOrderLine,
     Recipe,
     RecipeLine,
+    SimSettings,
     SourcingRun,
     Supplier,
     SupplierCatalog,
@@ -57,6 +58,24 @@ GROUPS = ["inventory", "procurement"]
 def _import_solve_sourcing() -> Any:
     from track_b.procurement.sourcing import solve_sourcing  # noqa: PLC0415
     return solve_sourcing
+
+
+def _horizon_day_offset(day: Dict[str, Any], now_day: int) -> int:
+    """Offset of a horizon day from *today*, anchored on the day's absolute
+    ``start`` timestamp.
+
+    ``day_index`` is relative to when the horizon was GENERATED, not to when it
+    is consumed.  Mapping day_index directly onto today shifts all demand when
+    the horizon is stale (e.g. plan rebuilt after a day rollover but before the
+    morning forecast) — yesterday's demand lands on today, producing spurious
+    "cannot be supplied" shortfalls that flip on the next replan.  Negative
+    offsets mean the day is already in the past and must be dropped.
+    """
+    start = day.get("start")
+    if start is not None:
+        return int(float(start) // SECONDS_PER_DAY) - now_day
+    return int(day.get("day_index") or 0)
+
 
 # JSON schema for the LLM optimizer action list.
 _OPTIMIZE_SCHEMA: Dict[str, Any] = {
@@ -156,11 +175,27 @@ class InventoryOptimizer(BaseAgent):
             payload["ingredient_id"] = ingredient_id
             self._propose_promo(payload)
         elif signal.type == SignalType.DEMAND_FORECAST_HORIZON.value:
-            # Re-plan when the forecaster emits a fresh horizon (e.g. after a parade event).
+            # Re-plan when the forecaster emits a fresh horizon — which now
+            # happens after every completed forecast run. With auto-plan on
+            # (sim_settings.auto_plan_on_forecast, default), also re-run the
+            # sourcing solver and place any now-due planned orders so a fresh
+            # forecast immediately turns into POs when valid.  Due rows are
+            # executed BEFORE the build too: their order-by window has passed,
+            # so the rebuild can no longer regenerate them — converting them to
+            # POs first keeps that supply credited as inbound.
+            _auto = self._auto_plan_on_forecast()
+            if _auto:
+                self.execute_due_planned_orders()
             self.build_procurement_plan()
+            if _auto:
+                self.run_sourcing_plan()
+                self.execute_due_planned_orders()
         elif signal.type == SignalType.WASTE_EVENT.value:
-            # Sudden spoilage: stock dropped unexpectedly — re-plan immediately.
+            # Sudden spoilage: stock dropped unexpectedly — re-plan immediately
+            # and place any now-due rows (a spoilage gap must not sit as a plan).
+            self.execute_due_planned_orders()
             self.build_procurement_plan()
+            self.execute_due_planned_orders()
         elif signal.type == SignalType.MENU_TOGGLE_REQUEST.value:
             payload = signal.payload or {}
             menu_item_id = payload.get("menu_item_id") or self._resolve_menu_item_id(
@@ -180,6 +215,8 @@ class InventoryOptimizer(BaseAgent):
             # A supplier offer was applied (manually or auto) — re-cost the forward plan,
             # re-run the sourcing solver, then immediately place any now-due orders so
             # at-risk stock is secured without waiting for the next reorder sweep (§W1a).
+            # Due rows are converted BEFORE the build (see the horizon branch above).
+            self.execute_due_planned_orders()
             self.build_procurement_plan()
             self.run_sourcing_plan()
             self.execute_due_planned_orders()
@@ -216,6 +253,18 @@ class InventoryOptimizer(BaseAgent):
         # execute pass prevents those rows from sitting visible-and-unexecuted for
         # a full FORECAST_INTERVAL_SIM_S.  No recursion — execute never calls build.
         self.execute_due_planned_orders()
+
+    def _auto_plan_on_forecast(self) -> bool:
+        """sim_settings.auto_plan_on_forecast (default on when unset)."""
+        session = self.db_session_factory()
+        try:
+            settings = session.get(SimSettings, 1)
+            if settings is None:
+                return True
+            value = getattr(settings, "auto_plan_on_forecast", None)
+            return True if value is None else bool(value)
+        finally:
+            session.close()
 
     def _on_hand_above_reorder(self, ingredient_id: int) -> bool:
         session = self.db_session_factory()
@@ -267,7 +316,9 @@ class InventoryOptimizer(BaseAgent):
         # beyond where we have real data (which caused back-half zero-demand rows
         # and under-sized orders).  If the caller provides an explicit horizon_days,
         # cap it at the forecast span; with no live forecast fall back gracefully.
-        forecast_span = (max(d.get("day_index", 0) for d in days_payload) + 1) if days_payload else 0
+        # Offsets are anchored on each day's absolute start (stale-horizon safe).
+        day_offsets = [_horizon_day_offset(d, now_day) for d in days_payload]
+        forecast_span = (max(day_offsets) + 1) if days_payload else 0
         if forecast_span > 0:
             n_days = forecast_span if horizon_days is None else min(math.ceil(float(horizon_days)), forecast_span)
         else:
@@ -319,9 +370,9 @@ class InventoryOptimizer(BaseAgent):
                     recipe_qty[mid][ing_id] = raw_q / yield_factors.get(ing_id, 1.0)
 
             # Accumulate per-day ingredient demand from horizon signal.
-            for day in days_payload:
-                day_idx = int(day.get("day_index") or 0)
-                if day_idx >= n_days:
+            # day_idx < 0 = demand for a day already in the past (stale horizon) — drop.
+            for day, day_idx in zip(days_payload, day_offsets):
+                if day_idx < 0 or day_idx >= n_days:
                     continue
                 for item_entry in day.get("items") or []:
                     menu_item_id = item_entry.get("menu_item_id")
@@ -759,6 +810,9 @@ class InventoryOptimizer(BaseAgent):
                     "margin_by_ing": _margin_by_ing,
                     "production_start_hour": config.PRODUCTION_START_HOUR,
                     "scheduled_supplier_days": scheduled_supplier_days,
+                    # Time-of-day so the solver never schedules a delivery whose
+                    # order-by cutoff already passed (no born-late plan rows).
+                    "now_time_of_day_s": now - now_day * SECONDS_PER_DAY,
                     "robust_hard_delay": (
                         robust if robust is not None else config.RELIABILITY_ROBUST_HARD_DELAY
                     ),
@@ -1213,8 +1267,9 @@ class InventoryOptimizer(BaseAgent):
                             short_qty=_sn,
                             unit=_uo_unit,
                             reason=(
-                                f"No lead-feasible / in-stock supply: "
-                                f"{_sn:.0f}{_uo_unit} short on time"
+                                f"{_sn:.0f}{_uo_unit} of near-term demand cannot be covered "
+                                f"in time — no supplier can deliver before it is needed "
+                                f"(lead time / availability)"
                             ),
                         ).model_dump(),
                         dedup_key=f"uncoverable:{_co_iid}",
@@ -1295,13 +1350,13 @@ class InventoryOptimizer(BaseAgent):
     _PROMO_TERM_TYPES = ("free_goods", "free_delivery", "threshold_discount")
 
     @staticmethod
-    def _promo_expiry_phrase(term: Any) -> str:
+    def _promo_expiry_phrase(term: Any, now: float) -> str:
         """Human phrase describing how much of a multi-use promo remains."""
         if term.expiry_kind == "orders":
             n = int(term.remaining_orders or 0)
             return f"still available for {n} more order{'s' if n != 1 else ''}"
         if term.expiry_kind == "date" and term.expires_at:
-            days = max(0, round((float(term.expires_at) - float(term.effective_at or 0)) / SECONDS_PER_DAY))
+            days = max(0, round((float(term.expires_at) - now) / SECONDS_PER_DAY))
             return f"still available for ~{days} more day{'s' if days != 1 else ''}"
         return "still available"
 
@@ -1338,7 +1393,7 @@ class InventoryOptimizer(BaseAgent):
             )
             .all()
         )
-        live = [t for t in terms if self._term_is_live(t)]
+        live = [t for t in terms if self._term_is_live(t, now)]
 
         # Max single-delivery order value per supplier from the planned orders.
         ov_by_sup: Dict[int, float] = {}
@@ -1371,7 +1426,7 @@ class InventoryOptimizer(BaseAgent):
                 ).all()
             }
             offer_lines = [self._promo_offer_desc(t, ing_names.get(t.free_ingredient_id, "")) for t in unused]
-            avail = "; ".join(sorted({self._promo_expiry_phrase(t) for t in unused}))
+            avail = "; ".join(sorted({self._promo_expiry_phrase(t, now) for t in unused}))
             mov = max(float(t.min_order_value or 0.0) for t in unused)
             summary = (
                 f"Promotion from {sup_name} evaluated but not used — "
@@ -1412,10 +1467,10 @@ class InventoryOptimizer(BaseAgent):
                 session.delete(c)
 
     @staticmethod
-    def _term_is_live(t: Any) -> bool:
+    def _term_is_live(t: Any, now: float) -> bool:
         """Mirror terms.apply_supplier_terms._term_is_live (order/date expiry)."""
         if t.expiry_kind == "date" and t.expires_at is not None:
-            return True  # date validity already filtered by status; treat as live
+            return float(t.expires_at) >= now
         if t.expiry_kind == "orders":
             return (t.remaining_orders or 0) > 0
         return True
@@ -1951,12 +2006,15 @@ class InventoryOptimizer(BaseAgent):
         payload = sig.payload or {}
         days = payload.get("days") or []
         coverage_days = math.ceil(lead_days + config.REORDER_INTERVAL_DAYS)
+        now_day = int(float(self.bus.sim_time) // SECONDS_PER_DAY)
 
         total_usage = 0.0
         session = self.db_session_factory()
         try:
             for day in days:
-                day_idx = day.get("day_index", 999)
+                day_idx = _horizon_day_offset(day, now_day)
+                if day_idx < 0:
+                    continue  # stale horizon: day already past
                 if day_idx >= coverage_days:
                     break
                 for item_entry in day.get("items") or []:
@@ -1988,12 +2046,15 @@ class InventoryOptimizer(BaseAgent):
         payload = sig.payload or {}
         days = payload.get("days") or []
         cap_days = math.ceil(shelf_life_days)
+        now_day = int(float(self.bus.sim_time) // SECONDS_PER_DAY)
 
         total_usage = 0.0
         session = self.db_session_factory()
         try:
             for day in days:
-                day_idx = day.get("day_index", 999)
+                day_idx = _horizon_day_offset(day, now_day)
+                if day_idx < 0:
+                    continue  # stale horizon: day already past
                 if day_idx >= cap_days:
                     break
                 for item_entry in day.get("items") or []:
@@ -3038,32 +3099,17 @@ class InventoryOptimizer(BaseAgent):
                 for s in supplier_rows
             ]
 
-            # Overlay active threshold_discount terms as extra volume_discount tiers,
-            # and collect free_goods offers for the solver (mirrors build_procurement_plan).
-            _sourcing_free_goods: list = []
+            # Overlay active threshold_discount terms as extra volume_discount tiers.
+            # (free_goods offers are consumed by the forward-plan MILP only —
+            # solve_sourcing has no free-goods model.)
             for _sup_dict in suppliers:
                 _s_id = int(_sup_dict["id"])
-                _all_scope_terms = _term_map.get((_s_id, None), [])
-                for _t in _all_scope_terms:
+                for _t in _term_map.get((_s_id, None), []):
                     if _t.term_type == "threshold_discount":
                         _disc_pct = round(float(_t.value) * 100.0, 4)
                         _mov = float(_t.min_order_value or 0.0)
                         if _disc_pct > 0 and _mov > 0:
                             _sup_dict["volume_discount"].append({"min_value": _mov, "discount_pct": _disc_pct})
-                    elif _t.term_type == "free_goods":
-                        if _t.free_ingredient_id and _t.free_qty_g:
-                            try:
-                                from track_b.procurement.terms import FreeGoodsOffer as _FGO  # noqa: PLC0415
-                            except ImportError:
-                                from procurement.terms import FreeGoodsOffer as _FGO  # type: ignore[no-redef]
-                            _sourcing_free_goods.append(_FGO(
-                                supplier_id=_s_id,
-                                free_ingredient_id=int(_t.free_ingredient_id),
-                                free_qty_g=float(_t.free_qty_g),
-                                min_order_value=float(_t.min_order_value or 0.0),
-                                remaining_orders=_t.remaining_orders,
-                                term_id=int(_t.id),
-                            ))
                 # Normalise: keep None when list is empty (solver expects None or list)
                 if not _sup_dict["volume_discount"]:
                     _sup_dict["volume_discount"] = None

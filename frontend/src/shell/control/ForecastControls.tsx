@@ -388,13 +388,16 @@ export function ForecastControls() {
   const [autoMuteBusy, setAutoModeBusy] = useState(false);
   const [batchAutoQty, setBatchAutoQty] = useState<boolean>(false);
   const [batchQtyBusy, setBatchQtyBusy] = useState(false);
+  const [autoPlan, setAutoPlan] = useState<boolean>(true);
+  const [autoPlanBusy, setAutoPlanBusy] = useState(false);
   const [seedBusy, setSeedBusy] = useState(false);
 
-  // Load current batch_auto_qty setting on mount
+  // Load current sim settings on mount
   useEffect(() => {
-    apiGet<{ batch_auto_qty?: number | boolean }>("/api/sim/pos")
+    apiGet<{ batch_auto_qty?: number | boolean; auto_plan_on_forecast?: number | boolean }>("/api/sim/pos")
       .then((d) => {
         if (d?.batch_auto_qty != null) setBatchAutoQty(Boolean(d.batch_auto_qty));
+        if (d?.auto_plan_on_forecast != null) setAutoPlan(Boolean(d.auto_plan_on_forecast));
       })
       .catch(() => {});
   }, []);
@@ -427,6 +430,15 @@ export function ForecastControls() {
       await apiPatch("/api/sim/pos", { batch_auto_qty: next });
       setBatchAutoQty(next);
     } catch { /* ignore */ } finally { setBatchQtyBusy(false); }
+  }
+
+  async function toggleAutoPlan() {
+    const next = !autoPlan;
+    setAutoPlanBusy(true);
+    try {
+      await apiPatch("/api/sim/pos", { auto_plan_on_forecast: next });
+      setAutoPlan(next);
+    } catch { /* ignore */ } finally { setAutoPlanBusy(false); }
   }
 
   async function seedBatches() {
@@ -485,6 +497,20 @@ export function ForecastControls() {
             (batchAutoQty ? "bg-success/20 text-success hover:bg-success/30" : "bg-muted text-text hover:bg-muted/70")}
         >
           {batchQtyBusy ? "…" : batchAutoQty ? "Auto qty ON — click to require approval" : "Auto qty OFF — click to enable"}
+        </button>
+      </div>
+
+      <div className="rounded-lg border border-muted bg-surface p-4">
+        <p className="mb-1 text-sm font-medium text-text">Auto procurement on forecast</p>
+        <p className="mb-3 text-xs text-text/50">
+          When enabled (default), every completed forecast run immediately rebuilds the procurement plan, re-runs the sourcing solver, and places any now-due planned orders. When disabled, the plan is only rebuilt — orders wait for the periodic reorder sweep.
+        </p>
+        <button
+          type="button" onClick={() => void toggleAutoPlan()} disabled={autoPlanBusy}
+          className={"rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50 " +
+            (autoPlan ? "bg-success/20 text-success hover:bg-success/30" : "bg-muted text-text hover:bg-muted/70")}
+        >
+          {autoPlanBusy ? "…" : autoPlan ? "Auto procurement ON — click to disable" : "Auto procurement OFF — click to enable"}
         </button>
       </div>
 

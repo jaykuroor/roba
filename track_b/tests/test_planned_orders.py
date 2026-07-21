@@ -1204,3 +1204,69 @@ def test_unused_promo_posts_manager_card(bus, session_factory):
         assert len(cards) == 1, "promo card should be refreshed, not duplicated"
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# Stale horizon: day mapping is anchored on absolute day starts
+# ---------------------------------------------------------------------------
+
+
+def test_stale_horizon_days_mapped_by_start_not_index(bus, session_factory):
+    """A horizon generated yesterday must not shift demand onto today.
+
+    Yesterday's (huge) day-0 entry is in the past — dropping it, today's modest
+    demand is fully covered by stock, so the rebuild must NOT report the
+    ingredient uncoverable.  (Mapping day_index directly onto today produced
+    exactly the flip-flopping 'basil cannot be supplied' alerts.)"""
+    ing_id = _seed_ingredient(session_factory, on_hand=200.0, safety_stock=0.0)
+    item_id = _seed_dish(session_factory, ing_id, recipe_qty=100.0)
+    _seed_supplier(session_factory, ing_id, lead_time_days=1.0, pack_size=10.0)
+
+    gen_day = 4                      # horizon generated on day 4 ...
+    bus.sim_time = float(5 * SECONDS_PER_DAY)  # ... consumed on day 5
+
+    day_entries = [
+        {
+            "day_index": d,
+            "start": float((gen_day + d) * SECONDS_PER_DAY),
+            "end": float((gen_day + d + 1) * SECONDS_PER_DAY),
+            "items": [{
+                "menu_item_id": item_id,
+                # Yesterday (d=0): 10 dishes = 1000g.  All later days: 1 dish = 100g.
+                "qty": 10.0 if d == 0 else 1.0,
+                "baseline": 10.0 if d == 0 else 1.0,
+            }],
+        }
+        for d in range(8)
+    ]
+    bus.emit(
+        type=SignalType.DEMAND_FORECAST_HORIZON,
+        payload={
+            "horizon_days": 8,
+            "generated_at": float(gen_day * SECONDS_PER_DAY),
+            "days": day_entries,
+            "item_daily_baseline_median": {str(item_id): 1.0},
+        },
+        source="test",
+    )
+
+    opt, _proc = _make_optimizer(bus, session_factory)
+    opt.build_procurement_plan()
+
+    # Yesterday's 1000g must be dropped, so today's 100g is covered by the 200g
+    # on hand → no uncoverable alert and the plan run reports full coverage.
+    assert bus.live(type=SignalType.INGREDIENT_UNCOVERABLE) == [], (
+        "stale day-0 demand was mapped onto today"
+    )
+    session = session_factory()
+    try:
+        run = (
+            session.query(ProcurementPlanRun)
+            .order_by(ProcurementPlanRun.id.desc())
+            .first()
+        )
+        assert run is not None and bool(run.coverage_ok), (
+            f"coverage_ok={run and run.coverage_ok}, total_short={run and run.total_short}"
+        )
+    finally:
+        session.close()
