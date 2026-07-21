@@ -14,13 +14,16 @@ export interface SimState {
   time_of_day?: string;
   speed: number;
   status: SimStatus;
-  call_mode?: "freeze" | "slow";
+  call_mode?: "freeze" | "slow" | "realtime";
   /** Active preset id; changes when a restaurant is (re)seeded. */
   active_seed_id?: string | null;
   /** Operating window in seconds-since-midnight, e.g. { open: 28800, close: 82800 }. */
   operating_window?: { open?: number; close?: number } | null;
   /** When true the clock jumps over closed hours. */
   skip_closed_hours?: boolean;
+  /** Labels of live calls / agent tasks currently pinning the clock to
+   *  realtime (1 sim-min = 1 real-min); the speed control locks while set. */
+  realtime_tasks?: string[];
 }
 
 /** Canonical weather struct (00 §9.1) as carried by weather_updated / GET /api/weather. */

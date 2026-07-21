@@ -127,14 +127,21 @@ const STATUS_CFG: Record<
     label: "frozen",
     textCls: "text-accent",
   },
+  realtime_task: {
+    dot: "bg-accent animate-pulse",
+    label: "real-time task",
+    textCls: "text-accent",
+  },
 };
 
 function StatusPill({
   status,
   pendingAction,
+  title,
 }: {
   status: SimStatus | string;
   pendingAction: string | null;
+  title?: string;
 }) {
   if (pendingAction === "restart") {
     return (
@@ -150,7 +157,10 @@ function StatusPill({
     textCls: "text-text/40",
   };
   return (
-    <span className="flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1.5 text-xs font-medium">
+    <span
+      className="flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1.5 text-xs font-medium"
+      title={title}
+    >
       <span className={`h-2 w-2 rounded-full ${cfg.dot}`} />
       <span className={cfg.textCls}>{cfg.label}</span>
     </span>
@@ -222,6 +232,8 @@ export function ControlBar({
 
   const status = simState?.status ?? "stopped";
   const speed = simState?.speed ?? 1;
+  const realtimeTasks = simState?.realtime_tasks ?? [];
+  const realtimeActive = realtimeTasks.length > 0;
   const isBusy = pendingAction !== null;
 
   async function sim(action: string) {
@@ -312,8 +324,14 @@ export function ControlBar({
           <Section label="Speed">
             <select
               value={speed}
+              disabled={realtimeActive}
               onChange={(event) => void setSpeed(Number(event.target.value))}
-              className="h-8 rounded-md border border-muted bg-primary px-2 text-sm font-medium text-text outline-none focus:border-accent"
+              title={
+                realtimeActive
+                  ? `Locked during real-time task (${realtimeTasks.join(", ")}) — will resume at ${speed}×`
+                  : undefined
+              }
+              className="h-8 rounded-md border border-muted bg-primary px-2 text-sm font-medium text-text outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-50"
             >
               {SPEEDS.map((s) => (
                 <option key={s} value={s}>
@@ -327,7 +345,11 @@ export function ControlBar({
             <span className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium tabular-nums text-text">
               {pendingAction === "restart" ? "Restarting…" : formatSimTime(simState)}
             </span>
-            <StatusPill status={status} pendingAction={pendingAction} />
+            <StatusPill
+              status={realtimeActive && status === "running" ? "realtime_task" : status}
+              pendingAction={pendingAction}
+              title={realtimeActive ? realtimeTasks.join(", ") : undefined}
+            />
           </Section>
 
           <Section label="Velocity">
