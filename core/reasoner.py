@@ -42,7 +42,7 @@ def consult(
     Falls back gracefully if Vertex AI is unavailable.
     """
     try:
-        from .vertex import build_genai_client, vertex_available
+        from .vertex import build_genai_client, call_with_timeout, vertex_available
         from .config import GEMINI_REASONER_MODEL
 
         if not vertex_available():
@@ -58,8 +58,6 @@ def consult(
         prompt_parts.append("Give ONE decisive recommendation (2-3 sentences, concrete, actionable):")
         prompt = "\n\n".join(prompt_parts)
 
-        import concurrent.futures
-
         def _call():
             return client.models.generate_content(
                 model=GEMINI_REASONER_MODEL,
@@ -67,16 +65,14 @@ def consult(
                 config={"system_instruction": _SYSTEM_PROMPT, "temperature": 0.3},
             )
 
-        # Run synchronously with timeout (VoiceActions is called via asyncio.to_thread)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_call)
-            try:
-                resp = future.result(timeout=timeout_s)
-            except concurrent.futures.TimeoutError:
-                return {
-                    "recommendation": "The reasoning model timed out — please decide based on current data.",
-                    "rationale": "timeout",
-                }
+        # Run synchronously with a REAL timeout (VoiceActions calls via asyncio.to_thread).
+        try:
+            resp = call_with_timeout(_call, timeout_s)
+        except TimeoutError:
+            return {
+                "recommendation": "The reasoning model timed out — please decide based on current data.",
+                "rationale": "timeout",
+            }
 
         text = ""
         if resp and resp.text:
@@ -157,7 +153,7 @@ def suggest_batch_changes(
     Designed to be called via asyncio.to_thread from async code.
     """
     try:
-        from .vertex import build_genai_client, vertex_available
+        from .vertex import build_genai_client, call_with_timeout, vertex_available
         from .config import GEMINI_REASONER_MODEL
 
         if not vertex_available():
@@ -171,8 +167,6 @@ def suggest_batch_changes(
             f"Context:\n{json.dumps(context, indent=2, default=str)}"
         )
 
-        import concurrent.futures
-
         def _call():
             return client.models.generate_content(
                 model=GEMINI_REASONER_MODEL,
@@ -185,13 +179,11 @@ def suggest_batch_changes(
                 },
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_call)
-            try:
-                resp = future.result(timeout=timeout_s)
-            except concurrent.futures.TimeoutError:
-                logger.warning("suggest_batch_changes: LLM timed out")
-                return {"proposals": [], "schedule_assessment": "Reasoning model timed out.", "source": "timeout"}
+        try:
+            resp = call_with_timeout(_call, timeout_s)
+        except TimeoutError:
+            logger.warning("suggest_batch_changes: LLM timed out")
+            return {"proposals": [], "schedule_assessment": "Reasoning model timed out.", "source": "timeout"}
 
         if not resp or not resp.text:
             return {"proposals": [], "schedule_assessment": "Empty response.", "source": "empty"}
@@ -290,7 +282,7 @@ def synthesize_demand_event(
     on failure. Designed to be called via asyncio.to_thread from async code.
     """
     try:
-        from .vertex import build_genai_client, vertex_available
+        from .vertex import build_genai_client, call_with_timeout, vertex_available
         from .config import GEMINI_REASONER_MODEL
 
         if not vertex_available():
@@ -307,8 +299,6 @@ def synthesize_demand_event(
             "Return JSON matching the required schema."
         )
 
-        import concurrent.futures
-
         def _call():
             return client.models.generate_content(
                 model=GEMINI_REASONER_MODEL,
@@ -321,13 +311,11 @@ def synthesize_demand_event(
                 },
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_call)
-            try:
-                resp = future.result(timeout=timeout_s)
-            except concurrent.futures.TimeoutError:
-                logger.warning("synthesize_demand_event: LLM timed out")
-                return {"error": "synthesis timed out", "raw_text": raw_text}
+        try:
+            resp = call_with_timeout(_call, timeout_s)
+        except TimeoutError:
+            logger.warning("synthesize_demand_event: LLM timed out")
+            return {"error": "synthesis timed out", "raw_text": raw_text}
 
         if not resp or not resp.text:
             return {"error": "empty response from synthesizer", "raw_text": raw_text}

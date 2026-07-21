@@ -4,7 +4,7 @@ import pytest
 
 from core.approvals import ApprovalsHub
 from core.calls import WAITING_NOTE, CallSubsystem
-from core.clock import CALL_FROZEN, SimClock
+from core.clock import CALL_FROZEN, RUNNING, SimClock, get_or_create_sim_state
 from core.models import ApprovalRequest, Call
 from core.signals import SignalType
 
@@ -22,10 +22,20 @@ class FakeLLM:
         return "canned line"
 
 
+def _set_call_mode(session_factory, mode):
+    session = session_factory()
+    try:
+        get_or_create_sim_state(session).call_mode = mode
+        session.commit()
+    finally:
+        session.close()
+
+
 @pytest.fixture
 def wired(bus, session_factory):
     clock = SimClock(session_factory, bus)
     clock.play()  # RUNNING, so a freeze is observable and restorable
+    _set_call_mode(session_factory, "freeze")  # these tests pin freeze semantics
     bus.sim_time = 1000.0
     approvals = ApprovalsHub(bus, session_factory)
     calls = CallSubsystem(bus, session_factory, clock, FakeLLM())
@@ -436,3 +446,62 @@ def test_mislabelled_free_delivery_price_is_dropped(bus, session_factory):
         assert all(t.term_type != "price_override" for t in terms), [t.term_type for t in terms]
     finally:
         session.close()
+
+
+def test_realtime_call_mode_keeps_clock_running_with_hold(bus, session_factory):
+    """call_mode=realtime (default): a call adds a realtime hold instead of
+    freezing; the orchestrator tick advances at 1/60 speed; end releases it."""
+    from core.orchestrator import Orchestrator
+
+    clock = SimClock(session_factory, bus)
+    clock.play()
+    _set_call_mode(session_factory, "realtime")
+    orchestrator = Orchestrator(clock, bus, session_factory)
+
+    prior = clock.freeze_for_call()
+    state = clock.current_state()
+    assert state["status"] == RUNNING
+    assert state["realtime_tasks"] == ["Live call"]
+    assert "call" in bus.realtime_holds
+
+    before = clock.sim_time
+    events = orchestrator.tick()
+    # Δsim = 60 × (1/60) × 0.25 = 0.25 sim-s: realtime, not the stored speed.
+    assert clock.sim_time == pytest.approx(before + 0.25)
+    # The tick payload reports the *stored* speed (what the UI locks to) plus
+    # the active task labels.
+    payload = events[0]["payload"]
+    assert payload["speed"] == 1.0
+    assert payload["realtime_tasks"] == ["Live call"]
+
+    clock.unfreeze_from_call(*prior)
+    assert not bus.realtime_holds
+    events = orchestrator.tick()
+    # Hold released: back to the stored 1.0 speed (15 sim-s per tick).
+    assert clock.sim_time == pytest.approx(before + 0.25 + 15.0)
+    assert events[0]["payload"]["realtime_tasks"] == []
+
+
+def test_finalize_restores_clock_even_when_extraction_raises(bus, session_factory):
+    """A crash anywhere in call finalization must still release the clock
+    (no leaked realtime hold / stuck CALL_FROZEN)."""
+    class ExplodingLLM(FakeLLM):
+        def complete(self, *a, **k):  # noqa: ANN002, ANN003
+            raise RuntimeError("extraction boom")
+
+    clock = SimClock(session_factory, bus)
+    clock.play()
+    _set_call_mode(session_factory, "realtime")
+    approvals = ApprovalsHub(bus, session_factory)
+    calls = CallSubsystem(bus, session_factory, clock, ExplodingLLM())
+    calls.attach_approvals(approvals)
+
+    call = calls.request("market_spectator", "supplier", 1, "Negotiate")
+    approvals.approve(call.approval_id)
+    assert "call" in bus.realtime_holds
+
+    try:
+        calls.end_call(call.id)
+    except Exception:  # noqa: BLE001 — the crash itself may or may not surface
+        pass
+    assert not bus.realtime_holds  # hold released despite the crash

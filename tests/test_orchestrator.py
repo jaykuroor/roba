@@ -118,3 +118,34 @@ def test_tick_jumps_over_closed_hours_and_skips_window(system):
         assert session.get(ScenarioEvent, ev_in_window).fired == 0
     finally:
         session.close()
+
+
+def test_run_loop_survives_tick_exception(system):
+    """A tick that raises must be logged and skipped, not silently kill the
+    loop task (which froze the sim at its last sim_time with status=running)."""
+    import asyncio
+
+    clock, orch, bus, session_factory = system
+    _set_clock(session_factory, 30000.0, speed=1.0, status="running")
+
+    calls = {"n": 0}
+    real_tick = orch.tick
+
+    def flaky_tick():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom (e.g. sqlite 'database is locked')")
+        return real_tick()
+
+    orch.tick = flaky_tick
+
+    async def _run():
+        task = asyncio.get_running_loop().create_task(orch.run_loop(lambda events: None))
+        while calls["n"] < 2:
+            await asyncio.sleep(0.01)
+        orch.stop_loop()
+        await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(_run())
+    assert calls["n"] >= 2, "loop must keep ticking after a failed tick"
+    assert bus.sim_time > 30000.0, "the post-failure tick must still advance sim time"

@@ -27,7 +27,7 @@ REAL_MINUTES_PER_DAY_1X = 15               # default
 TICK_REAL_MS = 250
 SPEEDS = [0.25, 0.5, 1, 2, 4, 8]
 SKIP_CLOSED_HOURS = True
-CALL_MODE = "freeze"                        # or "slow" (0.1x)
+CALL_MODE = "realtime"                      # or "freeze" | "slow" (0.1x)
 
 # dayparts (start, end, weight) — weights sum ~1.0
 DAYPARTS = {
@@ -129,6 +129,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 # per call, post-hangup, so latency/cost are not a concern.
 GEMINI_EXTRACTION_MODEL = os.getenv("GEMINI_EXTRACTION_MODEL", "gemini-2.5-pro")
 LLM_FALLBACK = ["gemini", "canned"]
+# Deadline for the LLM-authority forecast pass. gemini-2.5-pro on the large
+# structured forecast prompt regularly needs 30-60s; on timeout the
+# deterministic forecast publishes immediately (wait bounded by this value).
+LLM_AUTHORITY_TIMEOUT_S = float(os.getenv("LLM_AUTHORITY_TIMEOUT_S", "75"))
 LLM_RETRIES = 3
 LLM_BACKOFF_BASE_S = 1.5
 LLM_INTER_CALL_SLEEP_S = 2
