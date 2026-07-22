@@ -93,3 +93,39 @@ def test_uncapped_discount_still_cuts_price(session_factory):
         assert applied.capped_discount_offers == []
     finally:
         session.close()
+
+
+def _supplier_mov(mov=100.0):
+    return [{"id": 1, "delivery_charge": 0.0, "lead_time_days": 2.0, "min_order_value": mov}]
+
+
+def test_min_order_override_changes_supplier_mov(session_factory):
+    """A live min_order_override replaces the supplier's MOV the MILP constrains on."""
+    session = session_factory()
+    try:
+        session.add(SupplierTerm(
+            supplier_id=1, ingredient_id=None, term_type="min_order_override",
+            value=50.0, scope="all", effective_at=0.0, expiry_kind="none",
+            status="active", created_at=0.0,
+        ))
+        session.commit()
+        applied = apply_supplier_terms(session, [], _supplier_mov(100.0), now=1000.0)
+        assert applied.suppliers[0]["min_order_value"] == 50.0
+    finally:
+        session.close()
+
+
+def test_expired_min_order_override_keeps_base_mov(session_factory):
+    """A date-expired MOV promo reverts to the supplier's standing minimum."""
+    session = session_factory()
+    try:
+        session.add(SupplierTerm(
+            supplier_id=1, ingredient_id=None, term_type="min_order_override",
+            value=50.0, scope="all", effective_at=0.0, expiry_kind="date",
+            expires_at=500.0, status="active", created_at=0.0,
+        ))
+        session.commit()
+        applied = apply_supplier_terms(session, [], _supplier_mov(100.0), now=1000.0)
+        assert applied.suppliers[0]["min_order_value"] == 100.0  # now > expires_at → reverted
+    finally:
+        session.close()

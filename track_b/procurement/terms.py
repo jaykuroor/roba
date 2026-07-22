@@ -195,6 +195,11 @@ def apply_supplier_terms(
                 ))
             elif tt == "lead_time_override":
                 base_lead = float(t.value)
+            elif tt == "min_order_override":
+                # Change the supplier's standing MOV (the MILP min-order constraint
+                # reads this). Only live terms reach here, so a lapsed promo MOV
+                # reverts automatically. Latest-effective wins.
+                adjusted_s["min_order_value"] = max(0.0, float(t.value))
             elif tt in ("discount", "threshold_discount") and getattr(t, "max_discount_amount", None) and float(t.value) > 0:
                 # Capped percentage discount ("50% off up to €30") → order-level
                 # rebate min(frac·spend, cap). Never a per-item cut / vol tier

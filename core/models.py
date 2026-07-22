@@ -1164,7 +1164,7 @@ class SupplierTerm(Base):
     id = _pk()
     supplier_id = mapped_column(Integer, ForeignKey("suppliers.id"))
     ingredient_id = mapped_column(Integer, ForeignKey("ingredients.id"), nullable=True)
-    term_type = mapped_column(String)            # price_override | discount | threshold_discount | free_goods | unavailable | lead_time_override
+    term_type = mapped_column(String)            # price_override | discount | threshold_discount | free_goods | free_delivery | unavailable | lead_time_override | min_order_override
     value = mapped_column(Float)                 # per-gram price or fraction; 0.0 for free_goods
     unit_basis = mapped_column(String, nullable=True)  # unit the caller quoted, e.g. per_kg
     scope = mapped_column(String, default="ingredient")  # ingredient | all

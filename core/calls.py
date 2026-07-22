@@ -691,6 +691,11 @@ class CallSubsystem:
                 "The system normalises amounts in code — never convert.\n"
                 "5. SCOPE: 'all items' / 'everything' / 'all products' / 'whole range' → scope=all. "
                 "Named item → scope=ingredient, ingredient_name=<exact name stated>.\n"
+                "5b. MINIMUM ORDER: a change to the supplier's minimum order value → "
+                "update_type=minimum_order, amount=<new € minimum> (e.g. 'our minimum order is "
+                "now €50' → amount=50). This is the standing order minimum, distinct from a "
+                "promo's min_order_value gate. If temporary ('for your next 2 orders', 'this "
+                "month'), set expiry_kind/expires_hint like any promo so it reverts.\n"
                 "6. FREE DELIVERY vs FREE GOODS vs PRICE — do not confuse these:\n"
                 "   - 'free delivery' → update_type=free_delivery. It is NOT a price. "
                 "Never emit a price_change/amount=0 for it.\n"
@@ -927,7 +932,7 @@ class CallSubsystem:
                             "properties": {
                                 "update_type": {
                                     "type": "string",
-                                    "description": "price_change | discount | threshold_discount | free_goods | free_delivery | availability | lead_time | other. Use free_delivery for a waived delivery charge ('free delivery') — NEVER model it as a price. Use free_goods for a free item ('free 2kg tomatoes').",
+                                    "description": "price_change | discount | threshold_discount | free_goods | free_delivery | minimum_order | availability | lead_time | other. Use free_delivery for a waived delivery charge ('free delivery') — NEVER model it as a price. Use free_goods for a free item ('free 2kg tomatoes'). Use minimum_order to CHANGE the supplier's minimum order value ('our minimum order is now €50').",
                                 },
                                 "scope": {
                                     "type": "string",
@@ -1030,6 +1035,98 @@ class CallSubsystem:
             if ing.name and (needle in ing.name.strip().lower() or ing.name.strip().lower() in needle):
                 return int(cat.ingredient_id)
         return None
+
+    def _match_restaurant_ingredient(
+        self, session: Any, ingredient_name: str
+    ) -> Optional[int]:
+        """Match a name against the restaurant's FULL ingredient list (not just this
+        supplier's catalog) — used to add an item a supplier newly offers to stock."""
+        if not ingredient_name:
+            return None
+        needle = ingredient_name.strip().lower()
+        rows = session.query(Ingredient).all()
+        for ing in rows:
+            if ing.name and ing.name.strip().lower() == needle:
+                return int(ing.id)
+        for ing in rows:
+            if ing.name and (needle in ing.name.strip().lower() or ing.name.strip().lower() in needle):
+                return int(ing.id)
+        return None
+
+    def _add_catalog_item(
+        self, session: Any, call: Any, ingredient_id: int, price_per_g: float,
+        ingredient_name: str,
+    ) -> None:
+        """Create (or price-refresh) a SupplierCatalog row for an item a supplier
+        newly offers, so the planner can source it. Respects the same
+        ``auto_apply_supplier_changes`` gate as price/promo terms: when on, the row
+        is created and a desk card marked applied; when off, an informational
+        pending card is posted and the catalog is left untouched for manual review.
+        ponytail: when auto-apply is off the card is informational only (no approval
+        handler creates the row) — the manager adds it in the catalog UI.
+        ponytail: pack_size defaults to 1kg — the caller rarely states one; editable in the catalog UI.
+        """
+        from .models import AppSettings as _AppSettings  # noqa: PLC0415
+        from .models import SupplierCatalog, ManagerChange as _MC  # noqa: PLC0415
+        now = float(self.bus.sim_time)
+        _settings = session.get(_AppSettings, 1)
+        auto_apply = bool(_settings.auto_apply_supplier_changes if _settings else False)
+        sup = session.get(Supplier, call.counterparty_id)
+        sup_name = sup.name if sup else f"Supplier #{call.counterparty_id}"
+        disp = float(price_per_g) * 1000.0
+
+        if auto_apply:
+            existing = (
+                session.query(SupplierCatalog)
+                .filter(
+                    SupplierCatalog.supplier_id == call.counterparty_id,
+                    SupplierCatalog.ingredient_id == ingredient_id,
+                )
+                .first()
+            )
+            if existing is not None:
+                existing.current_price = float(price_per_g)  # already stocked → price refresh
+                existing.availability = "in_stock"
+                existing.updated_at = now
+            else:
+                session.add(SupplierCatalog(
+                    supplier_id=call.counterparty_id, ingredient_id=ingredient_id,
+                    current_price=float(price_per_g), unit="g", pack_size=1000.0,
+                    availability="in_stock", updated_at=now, is_default=0, discount=None,
+                ))
+            summary = f"{sup_name}: added {ingredient_name} at €{disp:.2f}/kg"
+        else:
+            summary = (
+                f"{sup_name}: offers {ingredient_name} at €{disp:.2f}/kg — "
+                f"add it in the catalog to source from them"
+            )
+
+        change = _MC(
+            kind="supplier_term",
+            status="applied" if auto_apply else "pending",
+            auto_applied=1 if auto_apply else 0,
+            summary=summary, created_at=now,
+            resolved_at=now if auto_apply else None,
+            details={
+                "term_type": "catalog_add", "supplier_id": call.counterparty_id,
+                "ingredient_id": ingredient_id, "ingredient_name": ingredient_name,
+                "call_id": call.id, "price_per_kg": disp,
+            },
+        )
+        session.add(change)
+        session.commit()
+        self._broadcast("manager_change", {
+            "kind": "supplier_term", "id": change.id, "supplier": sup_name,
+            "ingredient": ingredient_name, "term_type": "catalog_add",
+        })
+        if auto_apply:
+            # New supply expands sourcing options — trigger a replan like other
+            # auto-applied supplier changes so the planner can pick it up.
+            self.bus.emit(
+                SignalType.CALL_OUTCOME,
+                {"call_id": call.id, "counterparty_type": call.counterparty_type or "supplier", "outcome": {}},
+                source="calls",
+            )
 
     @staticmethod
     def _normalise_term_value(
@@ -1211,6 +1308,15 @@ class CallSubsystem:
                 if expiry_kind == "date" and expires_at:
                     days_left = max(1, round((expires_at - now) / 86400))
                     summary += f" (for ~{days_left} days)"
+            elif term_type == "min_order_override":
+                summary = f"{sup_name}: minimum order now €{value:.0f}"
+                if expiry_kind == "orders":
+                    summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
+                elif expiry_kind == "date" and expires_at:
+                    days_left = max(1, round((expires_at - now) / 86400))
+                    summary += f" (expires in ~{days_left} days)"
+                else:
+                    summary += " (permanent)"
             elif term_type == "threshold_discount":
                 pct = round(abs(value) * 100, 1)
                 direction = "increase" if value < 0 else "discount"
@@ -1478,6 +1584,17 @@ class CallSubsystem:
                     expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
                         expiry_kind_raw, expires_hint, None, now
                     )
+                elif utype in ("minimum_order", "min_order", "minimum_order_value", "mov"):
+                    # Change the supplier's standing minimum order value. Supplier-level;
+                    # expiry (date / next-N-orders) makes it a temporary promo MOV that
+                    # reverts when it lapses. value = new € minimum.
+                    term_type = "min_order_override"
+                    value = max(0.0, float(amount))
+                    scope = "all"
+                    ingredient_id = None
+                    expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
+                        expiry_kind_raw, expires_hint, None, now
+                    )
                 else:
                     term_type, value = self._normalise_term_value(amount, amount_kind, unit)
                     expiry_kind_str, expires_at, remaining_orders = self._parse_expiry(
@@ -1492,6 +1609,21 @@ class CallSubsystem:
                             "extraction (utype=%r, quote=%r)",
                             call.id, utype, verbatim_quote[:60],
                         )
+                        continue
+                    # ADD-ITEM: a price for an ingredient this supplier doesn't yet
+                    # stock. _fuzzy_match_ingredient (catalog-only) returned None; if
+                    # the ingredient is on the restaurant's list, create the catalog
+                    # row so the planner can source it. A scope='ingredient' term with
+                    # no ingredient_id would otherwise be miskeyed as supplier-wide.
+                    if term_type == "price_override" and scope == "ingredient" and ingredient_id is None:
+                        _new_iid = self._match_restaurant_ingredient(session, ingredient_name)
+                        if _new_iid is not None:
+                            self._add_catalog_item(session, call, _new_iid, value, ingredient_name)
+                        else:
+                            logger.info(
+                                "Call %s: dropping price for unknown ingredient %r "
+                                "(not on the restaurant's list).", call.id, ingredient_name,
+                            )
                         continue
 
                 self._create_supplier_term(
