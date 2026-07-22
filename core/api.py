@@ -216,6 +216,7 @@ def _migrate_schema() -> None:
         ("kitchen_tasks", "note", "ALTER TABLE kitchen_tasks ADD COLUMN note TEXT"),
         ("kitchen_tasks", "severity", "ALTER TABLE kitchen_tasks ADD COLUMN severity TEXT"),
         ("sim_settings", "auto_plan_on_forecast", "ALTER TABLE sim_settings ADD COLUMN auto_plan_on_forecast INTEGER DEFAULT 1"),
+        ("supplier_terms", "max_discount_amount", "ALTER TABLE supplier_terms ADD COLUMN max_discount_amount REAL"),
     ]
     with db.engine.connect() as conn:
         for table, column, ddl in migrations:

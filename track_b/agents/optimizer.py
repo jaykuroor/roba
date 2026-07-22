@@ -750,6 +750,7 @@ class InventoryOptimizer(BaseAgent):
             milp_suppliers = _applied.suppliers
             _milp_free_goods = _applied.free_goods_offers
             _milp_free_delivery = _applied.free_delivery_offers
+            _milp_capped_discount = _applied.capped_discount_offers
 
             _lead_by_sup = {s["id"]: float(s.get("lead_time_days") or 1.0) for s in milp_suppliers}
             _delivery_hour_by_sup = {
@@ -856,6 +857,7 @@ class InventoryOptimizer(BaseAgent):
                 "robust_min_reliability": config.RELIABILITY_ROBUST_MIN_RELIABILITY,
                 "free_goods_offers": _milp_free_goods,
                 "free_delivery_offers": _milp_free_delivery,
+                "capped_discount_offers": _milp_capped_discount,
             }
             _solve_kwargs = dict(
                 n_days=n_days,
@@ -3183,6 +3185,8 @@ class InventoryOptimizer(BaseAgent):
                         price = float(t.value)      # absolute per-gram price
                     elif t.term_type == "discount":
                         v = float(t.value)
+                        if v > 0 and getattr(t, "max_discount_amount", None):
+                            continue  # capped discount: order-level rebate, not a per-gram cut
                         if v < 0:                   # negative = price increase
                             price = price * (1.0 + abs(v))
                         else:

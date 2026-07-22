@@ -1181,6 +1181,7 @@ class SupplierTerm(Base):
     min_order_value = mapped_column(Float, nullable=True)          # €-gate for threshold_discount / free_goods
     free_ingredient_id = mapped_column(Integer, ForeignKey("ingredients.id"), nullable=True)  # free_goods: ingredient given free
     free_qty_g = mapped_column(Float, nullable=True)               # free_goods: quantity in grams
+    max_discount_amount = mapped_column(Float, nullable=True)      # € cap on a percentage discount's total benefit ("50% off up to €30"); None = uncapped
 
     def __repr__(self):
         return (

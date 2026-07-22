@@ -1406,6 +1406,73 @@ def test_free_goods_absent_is_noop():
     assert not any(o.reason == "free-goods benefit" for o in sol_empty.orders)
 
 
+# ---------------------------------------------------------------------------
+# Capped percentage-discount rebate ("50% off up to €30")
+# ---------------------------------------------------------------------------
+
+def _cd_offer(supplier_id, discount_frac, cap_eur, min_order_value=0.0):
+    from track_b.procurement.terms import CappedDiscountOffer
+    return CappedDiscountOffer(
+        supplier_id=supplier_id, discount_frac=discount_frac, cap_eur=cap_eur,
+        min_order_value=min_order_value, remaining_orders=None, term_id=1,
+    )
+
+
+def _capped_common(n=2):
+    # Day 0 covered by on-hand; day 1 must be ordered (1000g @ €0.10/g = €100 spend).
+    return dict(
+        ingredients=[_ing(1)],
+        catalog=[_cat(1, 1, price=0.1, pack=100.0)],
+        suppliers=[_sup(1, lead=1.0)],
+        demand_by_day={1: {d: 1000.0 for d in range(n)}},
+        on_hand={1: 1000.0},
+        safety_stock={1: 0.0},
+        n_days=n,
+    )
+
+
+def _sup1_spend(sol):
+    return sum(float(o.qty) * float(o.unit_price)
+               for o in sol.orders if o.supplier_id == 1 and o.unit_price > 0)
+
+
+def test_capped_discount_rebate_is_capped():
+    """50% off up to €30 on a ~€100 order rebates exactly the €30 cap, not €50."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    common = _capped_common()
+    plain = _run(**common, params={"slack_penalty": 1000.0})
+    offer = _run(**common, params={"slack_penalty": 1000.0,
+                                   "capped_discount_offers": [_cd_offer(1, 0.5, 30.0)]})
+    spend = _sup1_spend(plain)
+    assert spend > 60.0  # 50% of spend exceeds the €30 cap, so the cap binds
+    assert len(offer.orders) == len(plain.orders)  # rebate must not distort the plan
+    assert plain.total_cost - offer.total_cost == pytest.approx(30.0, abs=1e-4)
+
+
+def test_capped_discount_rebate_below_cap_is_full_percentage():
+    """When 50% of spend is under the cap, the full percentage is rebated."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    common = _capped_common()
+    plain = _run(**common, params={"slack_penalty": 1000.0})
+    offer = _run(**common, params={"slack_penalty": 1000.0,
+                                   "capped_discount_offers": [_cd_offer(1, 0.5, 500.0)]})
+    spend = _sup1_spend(plain)
+    assert plain.total_cost - offer.total_cost == pytest.approx(0.5 * spend, abs=1e-4)
+
+
+def test_capped_discount_absent_is_noop():
+    """No capped_discount_offers → identical plan and cost."""
+    common = _capped_common()
+    plain = _run(**common, params={"slack_penalty": 1000.0})
+    empty = _run(**common, params={"slack_penalty": 1000.0, "capped_discount_offers": []})
+    assert empty.total_cost == pytest.approx(plain.total_cost, rel=1e-6)
+    assert len(empty.orders) == len(plain.orders)
+
+
 def test_free_goods_perishable_cohort():
     """Free goods for a perishable ingredient are cohort-gated: the free qty
     covers demand only within its shelf life and still surfaces as a free line."""

@@ -167,11 +167,26 @@ class Procurement:
             # Negotiated threshold_discount terms act as extra volume tiers so the
             # billed PO total matches the plan the optimizer costed against.
             for t in self._live_terms(session, supplier_id, "threshold_discount"):
+                if float(getattr(t, "max_discount_amount", None) or 0.0) > 0:
+                    continue  # capped: billed as a bounded rebate below, not a vol tier
                 mov = float(t.min_order_value or 0.0)
                 pct = float(t.value or 0.0) * 100.0
                 if subtotal >= mov > 0 and pct > best_pct:
                     best_pct = pct
-            return subtotal * (1.0 - best_pct / 100.0)
+            discounted = subtotal * (1.0 - best_pct / 100.0)
+            # Capped percentage discounts ("50% off up to €30"): order-level rebate
+            # min(frac·subtotal, cap) — the % benefit never exceeds the € cap, matching
+            # the MILP's bounded rebate. Stored as discount / threshold_discount terms
+            # carrying max_discount_amount.
+            capped_rebate = 0.0
+            for _tt in ("discount", "threshold_discount"):
+                for t in self._live_terms(session, supplier_id, _tt):
+                    cap = float(getattr(t, "max_discount_amount", None) or 0.0)
+                    frac = float(t.value or 0.0)
+                    mov = float(t.min_order_value or 0.0)
+                    if cap > 0 and frac > 0 and subtotal >= mov:
+                        capped_rebate += min(frac * subtotal, cap)
+            return max(0.0, discounted - capped_rebate)
         finally:
             session.close()
 

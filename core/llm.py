@@ -533,6 +533,7 @@ class LLMProvider:
             temperature=temperature,
             top_p=top_p,
             timeout_s=self.timeout_s,
+            model=model or GEMINI_MODEL,
         )
 
         try:
@@ -582,6 +583,7 @@ class LLMProvider:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         timeout_s: Optional[float] = None,
+        model: Optional[str] = None,
     ) -> Any:
         kwargs: Dict[str, Any] = {"max_output_tokens": max_tokens}
         if temperature is not None:
@@ -601,6 +603,16 @@ class LLMProvider:
                 # google-genai expects the HTTP timeout in milliseconds.
                 kwargs["http_options"] = types.HttpOptions(
                     timeout=int(timeout_s * 1000)
+                )
+            if model and "2.5" in model:
+                # Gemini 2.5 "thinking" models spend reasoning tokens against
+                # max_output_tokens; left unbounded they silently starve the JSON
+                # output (a supplier-extraction call at max_tokens=600 truncated
+                # mid-JSON → parse failure → silent canned fallback → dropped promo).
+                # Cap the budget to half the output allowance (≤1024) so there is
+                # always room for the response and thinking cost stays bounded.
+                kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_budget=min(max_tokens // 2, 1024)
                 )
             return types.GenerateContentConfig(**kwargs)
         except Exception:

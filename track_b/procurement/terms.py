@@ -44,11 +44,29 @@ class FreeDeliveryOffer:
 
 
 @dataclass
+class CappedDiscountOffer:
+    """A percentage discount whose total € benefit is capped ("50% off up to €30").
+
+    Modelled as a per-supplier-day rebate ``r = min(discount_frac · spend_d, cap_eur)``
+    inside the MILP — NOT a per-item price cut, which would apply the full percentage
+    with no ceiling. ``min_order_value`` optionally gates it; expiry/order-count are
+    honoured via ``_term_is_live`` and the PO-placement decrement, like free_delivery.
+    """
+    supplier_id: int
+    discount_frac: float       # 0.50 for 50% off
+    cap_eur: float             # max € saved per qualifying supplier-day
+    min_order_value: float     # € spend threshold; 0.0 = unconditional
+    remaining_orders: Optional[int]  # None = no cap
+    term_id: int
+
+
+@dataclass
 class AppliedTerms:
     catalog: List[Dict[str, Any]]           # milp_catalog with prices/availability adjusted
     suppliers: List[Dict[str, Any]]          # milp_suppliers with volume_discount extended
     free_goods_offers: List[FreeGoodsOffer] = field(default_factory=list)
     free_delivery_offers: List["FreeDeliveryOffer"] = field(default_factory=list)
+    capped_discount_offers: List["CappedDiscountOffer"] = field(default_factory=list)
 
 
 def apply_supplier_terms(
@@ -127,6 +145,11 @@ def apply_supplier_terms(
                 price = float(t.value)
             elif tt == "discount":
                 v = float(t.value)
+                if v > 0 and getattr(t, "max_discount_amount", None):
+                    # Capped discount ("50% off up to €30"): an order-level rebate
+                    # min(v·spend, cap), collected supplier-side below. Applying it
+                    # as a per-item price cut here would ignore the cap entirely.
+                    continue
                 if v < 0:
                     price = price * (1.0 + abs(v))   # negative = price increase
                 else:
@@ -144,6 +167,7 @@ def apply_supplier_terms(
     # free_goods / free_delivery terms become offer objects returned separately.
     free_goods_offers: List[FreeGoodsOffer] = []
     free_delivery_offers: List[FreeDeliveryOffer] = []
+    capped_discount_offers: List[CappedDiscountOffer] = []
     new_suppliers: List[Dict[str, Any]] = []
 
     for s in suppliers:
@@ -171,8 +195,20 @@ def apply_supplier_terms(
                 ))
             elif tt == "lead_time_override":
                 base_lead = float(t.value)
+            elif tt in ("discount", "threshold_discount") and getattr(t, "max_discount_amount", None) and float(t.value) > 0:
+                # Capped percentage discount ("50% off up to €30") → order-level
+                # rebate min(frac·spend, cap). Never a per-item cut / vol tier
+                # (both ignore the cap). Handled in the MILP as a bounded rebate.
+                capped_discount_offers.append(CappedDiscountOffer(
+                    supplier_id=s_id,
+                    discount_frac=float(t.value),
+                    cap_eur=float(t.max_discount_amount),
+                    min_order_value=float(t.min_order_value or 0.0),
+                    remaining_orders=t.remaining_orders,
+                    term_id=int(t.id),
+                ))
             elif tt == "threshold_discount":
-                # Append as a volume_discount tier so the existing MILP rebate loop handles it.
+                # Uncapped: append as a volume_discount tier so the existing MILP rebate loop handles it.
                 disc_pct = round(float(t.value) * 100.0, 4)  # fraction → percent
                 mov = float(t.min_order_value or 0.0)
                 if disc_pct > 0 and mov > 0:
@@ -197,4 +233,5 @@ def apply_supplier_terms(
         suppliers=new_suppliers,
         free_goods_offers=free_goods_offers,
         free_delivery_offers=free_delivery_offers,
+        capped_discount_offers=capped_discount_offers,
     )

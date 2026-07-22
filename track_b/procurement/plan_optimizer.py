@@ -730,6 +730,8 @@ def _solve_milp(
     free_goods_offers: List[Any] = list(params.get("free_goods_offers") or [])
     # Free-delivery offers (threshold-gated delivery-charge rebate)
     free_delivery_offers: List[Any] = list(params.get("free_delivery_offers") or [])
+    # Capped percentage-discount offers ("50% off up to €30") → bounded order rebate
+    capped_discount_offers: List[Any] = list(params.get("capped_discount_offers") or [])
 
     ing_by_id: Dict[int, Dict] = {int(i["id"]): i for i in ingredients}
     sup_by_id: Dict[int, Dict] = {int(s["id"]): s for s in suppliers}
@@ -1240,6 +1242,46 @@ def _solve_milp(
                 prob += _fd_ov <= _fd_mov + M_val * _fd_bin, f"fd_ub_{_fdi}_{_fds_id}_{d}"
             if _fd_dc > 0:
                 cash_real_terms.append(-_fd_dc * _fd_bin)
+
+    # (6c) Capped percentage discounts ("50% off up to €30") → bounded order rebate.
+    # A continuous rebate r per supplier-day with r ≤ frac·spend and r ≤ cap (gated
+    # on the day being opened, plus any MOV). Minimising cash drives r to its ceiling,
+    # so the plan sees exactly min(frac·spend, cap) saved — the percentage never
+    # exceeds the € cap the supplier offered.
+    _cd_rebate: Dict[Tuple[int, int, int], Any] = {}  # (offer_idx, s_id, d) → continuous rebate var
+    for _cdi, _cdo in enumerate(capped_discount_offers):
+        _cds_id = int(_cdo.supplier_id)
+        _cd_frac = max(0.0, float(getattr(_cdo, "discount_frac", 0.0)))
+        _cd_cap = max(0.0, float(getattr(_cdo, "cap_eur", 0.0)))
+        _cd_mov = float(getattr(_cdo, "min_order_value", 0.0) or 0.0)
+        if _cd_frac <= 0.0 or _cd_cap <= 0.0:
+            continue
+        ld = lead_ceil.get(_cds_id, 1)
+        for d in range(ld, n_days):
+            if (_cds_id, d) not in deliver or (_cds_id, d) in scheduled_supplier_days:
+                continue
+            _cd_ov_terms = []
+            for _iid in active_ids:
+                if (_iid, _cds_id, d) not in q:
+                    continue
+                _p_i = float(cat_by_is.get((_iid, _cds_id), {}).get("current_price") or 0.0)
+                _cd_ov_terms.append(_p_i * _x(_iid, _cds_id, d))
+            if not _cd_ov_terms:
+                continue
+            _cd_ov = pulp.lpSum(_cd_ov_terms)
+            _r = pulp.LpVariable(f"cd_{_cdi}_{_cds_id}_{d}", lowBound=0)
+            _cd_rebate[_cdi, _cds_id, d] = _r
+            prob += _r <= _cd_frac * _cd_ov, f"cd_frac_{_cdi}_{_cds_id}_{d}"
+            # Cap, gated on the supplier-day actually being opened.
+            prob += _r <= _cd_cap * deliver[_cds_id, d], f"cd_cap_{_cdi}_{_cds_id}_{d}"
+            if _cd_mov > 0:
+                # Rebate only when the day's order value clears the offer's MOV.
+                _cd_bin = pulp.LpVariable(f"cdb_{_cdi}_{_cds_id}_{d}", cat="Binary")
+                prob += _cd_bin <= deliver[_cds_id, d], f"cd_open_{_cdi}_{_cds_id}_{d}"
+                prob += _cd_ov >= _cd_mov * _cd_bin, f"cd_lb_{_cdi}_{_cds_id}_{d}"
+                prob += _cd_ov <= _cd_mov + M_val * _cd_bin, f"cd_ubmov_{_cdi}_{_cds_id}_{d}"
+                prob += _r <= _cd_cap * _cd_bin, f"cd_movgate_{_cdi}_{_cds_id}_{d}"
+            cash_real_terms.append(-_r)
 
     # (7) Supplier-level volume-discount rebates → real cash (negative)
     for s_id in all_sup_ids:
@@ -2013,6 +2055,14 @@ def _solve_milp(
                         if _bv is not None and _bv > 0.5:
                             total_cost -= dc
                             break
+
+    # Net fired capped-discount rebates into the reported invoice (matches the
+    # objective's cash). r is forced to 0 on unopened/scheduled days, so summing
+    # the positive solved values is exact and can't double-count sunk deliveries.
+    for _cd_key, _cd_var in _cd_rebate.items():
+        _rv = pulp.value(_cd_var)
+        if _rv is not None and _rv > 1e-6:
+            total_cost -= float(_rv)
 
     from core.config import COVERAGE_EPSILON as _COV_EPS_M  # noqa: PLC0415
     coverage_ok = total_short <= _COV_EPS_M

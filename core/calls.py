@@ -441,7 +441,10 @@ class CallSubsystem:
 
         # Build a human-readable summary for the desk card.  Pull ManagerChange.summary
         # strings that were created for this call so the desk gets a concise read-out.
-        call_summary = self._build_call_summary(call_id, call)
+        # A canned outcome (None) on a supplier call means extraction failed — flag it
+        # so the card doesn't masquerade a lost offer as "no updates captured".
+        _extraction_failed = outcome is None and call.counterparty_type == "supplier"
+        call_summary = self._build_call_summary(call_id, call, extraction_failed=_extraction_failed)
         if call_summary:
             # Merge into outcome so it travels with the call_ended payload.
             if isinstance(outcome, dict):
@@ -484,11 +487,15 @@ class CallSubsystem:
 
         return outcome
 
-    def _build_call_summary(self, call_id: int, call: Call) -> str:
+    def _build_call_summary(self, call_id: int, call: Call, extraction_failed: bool = False) -> str:
         """Build a concise human-readable summary of what was captured from a call.
 
         Reads ManagerChange cards created for this call (via details.call_id) and
         the call transcript to produce a 2–5 line summary for the desk card.
+
+        ``extraction_failed`` — the supplier-outcome LLM extraction degraded to the
+        canned no-op (unavailable / truncated), so any stated offer was NOT captured.
+        The summary says so plainly instead of the misleading "no updates captured".
         """
         from .models import ManagerChange as _MC  # noqa: PLC0415
         session = self.db_session_factory()
@@ -513,6 +520,11 @@ class CallSubsystem:
             parts.append(f"{len(call_changes)} update{'s' if len(call_changes) != 1 else ''} captured:")
             for c in call_changes[:5]:  # cap at 5
                 parts.append(f"  • {c.summary}")
+        elif extraction_failed and counterparty_turns:
+            parts.append(
+                "⚠️ Couldn't read the supplier's offer from this call — extraction was "
+                "unavailable. If an offer was made, re-run the call to capture it."
+            )
         else:
             parts.append("No specific updates captured from this call.")
 
@@ -672,6 +684,9 @@ class CallSubsystem:
                 "2. VERBATIM QUOTE: verbatim_quote must be the caller's exact words. Never paraphrase.\n"
                 "3. DISCOUNTS vs PRICES: '20% off' = update_type=discount, amount_kind=percent_discount, amount=20. "
                 "A price like '€4.20 per kg' = update_type=price_change, amount_kind=absolute_price, amount=4.20, unit=per_kg.\n"
+                "3b. DISCOUNT CAP: 'X% off up to €Y' caps the euros SAVED at €Y. Set max_discount_amount=Y "
+                "(a ceiling on the benefit, NOT a minimum order value). "
+                "E.g. '50% off up to €30' → update_type=discount, amount_kind=percent_discount, amount=50, max_discount_amount=30.\n"
                 "4. DO NOT DO MATH. Report amount exactly as stated. '20%' → amount=20.0, NOT 0.20. "
                 "The system normalises amounts in code — never convert.\n"
                 "5. SCOPE: 'all items' / 'everything' / 'all products' / 'whole range' → scope=all. "
@@ -708,7 +723,11 @@ class CallSubsystem:
 
         # Low temperature for supplier extraction to minimise hallucination.
         temp = 0.2 if call.counterparty_type == "supplier" else None
-        max_tok = 600 if call.counterparty_type == "supplier" else 300
+        # gemini-2.5-pro (the extraction model) is a thinking model: its reasoning
+        # tokens count against max_output_tokens, so a tight cap truncates the JSON
+        # and the whole extraction silently degrades to canned. Give it comfortable
+        # headroom (thinking is bounded in _gemini_config).
+        max_tok = 3000 if call.counterparty_type == "supplier" else 300
         # Supplier terms drive real ordering — use a stronger reasoning model to
         # parse compound offers reliably. Runs once, post-call, so latency is fine.
         model = config.GEMINI_EXTRACTION_MODEL if call.counterparty_type == "supplier" else None
@@ -725,8 +744,11 @@ class CallSubsystem:
             # captured and no plan change happens. Make that visible.
             if call.counterparty_type == "supplier":
                 logger.warning(
-                    "Call %s: supplier outcome extraction fell back to canned "
-                    "(LLM unavailable) — no supplier terms captured. Check GEMINI_MODEL.",
+                    "Call %s: supplier outcome extraction fell back to canned — no "
+                    "supplier terms captured. The extraction model returned nothing "
+                    "parseable (token budget exhausted by reasoning, timeout, or the "
+                    "model is unavailable). The desk card flags this so the offer can "
+                    "be re-captured.",
                     call_id,
                 )
         else:
@@ -943,6 +965,10 @@ class CallSubsystem:
                                     "type": "number",
                                     "description": "Minimum order value (€) required for the offer to apply. Required for threshold_discount and free_goods types (e.g. 100 for 'orders over €100').",
                                 },
+                                "max_discount_amount": {
+                                    "type": "number",
+                                    "description": "Cap on the euros SAVED by a percentage discount ('50% off up to €30' → 30). This is a ceiling on the benefit, NOT a minimum order value. Omit if the discount is uncapped.",
+                                },
                                 "free_ingredient_name": {
                                     "type": "string",
                                     "description": "Ingredient given for free (for free_goods type only). E.g. 'tomato'.",
@@ -1116,6 +1142,7 @@ class CallSubsystem:
         min_order_value: Optional[float] = None,
         free_ingredient_id: Optional[int] = None,
         free_qty_g: Optional[float] = None,
+        max_discount_amount: Optional[float] = None,
     ) -> Optional["SupplierTerm"]:
         """Upsert a SupplierTerm and create a ManagerChange desk card.
 
@@ -1189,7 +1216,8 @@ class CallSubsystem:
                 direction = "increase" if value < 0 else "discount"
                 scope_desc = "all items" if scope == "all" else ing_name
                 mov_str = f" (orders ≥ €{min_order_value:.0f})" if min_order_value else ""
-                summary = f"{pct}% {direction} on {scope_desc} from {sup_name}{mov_str}"
+                cap_str = f" up to €{max_discount_amount:.0f}" if max_discount_amount else ""
+                summary = f"{pct}% {direction} on {scope_desc} from {sup_name}{cap_str}{mov_str}"
                 if expiry_kind == "orders":
                     summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
                 elif expiry_kind == "date" and expires_at:
@@ -1221,10 +1249,11 @@ class CallSubsystem:
             elif term_type == "discount":
                 pct = round(abs(value) * 100, 1)
                 direction = "increase" if value < 0 else "discount"
+                cap_str = f" up to €{max_discount_amount:.0f}" if max_discount_amount else ""
                 if scope == "all":
-                    summary = f"{pct}% {direction} on all items from {sup_name}"
+                    summary = f"{pct}% {direction} on all items from {sup_name}{cap_str}"
                 else:
-                    summary = f"{pct}% {direction} on {ing_name} ({sup_name})"
+                    summary = f"{pct}% {direction} on {ing_name} ({sup_name}){cap_str}"
                 if expiry_kind == "orders":
                     summary += f" (for {remaining_orders} order{'s' if (remaining_orders or 1) != 1 else ''})"
                 elif expiry_kind == "date" and expires_at:
@@ -1265,6 +1294,7 @@ class CallSubsystem:
                 min_order_value=min_order_value,
                 free_ingredient_id=free_ingredient_id,
                 free_qty_g=free_qty_g,
+                max_discount_amount=max_discount_amount,
             )
             session.add(term)
             session.flush()
@@ -1288,6 +1318,7 @@ class CallSubsystem:
                 "free_ingredient_id": free_ingredient_id,
                 "free_ingredient_name": free_ing_name or None,
                 "free_qty_g": free_qty_g,
+                "max_discount_amount": max_discount_amount,
             }
             change = _MC(
                 kind="supplier_term",
@@ -1387,6 +1418,10 @@ class CallSubsystem:
                 # New offer fields
                 _ext_mov = update.get("min_order_value")
                 _ext_min_order_value: Optional[float] = float(_ext_mov) if _ext_mov is not None else None
+                _ext_max_disc = update.get("max_discount_amount")
+                _ext_max_discount_amount: Optional[float] = (
+                    float(_ext_max_disc) if _ext_max_disc is not None and float(_ext_max_disc) > 0 else None
+                )
                 _ext_free_ing_name = update.get("free_ingredient_name") or ""
                 _ext_free_qty_raw = update.get("free_qty")
                 _ext_free_unit = (update.get("free_unit") or "g").strip().lower()
@@ -1474,6 +1509,7 @@ class CallSubsystem:
                     min_order_value=_ext_min_order_value,
                     free_ingredient_id=_ext_free_ingredient_id,
                     free_qty_g=_ext_free_qty_g,
+                    max_discount_amount=_ext_max_discount_amount,
                 )
         finally:
             session.close()
