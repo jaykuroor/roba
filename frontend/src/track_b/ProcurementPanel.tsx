@@ -812,6 +812,9 @@ export function ProcurementPanel() {
     const offPlan = wsClient.on("procurement_plan_updated", () => {
       void fetchPlan();
       void fetchWarnings();
+      // Auto-execute places POs after the build; refresh the Ordered section too
+      // so just-placed orders appear instead of the panel looking un-ordered.
+      void fetchOrders(deliveredPage);
     });
     return () => {
       offSignal();

@@ -1989,6 +1989,13 @@ class InventoryOptimizer(BaseAgent):
             finally:
                 session5.close()
 
+        # Notify the UI that order state changed: the just-placed rows leave the
+        # Planned list (status→placed) and the new POs enter the Ordered list.
+        # Without this the panel keeps showing the pre-execute "Late" plan rows
+        # and an empty Ordered section, so auto-placed orders look un-ordered.
+        if count or resolved_ids:
+            self.broadcast("procurement_plan_updated", {"orders_executed": count})
+
         return count
 
     def _maybe_reorder(self, ingredient_id: int) -> None:

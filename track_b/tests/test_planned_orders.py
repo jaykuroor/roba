@@ -412,6 +412,36 @@ def test_execute_due_planned_orders_creates_po(bus, session_factory):
         session.close()
 
 
+def test_execute_due_broadcasts_plan_update(bus, session_factory):
+    """Auto-execute must push a procurement_plan_updated WS event so the panel
+    refreshes: the just-placed row leaves the Planned list and the new PO enters
+    the Ordered list.  Without it, auto-ordered rows keep showing as un-ordered
+    'Late' plans and the Ordered section stays empty.
+    """
+    ing_id = _seed_ingredient(session_factory, on_hand=0.0, safety_stock=50.0)
+    sup_id = _seed_supplier(session_factory, ing_id, lead_time_days=1.0, price=2.0, pack_size=10.0)
+    session = session_factory()
+    try:
+        session.add(PlannedOrder(
+            plan_run_id=None, ingredient_id=ing_id, supplier_id=sup_id, qty=100.0,
+            unit="g", unit_price=2.0, order_date=0.0, delivery_date=86400.0,
+            covers_from=86400.0, covers_until=172800.0, status="planned",
+            reason="test", created_at=0.0))
+        session.commit()
+    finally:
+        session.close()
+    bus.sim_time = 10.0
+
+    events: list = []
+    opt = InventoryOptimizer(
+        bus, session_factory, procurement=_FakeProcurement(),
+        ws_broadcast=lambda ev, payload=None: events.append(ev),
+    )
+    assert opt.execute_due_planned_orders() == 1
+    assert "procurement_plan_updated" in events, (
+        "auto-execute must notify the UI so placed orders stop showing as Late plans")
+
+
 # ---------------------------------------------------------------------------
 # Test 6: at_risk status when order_date < now
 # ---------------------------------------------------------------------------
