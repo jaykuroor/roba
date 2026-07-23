@@ -24,6 +24,7 @@ import asyncio
 import logging
 import math
 import os
+import random
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional
 
@@ -280,7 +281,12 @@ def _bootstrap() -> None:
     approvals = ApprovalsHub(bus, factory)
     calls = CallSubsystem(bus, factory, clock, llm)
     formatter = DataFormatter(bus, factory)
-    pos = POSSimulator(bus, factory, clock, formatter, weather=weather)
+    # Deterministic demand replay when SIM_SEED is set (else the global unseeded
+    # RNG → a different customer-order stream every run). Pairs with the
+    # deterministic forecast (forecaster disables LLM authority under a seed) so a
+    # given seed reproduces the exact same procurement plan.
+    _sim_rng = random.Random(config.SIM_SEED) if config.SIM_SEED is not None else None
+    pos = POSSimulator(bus, factory, clock, formatter, weather=weather, rng=_sim_rng)
     scenarios = ScenarioEngine(bus, factory, clock, pos, weather)
 
     # Wire the WS broadcast sinks (§21). order_created flows through the

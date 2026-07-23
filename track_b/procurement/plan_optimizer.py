@@ -992,7 +992,13 @@ def _solve_milp(
         ld = first_day[s_id]  # time-of-day aware: never open a day already past its order-by cutoff
         sup = sup_by_id.get(s_id, {})
         vd = sup.get("volume_discount") or []
-        for d in range(ld, n_days):
+        # Already-scheduled (sunk-PO) delivery days can be piggybacked on even when
+        # their order-by has passed (d < first_day) — the truck is already going.
+        # Without a deliver/q var there, an item that could ride the delivery is
+        # dropped as "uncoverable" instead of joining it (Coffee on the placed
+        # Italian Pantry order). MOV/charge loops already exempt scheduled days.
+        _sched_days = {d for (ss, d) in scheduled_supplier_days if ss == s_id and 0 <= d < n_days}
+        for d in sorted(set(range(ld, n_days)) | _sched_days):
             deliver[s_id, d] = pulp.LpVariable(f"del_{s_id}_{d}", cat="Binary")
             for ti in range(len(vd)):
                 vol_tier[s_id, d, ti] = pulp.LpVariable(
@@ -1014,7 +1020,10 @@ def _solve_milp(
                 continue
             ld = first_day[s_id]  # matches the deliver-day window above
             _disc_tiers = cat_by_is[(iid, s_id)].get("discount") or []
-            for d in range(ld, n_days):
+            # Include scheduled (sunk-PO) days so items can piggyback on an
+            # already-going delivery whose order-by has passed (see deliver loop).
+            _sched_days = {d for (ss, d) in scheduled_supplier_days if ss == s_id and 0 <= d < n_days}
+            for d in sorted(set(range(ld, n_days)) | _sched_days):
                 q[iid, s_id, d] = pulp.LpVariable(
                     f"q_{iid}_{s_id}_{d}", lowBound=0, cat="Integer"
                 )

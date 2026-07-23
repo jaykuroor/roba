@@ -61,6 +61,12 @@ LLM_EXTREME_MULTIPLIERS = (0.0, 2.0)
 LLM_FORECAST_AUTO_MODE = os.getenv("LLM_FORECAST_AUTO_MODE", "1").lower() in {
     "1", "true", "yes", "on"
 }
+# Optional deterministic seed for the demand simulation. When set, the POS order
+# RNG replays the same customer-order stream every run, and the forecast falls
+# back to the deterministic (non-LLM) path — so a given seed reproduces the exact
+# same procurement plan run-to-run. Unset (None) = current stochastic behaviour.
+_sim_seed_raw = os.getenv("SIM_SEED")
+SIM_SEED = int(_sim_seed_raw) if _sim_seed_raw not in (None, "") else None
 COLD_TEMP_C = 12.0
 HOT_TEMP_C = 30.0
 

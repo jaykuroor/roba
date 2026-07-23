@@ -1473,6 +1473,34 @@ def test_capped_discount_absent_is_noop():
     assert len(empty.orders) == len(plain.orders)
 
 
+def test_scheduled_day_before_first_day_allows_piggyback():
+    """An item that can't independently clear MOV must ride an already-scheduled
+    (sunk-PO) supplier delivery whose order-by has passed (scheduled_day <
+    first_day), instead of a later standalone order. Regression for the Coffee
+    'uncoverable' bug: now_time_of_day_s pushes first_day to 4, but a delivery is
+    already scheduled on Day 3 — a single Coffee pack (€40) can't meet the €80 MOV
+    on a fresh day, so it must piggyback on the Day-3 truck."""
+    import track_b.procurement.plan_optimizer as _pm
+    if not _pm._PULP_AVAILABLE:
+        pytest.skip("PuLP not available")
+    n = 8
+    sol = _run(
+        ingredients=[_ing(2, name="Coffee")],
+        catalog=[_cat(1, 2, price=0.02, pack=2000.0)],
+        suppliers=[_sup(1, lead=3.0, mov=80.0, dc=12.0)],
+        demand_by_day={2: {0: 540., 1: 240., 2: 210., 3: 300., 4: 240., 5: 360., 6: 240., 7: 0.}},
+        on_hand={2: 1970.0}, safety_stock={2: 0.0}, n_days=n,
+        params={"slack_penalty": 1000.0, "now_time_of_day_s": 28886.0,
+                "scheduled_supplier_days": {(1, 3)}},
+    )
+    assert sol.coverage_ok
+    coffee = [o for o in sol.orders if o.ingredient_id == 2 and o.qty > 0]
+    assert coffee, "Coffee should be ordered, not left uncoverable"
+    # Rides the scheduled Day-3 delivery (one €40 pack), not a standalone later order.
+    assert any(o.delivery_day == 3 for o in coffee), \
+        f"Coffee should ride the scheduled Day-3 delivery, got {[(o.delivery_day, o.qty) for o in coffee]}"
+
+
 def test_free_goods_perishable_cohort():
     """Free goods for a perishable ingredient are cohort-gated: the free qty
     covers demand only within its shelf life and still surfaces as a free line."""

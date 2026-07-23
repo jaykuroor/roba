@@ -102,7 +102,9 @@ class DemandForecaster(BaseAgent):
         self.ws_broadcast = ws_broadcast
         self.llm = llm
         self.approvals = approvals
-        self.llm_auto_mode = bool(config.LLM_FORECAST_AUTO_MODE)
+        # A SIM_SEED forces the deterministic forecast so the whole sim is
+        # reproducible (LLM forecasts vary run-to-run).
+        self.llm_auto_mode = bool(config.LLM_FORECAST_AUTO_MODE) and config.SIM_SEED is None
         self.forecast_job_enqueue: Optional[Callable[[str, str], Any]] = None
         self.subscribe(["forecasting"])
         # Track which sim-day the batch advisor last ran to ensure once-per-day.
