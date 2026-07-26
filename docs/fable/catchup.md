@@ -40,7 +40,7 @@ summarizer fills in.
    incident history for the window — see [incidents.md](incidents.md) for why
    incidents should become first-class).
 2. Bucket events by subsystem before prompting (procurement, staffing, kitchen,
-   reviews, promos...) — `EventLog.event_type` / `payload` carry enough to
+   reviews, promos...) — `EventLog.category` / `detail` carry enough to
    group deterministically; let the LLM write prose *per bucket*, not over the
    raw firehose. Target shape: the example in the product brief — "X task was
    done 5 min late", "promo applied on procurement (expand for details)".

@@ -46,8 +46,11 @@ To implement:
 3. In `manager._instance_overview`, replace the hardcoded
    `"orders_waiting": None, "ticket_time_min": None` with the snapshot fields,
    and extend `derive_status` (backlog above a threshold → warning/critical).
-   The UI (`frontend/src/admin/AdminPage.tsx`, "Tickets / safety" metric)
-   already has the slot.
+   The UI needs a new "Tickets / safety" metric: the card grid in
+   `frontend/src/admin/AdminPage.tsx` is a hardcoded `grid-cols-3` of
+   Sales / Orders / Staff, so the field is typed in `useAdminData.ts` but
+   rendered nowhere. (Corrected 2026-07-27 — this doc previously claimed the
+   slot already existed.)
 
 ### Safety / equipment issues
 
