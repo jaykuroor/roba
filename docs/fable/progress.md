@@ -48,7 +48,7 @@ Last full audit of the codebase against the docs: **2026-07-27**.
 | [manager-dashboard.md](manager-dashboard.md) | ✅ implemented | — | — |
 | [approvals.md](approvals.md) | ✅ implemented | — | — |
 | [kitchen-task-notices.md](kitchen-task-notices.md) | 🟡 partial | task compliance in the manager overview; failed temp/safety → signal | 2 |
-| [portfolio-overview.md](portfolio-overview.md) | 🟡 partial | `orders_waiting`, `ticket_time_min`, `safety_issues` — all hardcoded `None` (`manager.py:584,624`) | 1, 2 |
+| [portfolio-overview.md](portfolio-overview.md) | 🟡 partial | `safety_issues` — still hardcoded `None` (`manager.py:639`); `orders_waiting` / `ticket_time_min` landed in Phase 1 | 2 |
 | [priority-action-queue.md](priority-action-queue.md) | 🟡 partial | € impact in `build_issues`; deadlines for non-approval issues | 3 |
 | [incidents.md](incidents.md) | 🟠 partial | 3 missing detectors; incidents not first-class objects | 2, 3, 4 |
 | [catchup.md](catchup.md) | 🟠 infra only | LLM summary, expand-for-detail, history drawer, merge, auto-capture | 5, 6 |
@@ -58,7 +58,8 @@ Last full audit of the codebase against the docs: **2026-07-27**.
 HTTP+WS proxy, `/admin/api/overview` with the ranked `actions` queue, `/admin/api/approvals`
 with pass-through resolve, `/admin/api/incidents` (derived, 4 of 7 categories),
 `/admin/api/summary` (numeric briefing), catch-up **capture** infrastructure, kitchen-task
-escalating notices, and the `/admin` UI with its 4 tabs.
+escalating notices, the `/admin` UI with its 4 tabs, and (Phase 1) the kitchen ticket
+lifecycle with its `Tickets` card metric and Controls mode toggle.
 
 ---
 
@@ -91,52 +92,73 @@ the existing capture infrastructure, so it can run any time after Phase 1.
 ### Phase 1 — Kitchen ticket lifecycle + the Tickets metric
 
 Unblocks `orders_waiting` / `ticket_time_min` ([portfolio-overview.md](portfolio-overview.md))
-and the `order_backlog` detector in Phase 3. Today `core/pos_simulator.py:354` creates every
-order `status="closed"` — nothing models waiting → cooking → served.
+and the `order_backlog` detector in Phase 3. ~~Today `core/pos_simulator.py:354` creates every
+order `status="closed"` — nothing models waiting → cooking → served.~~ It does now: orders
+enter the pass `queued` and are drained at a staffing-dependent rate. `Order.status` is
+untouched — it stays the *payment* state, `kitchen_status` is the new ticket state, so POS
+revenue/stats reporting is unaffected.
 
 **Child**
 
-- [ ] `core/models.py` `Order`: add `kitchen_status` (`queued|cooking|served`, default
+- [x] `core/models.py` `Order`: add `kitchen_status` (`queued|cooking|served`, default
       `served`) and `served_at` (Float, nullable), plus two `_migrate_schema` lines.
-- [ ] `core/models.py` `SimSettings`: add `kitchen_ticket_mode` (`lifecycle|instant`,
+      — 869482e
+- [x] `core/models.py` `SimSettings`: add `kitchen_ticket_mode` (`lifecycle|instant`,
       default `lifecycle`) + migration + `PosBody` field/validator — follow
-      `availability_oos_mode` end to end (see §4).
-- [ ] `core/pos_simulator.py` `_persist()` (`:360`): stamp `queued` in lifecycle mode, or
+      `availability_oos_mode` end to end (see §4). — 869482e
+- [x] `core/pos_simulator.py` `_persist()` (`:360`): stamp `queued` in lifecycle mode, or
       `served` + `served_at = sim_time` in instant mode (today's behaviour, `:348-357`).
-- [ ] `core/pos_simulator.py` `tick()` (`:380`): drain step — capacity per tick =
+      — 869482e. **Landed in `generate_order` instead of `_persist`** (`:356-374`):
+      `generate_order` already holds the `_Settings` row, so stamping there costs no extra
+      settings read and keeps `_persist` a pure writer.
+- [x] `core/pos_simulator.py` `tick()` (`:380`): drain step — capacity per tick =
       `cooks_present × KITCHEN_TICKETS_PER_COOK_PER_HOUR × Δsim/3600`, advancing
       oldest-first `queued → cooking → served`. Reuse
       `core/availability.py::_staff_available` (`:120-140`) for presence rather than
-      re-reading `Attendance`.
-- [ ] `core/config.py`: `KITCHEN_TICKETS_PER_COOK_PER_HOUR` (env-overridable, default ~12) —
+      re-reading `Attendance`. — 869482e. `_drain_tickets` (`:416`) +
+      `_cooks_present` (`:397`); see §4 for the fractional-capacity gotcha.
+- [x] `core/config.py`: `KITCHEN_TICKETS_PER_COOK_PER_HOUR` (env-overridable, default ~12) —
       this is the calibration knob, leave it tunable; plus `BACKLOG_WARN` / `BACKLOG_CRIT`.
-- [ ] `core/ops_snapshot.py`: add `queued_count`, `cooking_count`, `avg_ticket_minutes`
+      — 869482e (`config.py:48-63`, defaults 12 / 8 / 20)
+- [x] `core/ops_snapshot.py`: add `queued_count`, `cooking_count`, `avg_ticket_minutes`
       (rolling over orders served in the last sim-hour) to the returned dict (`:222-234`).
+      — 869482e (`:236-266`)
 
 **Manager + UI**
 
-- [ ] `manager._instance_overview`: fill `orders_waiting` / `ticket_time_min` from the
+- [x] `manager._instance_overview`: fill `orders_waiting` / `ticket_time_min` from the
       snapshot in **both** branches (`:584` offline/busy, `:624` online) — they must stay in
-      step or an offline card reports stale numbers.
-- [ ] `manager.derive_status` (`:98`): backlog above threshold → `warning`, well above →
-      `critical`.
-- [ ] `frontend/src/admin/AdminPage.tsx:193-203`: `grid-cols-3` → `grid-cols-4`, new
+      step or an offline card reports stale numbers. — 869482e (`:597` stays `None` — an
+      offline card has no snapshot to read; `:636-637` online). A fan-out test now asserts
+      the two branches expose the same keys.
+- [x] `manager.derive_status` (`:98`): backlog above threshold → `warning`, well above →
+      `critical`. — 869482e
+- [x] `frontend/src/admin/AdminPage.tsx:193-203`: `grid-cols-3` → `grid-cols-4`, new
       `Metric label="Tickets"`. **The slot does not exist yet** despite what
-      portfolio-overview.md claims (see §4).
-- [ ] Controls toggle for `kitchen_ticket_mode` in `frontend/src/shell/control/` — POS
-      settings live in `PosMixPanel.tsx`.
+      portfolio-overview.md claims (see §4). — 869482e (`:215-225`, `TicketBacklog`
+      renders `<backlog> <avg>m avg`)
+- [x] Controls toggle for `kitchen_ticket_mode` in `frontend/src/shell/control/` — POS
+      settings live in `PosMixPanel.tsx`. — 869482e (`KitchenTicketModeToggle`, PATCHes
+      on change rather than on Apply — see §4)
 
 **Tests**
 
-- [ ] `tests/test_pos_ticket_lifecycle.py`: backlog grows with cooks absent and drains when
+- [x] `tests/test_pos_ticket_lifecycle.py`: backlog grows with cooks absent and drains when
       present; `instant` mode reproduces today's born-closed behaviour; `served_at` is set
-      exactly once.
-- [ ] `tests/test_manager.py`: backlog `derive_status` cases.
-- [ ] `frontend/src/admin/__tests__/AdminPage.test.tsx` rendering a stubbed overview —
+      exactly once. — 869482e (11 tests)
+- [x] `tests/test_manager.py`: backlog `derive_status` cases. — 869482e
+- [x] `frontend/src/admin/__tests__/AdminPage.test.tsx` rendering a stubbed overview —
       **this is a new pattern**, no test renders `AdminPage` with data today (§4).
+      — 869482e (mocks `../../api` `apiGet` per path and drives the real `useAdminData`)
 
 **Done when** a restaurant with a sick cook shows a rising ticket count on its admin card,
 and flipping the Controls toggle to `instant` returns it to zero.
+
+> Discovered while building (added 2026-07-27), both fixed in 869482e:
+> an idle pass banked drain capacity overnight and flash-cleared the next morning's
+> first orders (`_drain_tickets` now zeroes `_drain_credit` when the pass is empty), and
+> flipping to `instant` would have frozen an existing backlog rather than clearing it
+> (instant mode flushes leftovers every tick, so the "Done when" line actually holds).
 
 ---
 
@@ -173,7 +195,10 @@ Completes every incident category (`unavailable_categories` → `[]`) and finish
 [priority-action-queue.md](priority-action-queue.md). **Depends on Phase 1.**
 
 - [ ] `SignalType.ORDER_BACKLOG` — emitted from the POS tick when queue depth or ticket time
-      crosses the Phase 1 thresholds.
+      crosses the Phase 1 thresholds. Those are in place: `config.BACKLOG_WARN` /
+      `BACKLOG_CRIT`, and `POSSimulator._drain_tickets` (`core/pos_simulator.py:416`)
+      already counts the open pass every tick — emit from there, and mind
+      `SIGNAL_COOLDOWN_SIM_S` or a sustained backlog signals on every tick.
 - [ ] **First, settle the `_fire_scenario_events` duplicate-firing bug** (§5) — otherwise
       the scenario event below is consumed before it ever dispatches.
 - [ ] `SignalType.EQUIPMENT_FAILURE` + an `equipment_failure` handler in the
@@ -288,11 +313,10 @@ The non-obvious facts that shape this work. **Read this section before starting 
   [catchup.md](catchup.md) §2 says `event_type`. Values in use include `optimizer`,
   `po_placed`, `po_delivered`, `waste`, `forecast`, `attendance`, `menu_toggle`, `call`,
   `promo_activated`, `receipt`, `scenario`.
-- **The "Tickets / safety" UI slot does not exist.**
-  [portfolio-overview.md](portfolio-overview.md) says the UI "already has the slot";
-  `AdminPage.tsx:193-203` is a hardcoded `grid-cols-3` of Sales / Orders / Staff.
-  `orders_waiting` / `ticket_time_min` / `safety_issues` are typed in
-  `useAdminData.ts:26-28` and rendered nowhere.
+- ~~**The "Tickets / safety" UI slot does not exist.**~~ **Resolved in Phase 1** — the card
+  grid is now `grid-cols-4` with a `Tickets` metric (`AdminPage.tsx:215-225`) fed by
+  `orders_waiting` / `ticket_time_min`. `safety_issues` is still typed-but-unrendered
+  (`useAdminData.ts:28`); Phase 2 puts it in that same slot.
 
 ### Simulator
 
@@ -307,6 +331,30 @@ The non-obvious facts that shape this work. **Read this section before starting 
 - **Additive schema changes need two edits**: the model column **and** an
   `ALTER TABLE … ADD COLUMN` line in `_migrate_schema` (`core/api.py:210-228`).
   `create_all()` cannot alter existing tables and `demo.db` is committed to the repo.
+- **The kitchen drain must carry fractional capacity between ticks** (added 2026-07-27).
+  A tick is 15 sim-s at 1×, so `cooks × 12 / 3600 × 15` is ~0.02 tickets — truncating per
+  tick drains *nothing, ever*, and the backlog looks broken rather than slow.
+  `POSSimulator._drain_credit` (`core/pos_simulator.py:149`) banks the remainder. It is
+  reset on a backward clock jump **and** whenever the pass is empty, so a closed night
+  cannot bank hours of capacity and flash-clear the next morning.
+- **One drain unit = one ticket served + one pulled off the queue**, so a ticket always
+  spends one slot in `cooking` and throughput equals the configured rate exactly. Serve
+  *before* promoting — promoting first lets a ticket cross `queued → served` in a single
+  step and `cooking_count` never leaves zero.
+- **`BASE_ORDERS_PER_DAY` is nominal, not actual** (added 2026-07-27, measured). The POS
+  rate is `base_orders_per_day × daypart_weight / 54000` per sim-second, and the shipped
+  `DAYPARTS` weights integrate to ~0.25 of a full day — so the default 300 produces ~76
+  orders/sim-day, peaking around **7/hour** at lunch. Anything sized against "300 a day"
+  will be ~4× too generous. It is why `KITCHEN_TICKETS_PER_COOK_PER_HOUR = 12` means one
+  present cook clears the pass single-handed: at default volume the backlog only builds
+  when the kitchen is *empty*. Lower the knob (~5) or raise `base_orders_per_day` to demo a
+  single absence biting. Phase 3's backlog thresholds should be set against measured
+  numbers, not the nominal ones.
+- **"Cook" is a role-substring match** (`COOK_ROLE_HINTS = ("cook", "chef")`,
+  `core/pos_simulator.py:28`) because `Staff.role` is a free string — the presets use
+  `cook` / `line_cook` / `fry_cook` / `grill_chef` / `head_chef`. A preset whose roles match
+  none of them falls back to counting **all** active staff rather than pinning capacity at
+  zero forever.
 - **Adding a `SignalType` touches four places or it breaks**: the enum
   (`core/signals.py:26-68`), a `<Name>Payload` model (`:273-632`), `SIGNAL_PAYLOADS`
   (`:636`), and `SIGNAL_REGISTRY` (`:76`). Omitting the **registry** entry is a hard
@@ -326,6 +374,12 @@ The non-obvious facts that shape this work. **Read this section before starting 
   branch (`:584`) and an online branch (`:624`). Every new field must be added to both.
 - **Aggregation logic must stay pure and unit-tested** (`derive_status`, `build_issues`,
   `rank_issues`, `merge_incidents`); async endpoints only fetch and delegate.
+- **Shared constants are mirrored, not imported** (added 2026-07-27). `APPROVAL_TTL_SIM_S`
+  set the precedent and Phase 1 followed it: `BACKLOG_WARN` / `BACKLOG_CRIT`
+  (`manager.py:56-58`) read the **same env var names** as `core.config`, so overriding one
+  overrides both without the manager growing a `core` import. Importing `core` is still
+  fine for Phases 5-6 (see above) — this is a style choice for two ints, not a rule.
+  `AdminPage.tsx:51-52` mirrors them a third time for the metric's colour.
 
 ### LLM
 
@@ -347,13 +401,22 @@ The non-obvious facts that shape this work. **Read this section before starting 
 - **`tests/test_api_session_lifecycle.py:27,32` calls `db.reset_db()` against the real
   `config.DB_PATH`** — running the Python suite **wipes the committed `demo.db`**. Back it
   up first or point `DB_PATH` at a scratch file.
-- **`tests/test_manager.py` has zero fan-out coverage** — pure functions only, no
-  `TestClient`, no mocking of any kind. Phase 1 establishes the pattern (monkeypatch
-  `manager._get` and `manager.registry.instances`); later phases follow it.
-- **No frontend test renders `AdminPage` with data** — `src/admin/__tests__/` contains only
-  `routing.test.tsx`. Phase 1 establishes that pattern too. Vitest + jsdom +
+- ~~**`tests/test_manager.py` has zero fan-out coverage**~~ — **the pattern now exists**
+  (Phase 1): `_overview(monkeypatch, {path_prefix: payload})` stubs `manager._get` and
+  calls `manager._instance_overview` under `asyncio.run`. No child, no HTTP, no registry.
+  Copy it for every later card field.
+- ~~**No frontend test renders `AdminPage` with data**~~ — **the pattern now exists**
+  (Phase 1): `src/admin/__tests__/AdminPage.test.tsx` mocks `../../api` so `apiGet`
+  answers per path, then drives the **real** `useAdminData`. Vitest + jsdom +
   `@testing-library/react`; shared helpers in `frontend/src/test/` (`wsMock.ts`,
-  `relativePaths.ts`).
+  `relativePaths.ts`). Note the mock must answer `/admin/api/{overview,approvals,
+  incidents,presets}` — a missing one throws inside the hook and the page renders empty.
+- **A `git worktree` starts without `.env` and `roba.json`** (added 2026-07-27) — both are
+  gitignored, so a worktree has no Vertex credentials and ~14 LLM-dependent tests
+  (`track_a/tests/test_forecaster.py`, `test_staff.py`, `track_b/tests/test_market.py`,
+  `test_optimizer.py`) fail on the canned fallback for reasons that have nothing to do with
+  your change. `cp ../../../.env ../../../roba.json .` before trusting a suite run.
+  `frontend/node_modules` is likewise absent — symlink it rather than reinstalling.
 - Frontend typecheck is folded into `npm run build` (`tsc -b`) — there is no separate
   `typecheck` script, and `make test` does not run the build.
 - Tailwind classes must be **statically named** (`frontend/tailwind.config.ts` comment) —
@@ -379,6 +442,13 @@ recorded because they will bite an implementor.
   event.
 - **`make test` skips `track_a/tests`** (`Makefile:32`) while `pytest.ini` includes it.
 - **The Python suite destroys `demo.db`** — see §4 Tests.
+- **The frontend suite has 7 failing tests and the build has 5 type errors**, all
+  pre-existing and unrelated to the fable work (verified against `main`, 2026-07-27).
+  Tests: `src/track_b/__tests__/InventoryDashboard.test.tsx` (2) and
+  `SupplierEditor.test.tsx` (5). `tsc -b`: `src/voice/ManagerVoice.tsx:440,443,457`
+  (`unknown` → `ReactNode`) and `src/voice/MicButton.tsx:22,32` (`VoiceState` gained a
+  `reconnecting` member that the two label maps never got). Diff your `tsc` output against
+  `main`'s rather than reading "5 errors" as your fault.
 - `KitchenTask.notified_manager`'s model comment says "bool 0/1" (`core/models.py:414`) but
   the code uses it as a **tier counter** 0..3 (`kitchen_tasks.py:317,349,358-360`). The
   comment is stale.

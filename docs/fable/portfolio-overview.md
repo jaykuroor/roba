@@ -1,6 +1,6 @@
 # Portfolio Overview — all restaurants on one screen
 
-Status: **implemented** except two fields (below).
+Status: **implemented** except `safety_issues` (below).
 
 ## What exists
 
@@ -15,42 +15,37 @@ queue. Per card, sourced by fan-out to the child:
 | `staff_present` / `staff_total` / `absent` | `/api/ops/snapshot` | attendance-derived, `status != "present"` = absent |
 | `stock_risks` | `/api/ops/snapshot` (low stock) + `/api/track-b/procurement/warnings` (uncoverable) | |
 | `pending_approvals` | `/api/approvals?status=pending` | count; details in the queue/approvals sections |
-| `orders_waiting`, `ticket_time_min` | — | **not implemented**, returned as `null` |
+| `orders_waiting`, `ticket_time_min` | `/api/ops/snapshot` | `queued_count` and `avg_ticket_minutes`, from the kitchen ticket lifecycle |
 | `safety_issues` | — | **not implemented**, returned as `null` |
 
 ### Status rules (`manager.derive_status`, tested in `tests/test_manager.py`)
 
 - **offline** — child `/api/health` unreachable.
-- **critical** — any of: uncoverable ingredient warning; depleted ingredient;
-  unstaffed station; pending approval with critical-class urgency
-  (`critical` / `uncoverable`).
+- **critical** — any of: uncoverable ingredient warning; kitchen backlog at or
+  above `BACKLOG_CRIT`; depleted ingredient; unstaffed station; pending approval
+  with critical-class urgency (`critical` / `uncoverable`).
 - **warning** — any of: below-safety-stock ingredient; any pending approval;
-  any absent staff (still covered).
+  kitchen backlog at or above `BACKLOG_WARN`; any absent staff (still covered).
 - **normal** — otherwise.
 
+## Kitchen ticket lifecycle
+
+Orders are no longer born done. `Order.kitchen_status` is
+`queued | cooking | served` with a `served_at` sim-time, and the POS tick drains
+the pass oldest-first at `cooks_present × config.KITCHEN_TICKETS_PER_COOK_PER_HOUR`
+— so a sick cook visibly grows a backlog and a full brigade clears it. Presence
+comes from the same `core/availability.py::_staff_available` rules that unstaff a
+station.
+
+`/api/ops/snapshot` exposes `queued_count`, `cooking_count` and
+`avg_ticket_minutes` (rolling over the last sim-hour); the card reads the first
+and last as `orders_waiting` / `ticket_time_min`.
+
+`SimSettings.kitchen_ticket_mode` (Controls → POS) switches between `lifecycle`
+(default) and `instant`, which restores the old born-served behaviour and
+flushes any backlog left on the pass.
+
 ## Not implemented — guidance
-
-### Orders waiting + ticket time
-
-Roba has no kitchen ticket lifecycle: `Order`/`OrderLine` rows are created by
-the POS simulator already "done" — nothing models *waiting → cooking → served*.
-To implement:
-
-1. Add a ticket state to orders (e.g. `Order.kitchen_status:
-   queued|cooking|served` + `served_at` sim-time), advanced by a kitchen agent
-   or a simple service-rate model in the POS simulator (staffing-dependent:
-   fewer present staff → slower drain → backlog grows).
-2. Expose `queued_count` and rolling `avg_ticket_minutes` — cheapest is to add
-   them to `/api/ops/snapshot` (see the "add a child endpoint" guideline in
-   [manager-dashboard.md](manager-dashboard.md)).
-3. In `manager._instance_overview`, replace the hardcoded
-   `"orders_waiting": None, "ticket_time_min": None` with the snapshot fields,
-   and extend `derive_status` (backlog above a threshold → warning/critical).
-   The UI needs a new "Tickets / safety" metric: the card grid in
-   `frontend/src/admin/AdminPage.tsx` is a hardcoded `grid-cols-3` of
-   Sales / Orders / Staff, so the field is typed in `useAdminData.ts` but
-   rendered nowhere. (Corrected 2026-07-27 — this doc previously claimed the
-   slot already existed.)
 
 ### Safety / equipment issues
 
