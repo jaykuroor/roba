@@ -51,8 +51,12 @@ Last full audit of the codebase against the docs: **2026-07-27**.
 | [portfolio-overview.md](portfolio-overview.md) | ✅ implemented | — | — |
 | [priority-action-queue.md](priority-action-queue.md) | ✅ implemented | — | — |
 | [incidents.md](incidents.md) | ✅ implemented | — | — |
-| [catchup.md](catchup.md) | 🟡 partial | merge, auto-capture | 6 |
-| [daily-summary.md](daily-summary.md) | 🟡 partial | LLM prose briefing, tomorrow-specific risk, end-of-day archive | 6 |
+| [catchup.md](catchup.md) | ✅ implemented | — | — |
+| [daily-summary.md](daily-summary.md) | ✅ implemented | — | — |
+
+**Every doc in this folder is now implemented.** The phase plan below is complete;
+what follows is kept as the build record and, in §4/§5, as the things that will bite
+whoever touches this next.
 
 **Already implemented and verified** (do not rebuild): manager registry / child spawn /
 HTTP+WS proxy, `/admin/api/overview` with the ranked `actions` queue, `/admin/api/approvals`
@@ -65,7 +69,9 @@ lifecycle with its `Tickets` card metric and Controls mode toggle, (Phase 2) the
 `EQUIPMENT_FAILURE` detectors plus € at stake and order-by deadlines on the action queue,
 and (Phase 4) first-class incidents in `dbdata/manager.db` with ack / resolve / history,
 and (Phase 5) the catch-up summarizer (`bucket_events` + one prompt per subsystem) with
-the per-restaurant catch-up drawer.
+the per-restaurant catch-up drawer, and (Phase 6) sim-day rollover detection driving
+auto-capture + the end-of-day summary archive, catch-up merge, the on-demand LLM
+portfolio briefing, and next-day coverage risk.
 `/admin/api/incidents` now covers **all 7 categories** (`unavailable_categories` is `[]`).
 
 ---
@@ -424,24 +430,64 @@ Finishes [catchup.md](catchup.md) and [daily-summary.md](daily-summary.md).
       incidents_in_window(id, since, until))` — no new prompt code, and mind the
       per-bucket cap (`CATCHUP_MAX_EVENTS_PER_BUCKET`, 120): a merged week will truncate,
       and `truncated` is already reported per bucket so the UI can say so.
-- [ ] Manager background task polling each child's `sim.day_number` (already returned by
+      — 0118b36. Landed with a **pure `merge_gap`** that refuses the merge when the
+      requested run is not contiguous, rather than quietly concatenating across the hole:
+      captures are contiguous by construction, so a gap means a capture file was deleted,
+      and merging anyway would claim to cover a window it has no events for. Returns a
+      transient result; the originals are read, never rewritten.
+- [x] Manager background task polling each child's `sim.day_number` (already returned by
       `/api/health`), last-seen day persisted in the Phase 4 SQLite. **There is no
-      day-rollover hook in the sim** (§4) — the manager must detect it.
-- [ ] On rollover: create a catch-up **and** snapshot `/admin/api/summary` to
+      day-rollover hook in the sim** (§4) — the manager must detect it. — 0118b36.
+      `_rollover_watch` (started in `lifespan`) wraps a pure `day_rollover` plus an
+      `instance_days` table; `check_rollovers` is a separate coroutine so the sweep is
+      testable without a running event loop. See §4 for the three edge cases it encodes.
+- [x] On rollover: create a catch-up **and** snapshot `/admin/api/summary` to
       `dbdata/summaries/<id>/day-NNN.json` (copy the catch-up marker machinery).
-- [ ] LLM prose briefing over the existing `daily_summary` JSON — on demand or once per
+      — 0118b36. `NNN` is the day that **ended**, not the one starting — it is an
+      *end-of-day* archive. The file holds the whole **portfolio** summary keyed by the
+      instance whose rollover triggered it (§4).
+- [x] LLM prose briefing over the existing `daily_summary` JSON — on demand or once per
       sim-day, **never per poll** (the summary endpoint is polled every 30s). Provider
-      errors surfaced in the UI.
-- [ ] `next_day_risks` enriched by joining `/api/track-a/forecast/horizons` with plan
-      `covers_until`, inside `manager.daily_summary` — not the frontend.
-- [ ] UI: briefing prose panel + archive day picker + merge control in the history drawer.
-- [ ] Tests: merge window contiguity; rollover fires exactly once per sim-day.
+      errors surfaced in the UI. — 0118b36. On demand only, via **POST**
+      `/admin/api/briefing` — a GET would invite exactly the polling the caution warns
+      about. `briefing_context` trims the restaurant cards to headline numbers so the
+      nested snapshots never reach the prompt. Same canned guard as Phase 5, and an empty
+      or whitespace `briefing` string counts as failure: a blank briefing renders as
+      "all quiet", which is the most expensive possible lie.
+- [x] `next_day_risks` enriched by joining `/api/track-a/forecast/horizons` with plan
+      `covers_until`, inside `manager.daily_summary` — not the frontend. — 0118b36.
+      Pure `next_day_coverage_risks`. Scoped to cover lapsing **during tomorrow**: cover
+      that already lapsed is today's problem and `build_issues` raises it as low stock,
+      so including it here would list the same ingredient twice.
+- [x] UI: briefing prose panel + archive day picker + merge control in the history drawer.
+      — 0118b36 (`BriefingProse`, `SummaryView`, and a `Catch-ups` / `Day archive` switch
+      inside `CatchupDrawer`). The briefing tab's metric block was extracted into
+      `SummaryView` so a live day and an archived day render through one code path.
+- [x] Tests: merge window contiguity; rollover fires exactly once per sim-day. — 0118b36.
+      `tests/test_rollover_and_briefing.py` (29) + `AdminPage.test.tsx` (+6).
 
 **Done when** a sim-day rollover creates a capture and archives that day's summary with
 nobody pressing a button.
 
-> This phase is the most divisible. If it runs long, ship merge + auto-capture first and
-> leave the briefing/archive for a follow-up session — say so here when you do.
+> Verified against a real manager process (0118b36). A stub child served `/api/health`
+> with a day number under test control; the manager ran with `MANAGER_ROLLOVER_POLL_S=1`
+> and nothing else touched it. At day 2 it wrote nothing. Flipping the child to day 3
+> produced `catchups/running_fox/000001.json` (window `0.0 → 262800.0`) **and**
+> `summaries/running_fox/day-002.json` — the day that ended — and five further polls
+> inside day 3 added neither. Killing the manager and restarting it against the same
+> `MANAGER_STATE_DIR` re-archived nothing (the `instance_days` row did its job), and the
+> next flip to day 4 produced `000002.json` + `day-003.json`.
+>
+> Merge verified over real HTTP with the real model: `{"from":1,"to":2}` across two
+> captures returned one window `0.0 → 200.0` with 3 events and the bullet *"Three
+> purchase orders were placed."* citing `[1, 2, 3]` — ids from **both** captures, which
+> is the proof that merging actually joins windows rather than summarizing the last one.
+> `{"from":2,"to":4}` over a deleted `#3` returned HTTP 400
+> *"catch-up #3 is missing — cannot merge across a hole in the audit trail."*
+>
+> Briefing verified against real Vertex: `gemini-2.5-pro` wrote five lines in 10.6s
+> (*"Bella's Trattoria walk-in fridge is at 9C; an engineer has been called."* …), and
+> `gemini-2.5-not-a-model` failed in 2.8s with an error and an empty `prose`.
 
 ---
 
@@ -480,7 +526,16 @@ The non-obvious facts that shape this work. **Read this section before starting 
 - **There is no day-rollover hook anywhere.** `day_number` is a derived field recomputed on
   every write (`core/clock.py:187`); per-day rows are lazily materialized on first read of
   the new day (`kitchen_tasks.ensure_tasks_for_day`). Anything that must happen "once per
-  sim-day" has to detect the boundary itself.
+  sim-day" has to detect the boundary itself. The manager now does
+  (`manager.day_rollover`, Phase 6) and its three edge cases are the ones any other
+  detector will hit too (added 2026-07-27): a **first sighting** must archive nothing (the
+  day was already underway, so there is no window to snapshot); a **backward jump** is a
+  reseed rewinding the clock and must re-base silently rather than archive a day about to
+  be replayed; and **several days at once** — trivially reachable at high sim speed
+  against any poll interval — must report only the most recent completed day, because
+  snapshotting *now* three times and labelling the copies day 2, 3 and 4 is fiction. The
+  last-seen day is persisted (`instance_days` in `dbdata/manager.db`), or every manager
+  restart re-fires the rollover for whatever day is in progress.
 - **Sim toggles have an established pattern**: a column on the `SimSettings` singleton
   (`core/models.py:1040-1053`) → a field + validator on `PosBody` (`core/api.py:568-582`) →
   `GET/PATCH /api/sim/pos` (`:725,736`) → a control in `frontend/src/shell/control/`.
@@ -593,6 +648,33 @@ The non-obvious facts that shape this work. **Read this section before starting 
   `opened_at`, i.e. sim-time. Don't "unify" them without deciding which clock the UI means.
 - **Card fields are assembled in two places** — `_instance_overview` has an offline/busy
   branch (`:584`) and an online branch (`:624`). Every new field must be added to both.
+- **The manager's SQLite schema is one `executescript`, so new tables migrate for free**
+  (added 2026-07-27). `_MANAGER_SCHEMA` (renamed from `_INCIDENT_SCHEMA` when Phase 6 put
+  `instance_days` beside `incidents`) is all `CREATE TABLE IF NOT EXISTS` and runs on
+  every `incidents_db()` call, so adding a table needs no migration step — unlike the
+  child, where `create_all()` cannot alter an existing table and `_migrate_schema` needs
+  a hand-written `ALTER TABLE`. Adding a **column** to an existing manager table would
+  still need one; there are none yet.
+- **`/admin/api/summary` is polled every 30s; `/admin/api/overview` every 5s**
+  (added 2026-07-27). That gap decides where a new join belongs. Phase 6's next-day
+  coverage risk deliberately re-reads the procurement plan that `_instance_overview`
+  already fetched rather than sharing it, because sharing would mean pulling the forecast
+  horizons onto the 5s path — six times the child load — and putting a next-*day* lens
+  into the priority queue, which is a today surface. Duplicating one child read on the
+  slow path was the cheaper side of the trade; don't "fix" it without re-checking that.
+- **The end-of-day archive stores the whole portfolio, keyed by one instance**
+  (added 2026-07-27). `dbdata/summaries/<instance_id>/day-NNN.json` holds
+  `/admin/api/summary` in full — every restaurant — with `instance_id` recording only
+  *whose* rollover triggered the snapshot. That is deliberate: the archive answers "what
+  did the estate look like when this restaurant's day ended", which is what makes two
+  archived days comparable. `NNN` is the day that **ended**, not the one starting.
+- **`HorizonForecast.breakdown.by_day[].day_index` is relative to that horizon's own
+  start**, not to today (added 2026-07-27). Matching "tomorrow" on `day_index == 1` is
+  wrong for any horizon that did not begin today; `next_day_coverage_risks` matches on the
+  absolute `start` window instead. The header rows from
+  `/api/track-a/forecast/horizons` carry `breakdown` in full (`_row_to_dict` serializes
+  every column, JSON ones included), so the per-day totals need no second call to
+  `/horizon/{id}`.
 - **Cuisine resolution lives in `kitchen_tasks.active_cuisine(session)`** (moved there
   2026-07-27). It used to be `api._active_cuisine()`, which opens its own session — unusable
   from `core/ops_snapshot`, which already holds one and cannot import `core.api` (circular).
@@ -632,6 +714,15 @@ The non-obvious facts that shape this work. **Read this section before starting 
   `summarize_catchup` is. An `async def` would block the manager's event loop for the whole
   Gemini call (~35s measured for a 5-bucket capture), stalling every child health probe and
   every other dashboard poll with it.
+- **An empty LLM answer is a failure, not a quiet day** (added 2026-07-27). `write_briefing`
+  treats a missing, non-string or whitespace-only `briefing` as an error alongside the
+  `CANNED_NOTE` case. A blank panel where prose should be reads as "all quiet across the
+  estate", which is the most expensive thing this dashboard could get wrong. Any future
+  LLM call site whose output is *rendered as reassurance* needs the same check — the
+  canned marker alone does not catch a model that answered with nothing.
+- **Briefing latency is ~10s, catch-up summaries ~35s** (added 2026-07-27, measured on
+  `gemini-2.5-pro`). The briefing is one prompt; the catch-up is one per non-empty bucket.
+  Both are POST-only and on demand — never hang either off a polled GET.
 - **One prompt per bucket means one round trip per bucket** (added 2026-07-27, measured).
   A capture touching all 8 subsystems is 8 serial `gemini-2.5-pro` calls; 5 buckets over 8
   events took 35s. They are prompted sequentially on purpose (a `ponytail:` note marks it

@@ -1,7 +1,7 @@
 # Catch-up — "what happened while I was away"
 
-Status: **capture + summary implemented** (Phase 5); **merge and auto-capture
-are future work** (Phase 6). This doc covers both.
+Status: **implemented** — capture (Phase 5 infrastructure), readable summary
+and expand-for-detail (Phase 5), merge and auto-capture (Phase 6).
 
 ## Infrastructure built now (manager.py)
 
@@ -82,17 +82,33 @@ How it works, and why:
 ### Viewing previous catch-ups + merging
 
 - Listing and the per-restaurant history drawer are built (Phase 5).
-- **Merge = concatenate windows.** Because captures are contiguous
+- **Merge = concatenate windows** (Phase 6). Because captures are contiguous
   (`since_sim` of n+1 == `until_sim` of n), merging catch-ups `[a..b]` is just
   summarizing the concatenated `events` of those captures — no new capture
-  format needed. Implement as
-  `POST /admin/api/instances/{id}/catchups/merge {from, to}` returning a
-  transient merged summary (do not delete the originals; they are the audit
-  trail).
+  format and no new prompt code.
+  `POST /admin/api/instances/{id}/catchups/merge {from, to}` returns a
+  **transient** merged summary; the originals are read and never rewritten,
+  because they are the audit trail.
 
-### Auto-capture
+  The one thing merge must not do is merge across a **hole**. Captures are
+  contiguous by construction, so a discontinuity means a capture file was
+  deleted — and concatenating either side of it would produce a summary
+  claiming a window it has no events for. `merge_gap()` is a pure check for
+  exactly that, and the endpoint answers 400 with the gap named rather than
+  guessing. Note a merged week can exceed `CATCHUP_MAX_EVENTS_PER_BUCKET`
+  (120); the per-bucket `truncated` count reports what fell out of the prompt.
 
-If catch-ups should exist even when nobody pressed the button (e.g. one per
-sim-day), add a manager-side background task that posts a capture per instance
-on day rollover — the capture endpoint is already idempotent w.r.t. windows, so
-scheduled and manual captures compose cleanly.
+### Auto-capture (Phase 6)
+
+Catch-ups exist even when nobody pressed the button. A manager-side background
+task (`_rollover_watch`, started in `lifespan`) polls each child's
+`sim.day_number` from `/api/health` and captures on the boundary. **The sim has
+no day-rollover hook** — `day_number` is derived on every clock write — so the
+manager detects the boundary by remembering the last day it saw per instance in
+`instance_days` (`dbdata/manager.db`), which is what makes a manager restart
+mid-day a no-op rather than a duplicate capture.
+
+Scheduled and manual captures compose cleanly because the capture window is
+always "everything since the last capture", whoever asked for it. The same
+rollover also archives that day's portfolio summary — see
+[daily-summary.md](daily-summary.md).
