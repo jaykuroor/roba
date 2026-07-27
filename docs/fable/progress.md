@@ -51,7 +51,7 @@ Last full audit of the codebase against the docs: **2026-07-27**.
 | [portfolio-overview.md](portfolio-overview.md) | ✅ implemented | — | — |
 | [priority-action-queue.md](priority-action-queue.md) | ✅ implemented | — | — |
 | [incidents.md](incidents.md) | ✅ implemented | — | — |
-| [catchup.md](catchup.md) | 🟠 infra only | LLM summary, expand-for-detail, history drawer, merge, auto-capture | 5, 6 |
+| [catchup.md](catchup.md) | 🟡 partial | merge, auto-capture | 6 |
 | [daily-summary.md](daily-summary.md) | 🟡 partial | LLM prose briefing, tomorrow-specific risk, end-of-day archive | 6 |
 
 **Already implemented and verified** (do not rebuild): manager registry / child spawn /
@@ -63,7 +63,9 @@ lifecycle with its `Tickets` card metric and Controls mode toggle, (Phase 2) the
 `FOOD_SAFETY_CHECK` detector feeding `safety_issues` / `task_compliance` and the
 `food_safety_checks` incident category, and (Phase 3) the `ORDER_BACKLOG` /
 `EQUIPMENT_FAILURE` detectors plus € at stake and order-by deadlines on the action queue,
-and (Phase 4) first-class incidents in `dbdata/manager.db` with ack / resolve / history.
+and (Phase 4) first-class incidents in `dbdata/manager.db` with ack / resolve / history,
+and (Phase 5) the catch-up summarizer (`bucket_events` + one prompt per subsystem) with
+the per-restaurant catch-up drawer.
 `/admin/api/incidents` now covers **all 7 categories** (`unavailable_categories` is `[]`).
 
 ---
@@ -342,34 +344,70 @@ still shows it acknowledged.
 ### Phase 5 — Catch-up summarizer + history and expand-for-detail
 
 [catchup.md](catchup.md) §"Readable structured summary" and §"Viewing previous catch-ups".
-Capture infrastructure already exists; `summary` is a `null` slot at `manager.py:802`.
+~~Capture infrastructure already exists; `summary` is a `null` slot.~~ The slot is filled
+on demand now: one prompt per subsystem over a frozen event window, bullets that point back
+at the events they were written from.
 
-- [ ] Manager gains an LLM path: `from core import llm, config`;
+- [x] Manager gains an LLM path: `from core import llm, config`;
       `LLMProvider.complete(..., json_schema=..., model=config.GEMINI_REASONER_MODEL)`.
       Importing `core` as a *library* is fine — the "HTTP is the contract" rule is about
-      child *data* (§4).
-- [ ] Pure `bucket_events(events)` grouping a capture's rows by **`category`** — **not
+      child *data* (§4). — b8e7ebb. Imported **inside** `_summarizer()`, not at module
+      level, so the manager still boots and serves every non-LLM endpoint without the
+      sim's dependencies installed. Deliberately **not** a cached singleton — see §4.
+- [x] Pure `bucket_events(events)` grouping a capture's rows by **`category`** — **not
       `event_type`, which does not exist** (§4) — into procurement / kitchen / staffing /
       reviews / promos. One prompt per bucket, never over the raw firehose.
-- [ ] Each summary bullet references its source event ids, so "click to expand" resolves
-      against `GET .../catchups/{n}`.
-- [ ] `POST /admin/api/instances/{id}/catchups/{n}/summarize` — writes into the capture
+      — b8e7ebb. Buckets are `procurement | inventory | demand | staffing | menu | promos
+      | market | other`: **`kitchen` and `reviews` were dropped** because nothing in the
+      sim writes `event_log` rows for either (§4), and `inventory` / `demand` / `market`
+      were added because plenty does. An unmapped category lands in `other` rather than
+      being silently dropped.
+- [x] Each summary bullet references its source event ids, so "click to expand" resolves
+      against `GET .../catchups/{n}`. — b8e7ebb. Ids the model invents are filtered
+      against the prompt's own event set, so an expander can never resolve to nothing.
+- [x] `POST /admin/api/instances/{id}/catchups/{n}/summarize` — writes into the capture
       file's `summary` slot, idempotent overwrite (re-summarizing with a better prompt is
-      expected).
-- [ ] **Canned-fallback guard**: if `note == CANNED_NOTE`, store and render an *error*, not
-      prose (§4 — this has bitten the project twice).
-- [ ] UI: per-card catch-up history drawer (`GET .../catchups` is already served and unused
-      by the frontend), bullets expanding to raw events.
-- [ ] "Major incidents since you left" should read the **Phase 4 incident store**
+      expected). — b8e7ebb. A sync `def`, not `async def` — see §4.
+- [x] **Canned-fallback guard**: if `note == CANNED_NOTE`, store and render an *error*, not
+      prose (§4 — this has bitten the project twice). — b8e7ebb. One bad bucket fails the
+      **whole** summary (`buckets: []`): a partial briefing reads as "nothing else
+      happened", which is worse than an honest error.
+- [x] UI: per-card catch-up history drawer (`GET .../catchups` is already served and unused
+      by the frontend), bullets expanding to raw events. — b8e7ebb (`CatchupDrawer` /
+      `CatchupSummaryView` / `CatchupBullet`). The card's capture button keeps its wording
+      and takes the `Camera` icon; the drawer button is labelled **"Catch-ups"**, not
+      "History", because the incidents tab already owns that word.
+- [x] "Major incidents since you left" should read the **Phase 4 incident store**
       (added 2026-07-27), not re-derive from signals: `GET /admin/api/incidents/history
       ?instance_id=&since=` already returns everything opened in a window, including rows
       that have since resolved — which is exactly what a catch-up wants and what live
-      signals can no longer tell you.
-- [ ] Tests: bucketing is deterministic; a canned response yields an error, never a summary.
+      signals can no longer tell you. — b8e7ebb. Landed as `incidents_in_window()` reading
+      the same SQLite directly rather than the manager calling its own HTTP endpoint;
+      the window is `(since_sim, until_sim]`, matching `create_catchup`'s event filter.
+- [x] Tests: bucketing is deterministic; a canned response yields an error, never a summary.
+      — b8e7ebb. `tests/test_catchup_summary.py` (19) + `AdminPage.test.tsx` (+5).
+      Includes a guard that the mirrored `CANNED_NOTE` literal still equals
+      `core.llm.CANNED_NOTE`, and a frontend test that feeds an errored summary which
+      *also* carries a bullet — so the view fails loudly if it ever renders prose anyway.
 
 **Done when** a catch-up produces a readable per-subsystem summary whose bullets expand to
 the underlying events — and a deliberately bad `GEMINI_MODEL` shows an error instead of
 canned text.
+
+> Verified against real Vertex (b8e7ebb), both halves of the "Done when":
+> an 8-event window over 5 subsystems returned in 35s with, e.g., *"Two purchase orders
+> were placed with Verdura Fresca and City Wholesale for a total of EUR 262.85."* →
+> `event_ids [1, 2]`, *"Wrote off 1.2kg of Mozzarella past its use-by date for a loss of
+> EUR 9.60."* → `[4]`, and the window's one incident (`staff_no_show`, already resolved)
+> attached. Re-running with `model="gemini-2.5-does-not-exist"` failed in 3.6s with
+> *"The summarizer did not answer: … fell back to canned output on the 'procurement'
+> bucket. Check GEMINI_REASONER_MODEL and the Vertex credentials — a bad model id degrades
+> silently."* and `buckets: []`.
+>
+> Fixed here, out of phase scope but one line (added 2026-07-27): `CATCHUP_DIR` was a
+> module-level constant, so it froze the capture path at import and ignored a relocated
+> `STATE_DIR` — the exact trap §4 warns about for `incidents_db()`. `_catchup_dir` now
+> reads `STATE_DIR` at call time.
 
 ---
 
@@ -381,6 +419,11 @@ Finishes [catchup.md](catchup.md) and [daily-summary.md](daily-summary.md).
 - [ ] `POST /admin/api/instances/{id}/catchups/merge {from,to}` — captures are contiguous
       (`since_sim(n+1) == until_sim(n)`), so merging is concatenating `events` and reusing
       the Phase 5 summarizer. **Never delete the originals** — they are the audit trail.
+      The summarizer takes a whole capture-shaped dict, so a merge is
+      `summarize_capture({"events": [...concatenated...], "since_sim": …, "until_sim": …},
+      incidents_in_window(id, since, until))` — no new prompt code, and mind the
+      per-bucket cap (`CATCHUP_MAX_EVENTS_PER_BUCKET`, 120): a merged week will truncate,
+      and `truncated` is already reported per bucket so the UI can say so.
 - [ ] Manager background task polling each child's `sim.day_number` (already returned by
       `/api/health`), last-seen day persisted in the Phase 4 SQLite. **There is no
       day-rollover hook in the sim** (§4) — the manager must detect it.
@@ -409,9 +452,24 @@ The non-obvious facts that shape this work. **Read this section before starting 
 ### Doc drift (the spec is wrong here)
 
 - **`EventLog` has no `event_type` column — it is `category`** (`core/models.py:1087-1099`).
-  [catchup.md](catchup.md) §2 says `event_type`. Values in use include `optimizer`,
-  `po_placed`, `po_delivered`, `waste`, `forecast`, `attendance`, `menu_toggle`, `call`,
-  `promo_activated`, `receipt`, `scenario`.
+  [catchup.md](catchup.md) §2 says `event_type`. The **complete** set of categories any
+  writer produces (added 2026-07-27, enumerated by AST-walking every `log_event` call —
+  `demo.db` only contains two of them, so do not sample the DB for this) is the
+  `manager.EVENT_BUCKETS` map: `po_placed`, `po_delivered`, `po_pending_approval`,
+  `sourcing_plan`, `sourcing_plan_skipped`, `reorder_failed`, `optimizer`, `llm_optimize`,
+  `negotiation_{requested,agreed,no_deal,skipped}`, `receipt`, `waste`, `reconciliation`,
+  `stockout_risk`, `low_stock`, `manual_shortage`, `inventory_signal_muted`,
+  `spoilage_pattern`, `forecast`, `cook_feedback`, `batch_advisor`, `attendance`,
+  `menu_toggle`, `promo_proposal`, `promo_activated`, `competitor`, `call`, `scenario`.
+  `category` is a **free string** with no enum, so treat that list as current-not-closed —
+  `bucket_events` sends anything unmapped to `other` rather than dropping it.
+- **Nothing logs kitchen or review events** (added 2026-07-27). `core/kitchen_tasks.py`,
+  `core/pos_simulator.py`, `core/api.py`, `core/approvals.py` and
+  `track_a/agents/review.py` contain **zero** `log_event` calls. So catchup.md's suggested
+  `kitchen` and `reviews` buckets would be permanently empty and Phase 5 does not create
+  them — the kitchen's story reaches the manager through `/api/ops/snapshot` and signals,
+  not the narrative feed. If you want kitchen prose in a catch-up, the fix is to make
+  `kitchen_tasks` log events, not to add an empty bucket.
 - ~~**The "Tickets / safety" UI slot does not exist.**~~ **Resolved in Phase 1** — the card
   grid is now `grid-cols-4` with a `Tickets` metric (`AdminPage.tsx:215-225`) fed by
   `orders_waiting` / `ticket_time_min`. `safety_issues` is still typed-but-unrendered
@@ -522,7 +580,12 @@ The non-obvious facts that shape this work. **Read this section before starting 
   keep it that way. All state lives under `STATE_DIR` (`MANAGER_STATE_DIR`, default
   `./dbdata`), and `incidents_db()` reads `STATE_DIR` **at call time**, so a test relocates
   the entire footprint with `monkeypatch.setattr(manager, "STATE_DIR", tmp_path)`. A
-  module-level path constant would have broken that — don't add one.
+  module-level path constant would have broken that — don't add one. **There was exactly
+  one** (added 2026-07-27): `CATCHUP_DIR = STATE_DIR / "catchups"` predated the rule and
+  froze the capture path at import, so captures landed outside a relocated `STATE_DIR`.
+  Deleted in Phase 5; `_catchup_dir` now composes the path at call time. Everything under
+  `STATE_DIR` — registry, `manager.db`, `catchups/` — is now relocatable by the single
+  `monkeypatch.setattr(manager, "STATE_DIR", tmp_path)`.
 - **`opened_at` is sim-time; `resolved_at` is wall-clock** (added 2026-07-27). Deliberate,
   and the one place the manager mixes clocks: an incident *opens* because of something that
   happened in the child's sim (so it sorts and renders with `fmtSim` like everything else),
@@ -555,6 +618,26 @@ The non-obvious facts that shape this work. **Read this section before starting 
 - Only `gemini-2.5-*` models exist for this project. `GEMINI_REASONER_MODEL`
   (`config.py:262`, default `gemini-2.5-pro`) bypasses `LLMProvider` in existing call sites
   (`core/reasoner.py`) but works fine passed as `model=` to `complete()`.
+- **`LLMProvider` memoises canned failures too** (added 2026-07-27, Phase 5). `complete()`
+  caches by `sha256(model + messages + schema)` for the life of the *instance*, and the
+  canned fallback is cached like any real answer (`core/llm.py:366`; only
+  `use_site="generation"` is exempt). A module-level provider singleton would therefore
+  keep serving the same failure to every retry until the manager restarted — even after
+  the credentials it choked on were fixed, because fixing credentials does not change the
+  cache key (fixing a bad *model id* does). `manager._summarizer()` builds a **fresh
+  provider per request** for exactly this reason. Any future manager-side LLM call site
+  should do the same, or retry means nothing.
+- **`LLMProvider.complete` is synchronous** (added 2026-07-27). Manager endpoints that call
+  it must be plain `def`, not `async def`, so FastAPI runs them in its threadpool —
+  `summarize_catchup` is. An `async def` would block the manager's event loop for the whole
+  Gemini call (~35s measured for a 5-bucket capture), stalling every child health probe and
+  every other dashboard poll with it.
+- **One prompt per bucket means one round trip per bucket** (added 2026-07-27, measured).
+  A capture touching all 8 subsystems is 8 serial `gemini-2.5-pro` calls; 5 buckets over 8
+  events took 35s. They are prompted sequentially on purpose (a `ponytail:` note marks it
+  in `summarize_capture`) — fan out with a thread pool if the wait becomes the complaint,
+  but note `_last_call_meta` on a shared provider is not thread-safe, which is a second
+  reason the per-request provider above matters.
 
 ### Tests
 
@@ -616,9 +699,13 @@ recorded because they will bite an implementor.
     `track_a/tests/test_forecaster.py` (10), `test_staff.py` (1),
     `track_b/tests/test_market.py` (2), `test_optimizer.py` (1) — everything that needs a
     real completion degrades to the canned no-op.
-  - **With credentials**: those 14 pass, and **two others start failing** —
-    `tests/test_seeding.py::test_generate_offline_produces_valid_bundle` and
-    `tests/test_api_session_lifecycle.py::test_running_sim_periodically_updates_core_feeds`.
+  - **With credentials**: those 14 pass, and **three others start failing** —
+    `tests/test_seeding.py::test_generate_offline_produces_valid_bundle`,
+    `tests/test_api_session_lifecycle.py::test_running_sim_periodically_updates_core_feeds`
+    and `tests/test_llm.py::test_canned_fallback_without_gcp_project` (added 2026-07-27 —
+    the last one is self-explanatory once you read the name: it asserts the *no project*
+    path, so a resolvable project makes it fail. Verified both ways on Phase 5's branch;
+    it is not caused by any change).
     The seeding one is a real bug: `core/seeding.py:374` indexes the LLM's generated bundle
     without validating its shape, so it dies on whatever the model returned that run — the
     exception is *not stable* (`TypeError: cannot use 'dict' as a dict key` and

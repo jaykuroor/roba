@@ -1,7 +1,7 @@
 # Catch-up — "what happened while I was away"
 
-Status: **infrastructure implemented**; the readable summary, expand-for-detail
-and merge UX are future work. This doc covers both.
+Status: **capture + summary implemented** (Phase 5); **merge and auto-capture
+are future work** (Phase 6). This doc covers both.
 
 ## Infrastructure built now (manager.py)
 
@@ -32,33 +32,56 @@ time means the summarizer can run later (or repeatedly, with better prompts)
 without the source needing to still exist. `summary: null` is the slot the
 summarizer fills in.
 
-## Future work — implementation guidance
+## Summary built now (manager.py, Phase 5)
 
-### Readable structured summary
+`POST /admin/api/instances/{id}/catchups/{n}/summarize` fills the `summary`
+slot and returns it. Idempotent — re-summarizing overwrites, and the raw
+`events` are never touched, so a better prompt can always be tried again.
 
-1. Input: one capture's `events` (plus, ideally, resolved approvals and
-   incident history for the window — see [incidents.md](incidents.md) for why
-   incidents should become first-class).
-2. Bucket events by subsystem before prompting (procurement, staffing, kitchen,
-   reviews, promos...) — `EventLog.category` / `detail` carry enough to
-   group deterministically; let the LLM write prose *per bucket*, not over the
-   raw firehose. Target shape: the example in the product brief — "X task was
-   done 5 min late", "promo applied on procurement (expand for details)".
-3. Each summary bullet should reference the source event ids from the capture —
-   that is what "click to expand" resolves against (`GET .../catchups/{n}`
-   already returns the raw rows).
-4. Write the result into the capture file's `summary` field (idempotent:
-   re-summarizing overwrites). Add
-   `POST /admin/api/instances/{id}/catchups/{n}/summarize` for it.
-5. Use `GEMINI_REASONER_MODEL` (2.5-pro) — extraction-grade, latency
-   irrelevant. Same silent-fallback caution as
-   [daily-summary.md](daily-summary.md): never present canned output as a
-   summary.
+```json
+{"generated_at": 1784480000.0, "model": "gemini-2.5-pro", "error": null,
+ "buckets": [{"bucket": "procurement", "event_count": 3, "truncated": 0,
+              "bullets": [{"text": "Two POs were placed with Verdura Fresca and
+                                    City Wholesale for EUR 262.85.",
+                           "event_ids": [1, 2]}]}],
+ "incidents": [{"incident_id": 3, "category": "staff_no_show",
+                "summary": "Marco is sick.", "opened_at": 33000.0,
+                "status": "resolved", "resolved_at": 1784480000.0}]}
+```
+
+How it works, and why:
+
+1. **Bucket first, prompt second.** `bucket_events` groups the window by
+   `EventLog.category` into `procurement | inventory | demand | staffing |
+   menu | promos | market | other`, in that fixed order. It is pure and
+   unit-tested, so the grouping never depends on the model. Each non-empty
+   bucket gets **its own prompt** — the LLM never sees the raw firehose.
+   Note §2 above says `event_type`; the column is `category`.
+   Note also there is **no `kitchen` or `reviews` bucket**: nothing in the sim
+   writes `event_log` rows for either (the review agent writes none at all),
+   so those buckets would be permanently empty. Add them the day something
+   logs to them.
+2. **Bullets cite their sources.** Every bullet carries the `event_ids` it was
+   written from, and ids the model invented are filtered out against the
+   prompt's own event set — an expander never resolves to nothing. This is what
+   `GET .../catchups/{n}` is expanded against in the UI.
+3. **Incidents come from the store, not from signals.** The `incidents` list is
+   `incidents_in_window()` over the Phase 4 SQLite (see
+   [incidents.md](incidents.md)) — rows *opened* inside `(since_sim, until_sim]`
+   including ones that have since resolved. A live-signal read could not tell
+   you about those: the signal is long expired by the time you catch up.
+4. **A degraded model is an error, never prose.** `GEMINI_REASONER_MODEL`
+   (2.5-pro) is used, and the result is checked for `note == CANNED_NOTE`
+   before anything is stored. On a canned or malformed answer the whole summary
+   comes back `error: <what to check>` with `buckets: []`, and the UI renders a
+   danger block. A *partial* summary is treated as failure too — half a briefing
+   reads as "nothing else happened", which is worse than an honest error.
+5. **UI:** a "Catch-ups" drawer per restaurant card lists the captured windows,
+   summarizes one on demand, and expands any bullet into its raw events.
 
 ### Viewing previous catch-ups + merging
 
-- Listing is already served by the markers endpoint; the UI needs a history
-  drawer per restaurant.
+- Listing and the per-restaurant history drawer are built (Phase 5).
 - **Merge = concatenate windows.** Because captures are contiguous
   (`since_sim` of n+1 == `until_sim` of n), merging catch-ups `[a..b]` is just
   summarizing the concatenated `events` of those captures — no new capture

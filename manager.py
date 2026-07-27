@@ -12,7 +12,8 @@ Runs a small FastAPI app (default port 8100) that:
   the unified frontend talks only to this server for instance traffic;
 - serves the ``/admin/api/*`` aggregation endpoints that power the manager
   dashboard: portfolio overview, priority action queue, combined approvals,
-  incidents, daily summary, and catch-up markers (docs/fable/catchup.md).
+  incidents, daily summary, and catch-ups — captured event windows plus the
+  per-subsystem LLM summary written over them (docs/fable/catchup.md).
 
 Run:  uvicorn manager:app --port 8100
 """
@@ -1214,26 +1215,27 @@ _BULLET_SCHEMA = {
     "required": ["bullets"],
 }
 
-_PROVIDER: Optional[tuple] = None
-
-
 def _summarizer() -> tuple:
-    """The shared ``(LLMProvider, model)`` used to write catch-up prose.
+    """A fresh ``(LLMProvider, model)`` for one summarize request.
 
     ``core`` is imported here as a *library*: the manager's "do not reach into
     child state, HTTP is the contract" rule is about child **data**, not shared
     code (docs/fable/progress.md §4). The import is lazy so the manager still
     boots and serves every non-LLM endpoint without the sim's dependencies.
+
+    Deliberately **not** a cached singleton. ``LLMProvider`` memoises by content
+    hash for the life of the instance, and a *canned* answer is memoised like
+    any other — so a shared provider would keep serving the same failure to
+    every "Re-summarize" press until the manager was restarted, even after the
+    credentials it choked on were fixed. One provider per request costs a client
+    build against a ~30s call and makes retrying mean something.
     """
-    global _PROVIDER
-    if _PROVIDER is None:
-        from core import config as core_config
-        from core.llm import LLMProvider
-        _PROVIDER = (
-            LLMProvider(timeout_s=core_config.LLM_AUTHORITY_TIMEOUT_S),
-            core_config.GEMINI_REASONER_MODEL,
-        )
-    return _PROVIDER
+    from core import config as core_config
+    from core.llm import LLMProvider
+    return (
+        LLMProvider(timeout_s=core_config.LLM_AUTHORITY_TIMEOUT_S),
+        core_config.GEMINI_REASONER_MODEL,
+    )
 
 
 def bucket_events(events: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
