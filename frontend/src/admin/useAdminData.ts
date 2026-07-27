@@ -156,6 +156,19 @@ export interface CatchupRecord extends CatchupMarker {
   events: CatchupEvent[];
 }
 
+/** Captures [from..to] summarized as one window. Transient — the manager writes
+ *  nothing, the originals stay untouched (they are the audit trail). */
+export interface MergedCatchup {
+  from: number;
+  to: number;
+  since_sim: number;
+  until_sim: number;
+  event_count: number;
+  /** The concatenated raw rows, so merged bullets still expand. */
+  events: CatchupEvent[];
+  summary: CatchupSummary;
+}
+
 export interface Summary {
   generated_at: number;
   totals: {
@@ -170,6 +183,33 @@ export interface Summary {
   major_incidents: ActionItem[];
   pending_decisions: ActionItem[];
   next_day_risks: ActionItem[];
+}
+
+/** LLM prose over the `Summary` JSON (docs/fable/daily-summary.md). Written on
+ *  demand only — it is a real Gemini round trip, and `Summary` itself is polled
+ *  every 30s, so this must never ride along with that poll. */
+export interface Briefing {
+  generated_at: number;
+  model: string;
+  /** Non-null means the LLM degraded. Render as an error — never as prose,
+   *  and never render `prose` alongside it. */
+  error: string | null;
+  prose: string;
+}
+
+/** One archived end-of-day snapshot; `day` is the sim-day that ended. */
+export interface SummaryArchiveMarker {
+  day: number;
+  created_at: number;
+}
+
+/** The portfolio-wide summary frozen at one instance's day rollover — the
+ *  whole portfolio, not just `instance_id`'s slice. That is deliberate. */
+export interface SummaryArchive {
+  day: number;
+  created_at: number;
+  instance_id: string;
+  summary: Summary;
 }
 
 export function useAdminData() {

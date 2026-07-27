@@ -43,7 +43,15 @@ async function requestOnce<T>(
     ...init,
   });
   if (!res.ok) {
-    throw new Error(`${init?.method ?? "GET"} ${path} -> ${res.status}`);
+    const err = new Error(`${init?.method ?? "GET"} ${path} -> ${res.status}`);
+    // FastAPI answers 4xx with {"detail": "<sentence>"}. Hang it off the error
+    // so a caller can show the server's own words; the message format is
+    // untouched, so `request`'s status parsing still works.
+    const body = (await res.json().catch(() => null)) as { detail?: unknown } | null;
+    if (typeof body?.detail === "string") {
+      (err as Error & { detail?: string }).detail = body.detail;
+    }
+    throw err;
   }
   const text = await res.text();
   return (text ? JSON.parse(text) : null) as T;

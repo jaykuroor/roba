@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from websockets.asyncio.client import connect as ws_connect
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,16 @@ def generate_instance_id(taken: set) -> str:
 # ---------------------------------------------------------------------------
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def sim_label(sim_seconds: Optional[float]) -> str:
+    """``"Day N HH:MM"`` — mirrors the frontend's ``fmtSim`` so a sentence the
+    manager writes server-side reads the same as a timestamp the UI renders."""
+    if sim_seconds is None:
+        return "an unknown time"
+    total = int(sim_seconds)
+    return (f"Day {total // 86400} {total % 86400 // 3600:02d}"
+            f":{total % 3600 // 60:02d}")
 
 # ApprovalRequest.urgency is a free string; observed values include
 # normal / high plus the optimizer's at_risk / uncoverable labels.
@@ -350,7 +360,7 @@ def reconcile_incidents(
 # one). Everything lives under STATE_DIR so tests relocate the whole footprint.
 # ---------------------------------------------------------------------------
 
-_INCIDENT_SCHEMA = """
+_MANAGER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS incidents (
     incident_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     instance_id      TEXT NOT NULL,
@@ -364,6 +374,16 @@ CREATE TABLE IF NOT EXISTS incidents (
 );
 CREATE INDEX IF NOT EXISTS incidents_status ON incidents (status);
 CREATE INDEX IF NOT EXISTS incidents_instance ON incidents (instance_id);
+
+-- Last sim-day seen per instance. The sim has no day-rollover hook (the field
+-- is derived on every clock write), so the manager detects the boundary by
+-- remembering what it saw last — and it must survive a manager restart, or
+-- every restart would re-archive the day already in progress.
+CREATE TABLE IF NOT EXISTS instance_days (
+    instance_id TEXT PRIMARY KEY,
+    last_day    INTEGER NOT NULL,
+    updated_at  REAL
+);
 """
 
 
@@ -377,7 +397,7 @@ def incidents_db() -> sqlite3.Connection:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(STATE_DIR / "manager.db")
     conn.row_factory = sqlite3.Row
-    conn.executescript(_INCIDENT_SCHEMA)
+    conn.executescript(_MANAGER_SCHEMA)
     conn.commit()
     return conn
 
@@ -408,6 +428,73 @@ def apply_reconcile(
             f"SELECT * FROM incidents WHERE status IN {OPEN_STATUSES}"
         )
     ]
+
+
+def next_day_coverage_risks(
+    plan_items: List[Dict[str, Any]],
+    horizons: List[Dict[str, Any]],
+    sim_time: float,
+    *,
+    instance_id: str,
+    restaurant: str,
+) -> List[Dict[str, Any]]:
+    """Pure: ingredients whose procurement cover lapses *during tomorrow*.
+
+    Today's stock rows say "you are low now". This says "the plan stops covering
+    Basil at 14:00 tomorrow, and tomorrow forecasts 118 covers" — the thing that
+    is still fixable tonight and invisible until it is not.
+
+    Deliberately scoped to cover ending strictly inside tomorrow's window.
+    Anything lapsing *before* tomorrow starts is today's problem and
+    ``build_issues`` already raises it as low stock or uncoverable; repeating it
+    here would double-count the same ingredient in two lists.
+    """
+    day = int(sim_time // SECONDS_PER_DAY)
+    start = (day + 1) * SECONDS_PER_DAY
+    end = (day + 2) * SECONDS_PER_DAY
+
+    # Newest horizon that actually forecasts tomorrow. `day_index` is relative
+    # to each horizon's own start, so match on the absolute window instead.
+    forecast_qty: Optional[float] = None
+    for horizon in sorted(horizons, key=lambda h: h.get("generated_at") or 0,
+                          reverse=True):
+        for row in ((horizon.get("breakdown") or {}).get("by_day") or []):
+            if int(float(row.get("start") or 0.0) // SECONDS_PER_DAY) == day + 1:
+                forecast_qty = row.get("qty")
+                break
+        if forecast_qty is not None:
+            break
+
+    demand = (
+        f"Tomorrow forecasts {int(forecast_qty)} covers."
+        if forecast_qty is not None
+        else "No forecast covering tomorrow has been generated yet."
+    )
+
+    risks = []
+    for item in plan_items:
+        covers_until = item.get("covers_until")
+        if covers_until is None or not (start <= float(covers_until) < end):
+            continue
+        name = item.get("ingredient_name") or str(item.get("ingredient_id"))
+        risks.append({
+            "instance_id": instance_id,
+            "restaurant": restaurant,
+            "kind": "coverage",
+            "problem": (
+                f"{name} is only covered until {sim_label(covers_until)} — "
+                "tomorrow runs dry after that."
+            ),
+            "severity": "high",
+            "deadline_sim": item.get("order_date") or float(covers_until),
+            "impact": demand,
+            "impact_eur": None,
+            "recommended_action": (
+                f"Extend tomorrow's cover for {name} on the next procurement run."
+            ),
+            "approval_id": None,
+        })
+    return sorted(risks, key=lambda r: r["deadline_sim"])
 
 
 def rank_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -718,7 +805,12 @@ async def _get(inst: Dict[str, Any], path: str) -> Optional[Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Detects sim-day rollovers and auto-captures / archives on them. Started
+    # here rather than lazily so a manager left running overnight keeps its
+    # archive complete without anyone opening the dashboard.
+    watcher = asyncio.create_task(_rollover_watch())
     yield
+    watcher.cancel()
     # Terminate the children we spawned; DBs and the registry persist, so
     # /admin/api/instances/{id}/start brings any of them back.
     for instance_id, proc in registry.procs.items():
@@ -1088,20 +1180,43 @@ async def daily_summary() -> Dict[str, Any]:
         *(_instance_overview(i) for i in registry.instances.values())
     ))
 
-    async def waste_today(inst: Dict[str, Any], card: Dict[str, Any]) -> float:
+    async def tomorrow(inst: Dict[str, Any], card: Dict[str, Any]) -> tuple:
+        """Today's waste plus tomorrow's coverage gaps, in one round trip.
+
+        Yes, this re-reads the plan that ``_instance_overview`` already fetched.
+        Deliberate: the alternative is moving the coverage join into the
+        overview, which is polled every **5s** by the dashboard versus this
+        endpoint's 30s — so sharing the read would mean fetching the forecast
+        horizons six times as often, and would put a next-*day* lens into the
+        priority queue, which is a today surface. One extra child query per
+        instance per 30s is the cheaper side of that trade.
+        """
         if not card["online"]:
-            return 0.0
+            return 0.0, []
         sim_time = float((card.get("sim") or {}).get("sim_time") or 0.0)
         day_start = (sim_time // SECONDS_PER_DAY) * SECONDS_PER_DAY
-        rows = await _get(inst, "/api/waste") or []
-        return round(sum(
-            float(r.get("cost") or 0.0) for r in rows
+        waste_rows, plan, horizons = await asyncio.gather(
+            _get(inst, "/api/waste"),
+            _get(inst, "/api/track-b/procurement/plan"),
+            _get(inst, "/api/track-a/forecast/horizons"),
+        )
+        cost = round(sum(
+            float(r.get("cost") or 0.0) for r in waste_rows or []
             if float(r.get("sim_time") or 0.0) >= day_start
         ), 2)
+        return cost, next_day_coverage_risks(
+            (plan or {}).get("items") or [],
+            (horizons or {}).get("horizons") or [],
+            sim_time,
+            instance_id=card["id"],
+            restaurant=card["title"],
+        )
 
-    waste = await asyncio.gather(*(
-        waste_today(registry.instances[c["id"]], c) for c in cards
+    per_instance = await asyncio.gather(*(
+        tomorrow(registry.instances[c["id"]], c) for c in cards
     ))
+    waste = [w for w, _ in per_instance]
+    coverage = [r for _, rows in per_instance for r in rows]
     for card, w in zip(cards, waste):
         card["waste_today"] = w
 
@@ -1121,7 +1236,13 @@ async def daily_summary() -> Dict[str, Any]:
         },
         "major_incidents": [a for a in actions if a["severity"] == "critical"],
         "pending_decisions": [a for a in actions if a["kind"] == "approval"],
-        "next_day_risks": [a for a in actions if a["kind"] == "stock"],
+        # Stock rows are "low right now"; coverage rows are "the plan stops
+        # covering this during tomorrow" — joined from the procurement plan's
+        # covers_until against the forecaster's horizon, here rather than in the
+        # frontend so the archive snapshots carry it too.
+        "next_day_risks": rank_issues(
+            [a for a in actions if a["kind"] == "stock"] + coverage
+        ),
     }
 
 
@@ -1497,6 +1618,83 @@ async def create_catchup(instance_id: str) -> Dict[str, Any]:
             ("n", "created_at", "since_sim", "until_sim", "event_count", "summary")}
 
 
+def merge_gap(records: List[Dict[str, Any]]) -> Optional[str]:
+    """Pure: the first discontinuity in a run of captures, as a human sentence.
+
+    Captures are contiguous *by construction* — ``create_catchup`` starts each
+    window where the last one ended — so a gap can only mean a capture file was
+    removed. Merging across it would silently drop a window of events while
+    claiming to cover the whole span, which is exactly the lie the audit trail
+    exists to prevent.
+    """
+    for earlier, later in zip(records, records[1:]):
+        until = float(earlier.get("until_sim") or 0.0)
+        since = float(later.get("since_sim") or 0.0)
+        if since != until:
+            return (
+                f"catch-ups #{earlier.get('n')} and #{later.get('n')} are not "
+                f"contiguous: #{earlier.get('n')} ends at {sim_label(until)} but "
+                f"#{later.get('n')} starts at {sim_label(since)}. Merging would "
+                "claim to cover a window it has no events for."
+            )
+    return None
+
+
+class MergeBody(BaseModel):
+    """``from`` is a Python keyword, hence the aliases."""
+    model_config = {"populate_by_name": True}
+
+    from_n: int = Field(alias="from")
+    to_n: int = Field(alias="to")
+
+
+@app.post("/admin/api/instances/{instance_id}/catchups/merge")
+def merge_catchups(instance_id: str, body: MergeBody) -> Dict[str, Any]:
+    """Summarize captures ``from``..``to`` as one window, without saving.
+
+    Merging is concatenation: the captures are contiguous, so their events in
+    order *are* the wider window's events, and the Phase 5 summarizer needs no
+    new prompt code. The result is deliberately **transient** — the originals
+    are the audit trail and are never rewritten or deleted, so a merged view is
+    a lens on them rather than a replacement for them.
+    """
+    _inst_or_404(instance_id)
+    lo, hi = body.from_n, body.to_n
+    if lo > hi:
+        raise HTTPException(400, f"empty range: #{lo} is after #{hi}")
+
+    records = []
+    for n in range(lo, hi + 1):
+        path = _catchup_dir(instance_id) / f"{n:06d}.json"
+        if not path.exists():
+            raise HTTPException(
+                400,
+                f"catch-up #{n} is missing — cannot merge across a hole in the "
+                "audit trail.",
+            )
+        records.append(json.loads(path.read_text()))
+
+    gap = merge_gap(records)
+    if gap is not None:
+        raise HTTPException(400, gap)
+
+    events = [e for r in records for e in (r.get("events") or [])]
+    since_sim = float(records[0].get("since_sim") or 0.0)
+    until_sim = float(records[-1].get("until_sim") or 0.0)
+    return {
+        "from": lo,
+        "to": hi,
+        "since_sim": since_sim,
+        "until_sim": until_sim,
+        "event_count": len(events),
+        "events": events,
+        "summary": summarize_capture(
+            {"events": events, "since_sim": since_sim, "until_sim": until_sim},
+            incidents_in_window(instance_id, since_sim, until_sim),
+        ),
+    }
+
+
 @app.post("/admin/api/instances/{instance_id}/catchups/{n}/summarize")
 def summarize_catchup(instance_id: str, n: int) -> Dict[str, Any]:
     """Write a readable summary into capture ``n`` and return it.
@@ -1523,6 +1721,283 @@ def summarize_catchup(instance_id: str, n: int) -> Dict[str, Any]:
     )
     path.write_text(json.dumps(record, indent=2, default=str))
     return record["summary"]
+
+
+# ---------------------------------------------------------------------------
+# End-of-day archive + auto-capture (docs/fable/daily-summary.md §Guidance).
+#
+# The sim has no day-rollover hook — day_number is derived on every clock write
+# and per-day rows are materialized lazily on first read (§4) — so the manager
+# detects the boundary itself by remembering the last day it saw per instance.
+# ---------------------------------------------------------------------------
+
+ROLLOVER_POLL_S = float(os.getenv("MANAGER_ROLLOVER_POLL_S", "20"))
+
+
+def day_rollover(seen: Optional[int], current: Optional[int]) -> Optional[int]:
+    """Pure: the sim-day that just *ended*, or ``None`` if nothing rolled over.
+
+    - ``seen is None`` (first sighting) archives nothing: the day was already
+      underway when the manager started, so there is no window to snapshot.
+    - A backward jump — a reseed rewinds the clock — re-bases silently rather
+      than archiving a day that is about to be replayed.
+    - Several days at once (a fast sim between polls) reports only the most
+      recent completed day. Snapshotting *now* three times and labelling the
+      copies day 2, 3 and 4 would be fiction; the catch-up capture that runs
+      alongside still covers the whole span, because its window is "everything
+      since the last capture".
+    """
+    if current is None or seen is None or current <= seen:
+        return None
+    return current - 1
+
+
+def last_seen_day(conn: sqlite3.Connection, instance_id: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT last_day FROM instance_days WHERE instance_id = ?", (instance_id,)
+    ).fetchone()
+    return None if row is None else int(row["last_day"])
+
+
+def record_seen_day(conn: sqlite3.Connection, instance_id: str, day: int) -> None:
+    conn.execute(
+        "INSERT INTO instance_days (instance_id, last_day, updated_at)"
+        " VALUES (?, ?, ?) ON CONFLICT(instance_id) DO UPDATE SET"
+        " last_day = excluded.last_day, updated_at = excluded.updated_at",
+        (instance_id, int(day), time.time()),
+    )
+    conn.commit()
+
+
+def _summary_dir(instance_id: str) -> Path:
+    # STATE_DIR read at call time, like _catchup_dir / incidents_db (§4).
+    d = STATE_DIR / "summaries" / instance_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+async def archive_summary(instance_id: str, day: int) -> Dict[str, Any]:
+    """Snapshot the portfolio summary as the record of ``day`` for ``instance_id``.
+
+    The *portfolio* summary, not just this instance's card: the archive answers
+    "what did the estate look like when this restaurant's day ended", which is
+    what makes two archived days comparable. ``instance_id`` records whose
+    rollover triggered it.
+
+    Overwrites an existing file on purpose — a reseed can legitimately replay a
+    sim-day, and last-write-wins beats silently keeping the pre-reseed numbers.
+    """
+    record = {
+        "day": int(day),
+        "created_at": time.time(),
+        "instance_id": instance_id,
+        "summary": await daily_summary(),
+    }
+    (_summary_dir(instance_id) / f"day-{int(day):03d}.json").write_text(
+        json.dumps(record, indent=2, default=str)
+    )
+    return record
+
+
+@app.get("/admin/api/instances/{instance_id}/summaries")
+def list_summaries(instance_id: str) -> List[Dict[str, Any]]:
+    """Archived end-of-day snapshots, newest day first."""
+    _inst_or_404(instance_id)
+    out = []
+    for f in _summary_dir(instance_id).glob("day-*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        out.append({"day": data.get("day"), "created_at": data.get("created_at")})
+    return sorted(out, key=lambda r: r.get("day") or 0, reverse=True)
+
+
+@app.get("/admin/api/instances/{instance_id}/summaries/{day}")
+def get_summary_archive(instance_id: str, day: int) -> Dict[str, Any]:
+    _inst_or_404(instance_id)
+    path = _summary_dir(instance_id) / f"day-{int(day):03d}.json"
+    if not path.exists():
+        raise HTTPException(404, f"no archived summary for day {day}")
+    return json.loads(path.read_text())
+
+
+async def check_rollovers() -> List[Dict[str, Any]]:
+    """One sweep: capture + archive for every instance that changed sim-day.
+
+    Returns what it did, so the test can assert "exactly once per sim-day"
+    without reaching into the filesystem.
+    """
+    done: List[Dict[str, Any]] = []
+    for instance_id, inst in list(registry.instances.items()):
+        health = await _get(inst, "/api/health")
+        if health is None:
+            continue  # offline children simply stop being watched
+        raw = (health.get("sim") or {}).get("day_number")
+        if raw is None:
+            continue
+        current = int(raw)
+
+        conn = incidents_db()
+        try:
+            ended = day_rollover(last_seen_day(conn, instance_id), current)
+            record_seen_day(conn, instance_id, current)
+        finally:
+            conn.close()
+        if ended is None:
+            continue
+
+        # The day is marked *before* the work, so a persistently failing child
+        # cannot spin the watcher into re-capturing the same rollover forever —
+        # a missed archive is better than an endless one. Capture before
+        # archive, because the capture is what defines the window.
+        try:
+            capture = await create_catchup(instance_id)
+        except HTTPException as exc:
+            logger.warning("rollover capture for %s failed: %s", instance_id, exc.detail)
+            capture = None
+        await archive_summary(instance_id, ended)
+        done.append({"instance_id": instance_id, "day": ended, "capture": capture})
+    return done
+
+
+async def _rollover_watch() -> None:
+    """Background poll. Never dies: a raising sweep would silently end
+    auto-capture for the rest of the process's life."""
+    while True:
+        await asyncio.sleep(ROLLOVER_POLL_S)
+        try:
+            await check_rollovers()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the loop must outlive any one sweep
+            logger.exception("rollover sweep failed")
+
+
+# ---------------------------------------------------------------------------
+# LLM prose briefing (docs/fable/daily-summary.md §Guidance)
+# ---------------------------------------------------------------------------
+
+BRIEFING_MAX_TOKENS = int(os.getenv("BRIEFING_MAX_TOKENS", "3000"))
+
+_BRIEFING_SCHEMA = {
+    "type": "object",
+    "properties": {"briefing": {"type": "string"}},
+    "required": ["briefing"],
+}
+
+
+def briefing_context(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Pure: the slice of the daily summary worth prompting over.
+
+    The full payload carries every restaurant card with its nested snapshot;
+    the briefing only needs the headline numbers and the already-phrased action
+    rows, which ``build_issues`` has written as human sentences anyway.
+    """
+    def rows(key: str) -> List[str]:
+        return [
+            f"{a.get('restaurant')}: {a.get('problem')}"
+            + (f" — {a['impact']}" if a.get("impact") else "")
+            for a in summary.get(key) or []
+        ]
+
+    return {
+        "totals": summary.get("totals") or {},
+        "restaurants": [
+            {
+                "name": c.get("title"),
+                "status": c.get("status"),
+                "sales_today": c.get("sales_today"),
+                "forecast_today": c.get("forecast_today"),
+                "waste_today": c.get("waste_today"),
+                "tickets_waiting": c.get("orders_waiting"),
+            }
+            for c in summary.get("restaurants") or []
+        ],
+        "major_incidents": rows("major_incidents"),
+        "pending_decisions": rows("pending_decisions"),
+        "next_day_risks": rows("next_day_risks"),
+    }
+
+
+def write_briefing(
+    summary: Dict[str, Any],
+    complete: Optional[Any] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Six lines of portfolio prose over the daily-summary JSON.
+
+    Same canned-fallback contract as the catch-up summarizer: a degraded
+    provider yields ``error`` set and ``prose`` empty. Canned filler presented
+    as a briefing is the exact failure daily-summary.md warns about.
+    """
+    if complete is None:
+        provider, default_model = _summarizer()
+        complete, model = provider.complete, model or default_model
+
+    result = complete(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are writing the morning briefing for someone who owns "
+                    "several restaurants and has not looked at them yet today.\n\n"
+                    "Rules:\n"
+                    "- At most 6 short lines, one per line, no bullet characters.\n"
+                    "- Lead with the thing that costs money or blocks service "
+                    "today; end with what needs a decision.\n"
+                    "- Name restaurants. Quantify with the numbers given "
+                    "(euros, counts) and no others.\n"
+                    "- Plain declarative prose. No greeting, no sign-off, no "
+                    "advice that the data does not support.\n"
+                    "- If the estate is quiet, say so in one line rather than "
+                    "padding to six.\n\n"
+                    'Return JSON: {"briefing": "line one\\nline two\\n..."}'
+                ),
+            },
+            {"role": "user", "content": json.dumps(
+                briefing_context(summary), sort_keys=True, default=str)},
+        ],
+        json_schema=_BRIEFING_SCHEMA,
+        max_tokens=BRIEFING_MAX_TOKENS,
+        use_site="portfolio_briefing",
+        model=model,
+    )
+
+    prose = result.get("briefing") if isinstance(result, dict) else None
+    if (not isinstance(result, dict) or result.get("note") == CANNED_NOTE
+            or not isinstance(prose, str) or not prose.strip()):
+        return {
+            "generated_at": time.time(),
+            "model": model or "",
+            "error": (
+                f"The briefing was not written: {model or 'the model'} fell back "
+                "to canned output. Check GEMINI_REASONER_MODEL and the Vertex "
+                "credentials — a bad model id degrades silently."
+            ),
+            "prose": "",
+        }
+    return {
+        "generated_at": time.time(),
+        "model": model or "",
+        "error": None,
+        "prose": prose.strip(),
+    }
+
+
+@app.post("/admin/api/briefing")
+async def briefing() -> Dict[str, Any]:
+    """Write the prose briefing over a freshly-read portfolio summary.
+
+    POST, and only ever on demand: ``GET /admin/api/summary`` is polled every
+    30s by the dashboard, and hanging an LLM call off that poll would bill a
+    Gemini call twice a minute forever.
+
+    The fan-out is async but ``write_briefing`` blocks, so it goes to a thread —
+    the same reason ``summarize_catchup`` is a sync ``def``.
+    """
+    snapshot = await daily_summary()
+    return await asyncio.to_thread(write_briefing, snapshot)
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import {
   History,
   Play,
   Plus,
+  Sparkles,
   Square,
   Trash2,
   X,
@@ -18,6 +19,7 @@ import { PRESET_EMOJI, RestaurantLogo } from "../shell/RestaurantLogo";
 import {
   type ActionItem,
   type AdminApproval,
+  type Briefing,
   type CatchupEvent,
   type CatchupMarker,
   type CatchupRecord,
@@ -25,6 +27,10 @@ import {
   type Incident,
   type IncidentHistoryRow,
   type InstanceCard,
+  type MergedCatchup,
+  type Summary,
+  type SummaryArchive,
+  type SummaryArchiveMarker,
   fmtMoney,
   fmtSim,
   useAdminData,
@@ -66,12 +72,24 @@ const INCIDENT_STATUS_STYLE: Record<string, string> = {
   resolved: "bg-success/15 text-success",
 };
 
+// Two-way switches (drawer sections, archive days). Tailwind classes must be
+// statically named, so selection picks a whole string rather than building one.
+const TOGGLE_ON = "rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-text";
+const TOGGLE_OFF =
+  "rounded-md px-2.5 py-1 text-xs font-medium text-text/50 hover:bg-muted/60 hover:text-text";
+
 const SEVERITY_STYLE: Record<string, string> = {
   critical: "bg-danger text-white",
   high: "bg-amber-500 text-white",
   medium: "bg-muted text-text/80",
   low: "bg-muted text-text/50",
 };
+
+/** Wall-clock epoch seconds. Sim time uses fmtSim — briefings and archives are
+ *  stamped in real time, so they must not go through it. */
+function fmtWhen(epochSeconds: number): string {
+  return new Date(epochSeconds * 1000).toLocaleString();
+}
 
 function StatusPill({ status }: { status: string }) {
   return (
@@ -292,7 +310,7 @@ function RestaurantCard({
           type="button"
           onClick={() => setShowCatchups(true)}
           className="flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-text/60 hover:bg-muted"
-          title={`Previous catch-ups for ${card.title}`}
+          title={`Previous catch-ups and archived days for ${card.title}`}
         >
           {/* Not labelled "History" — the incidents tab owns that word, and two
               History buttons on one screen is a coin flip for the reader. */}
@@ -474,9 +492,9 @@ function CatchupSummaryView({
   );
 }
 
-/** Per-restaurant catch-up history. Fetched on open rather than polled — past
- *  captures do not change while you read them, and summarizing is an explicit
- *  (slow) act. */
+/** Per-restaurant history: the catch-up captures, and the end-of-day summary
+ *  archive. Both are fetched on open rather than polled — neither changes while
+ *  you read it, and summarizing/merging is an explicit (slow) act. */
 function CatchupDrawer({
   instanceId,
   title,
@@ -486,21 +504,35 @@ function CatchupDrawer({
   title: string;
   onClose: () => void;
 }) {
+  const [view, setView] = useState<"catchups" | "archive">("catchups");
   const [markers, setMarkers] = useState<CatchupMarker[] | null>(null);
   const [record, setRecord] = useState<CatchupRecord | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [summarizing, setSummarizing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Merge is a transient read: nothing is written, the captures are untouched.
+  const [range, setRange] = useState<{ from: number; to: number } | null>(null);
+  const [merged, setMerged] = useState<MergedCatchup | null>(null);
+  const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+  const [days, setDays] = useState<SummaryArchiveMarker[] | null>(null);
+  const [archive, setArchive] = useState<SummaryArchive | null>(null);
+  const [archiveDay, setArchiveDay] = useState<number | null>(null);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
 
   useEffect(() => {
     apiGet<CatchupMarker[]>(`/admin/api/instances/${instanceId}/catchups`)
       .then(setMarkers)
       .catch(() => setMarkers([]));
+    apiGet<SummaryArchiveMarker[]>(`/admin/api/instances/${instanceId}/summaries`)
+      .then(setDays)
+      .catch(() => setDays([]));
   }, [instanceId]);
 
   async function select(n: number) {
     setSelected(n);
     setRecord(null);
+    setMerged(null);
     setError(null);
     try {
       setRecord(
@@ -508,6 +540,45 @@ function CatchupDrawer({
       );
     } catch {
       setError("Could not load that catch-up.");
+    }
+  }
+
+  async function merge() {
+    setMerging(true);
+    setMergeError(null);
+    setMerged(null);
+    setSelected(null);
+    setRecord(null);
+    try {
+      setMerged(
+        await apiPost<MergedCatchup>(
+          `/admin/api/instances/${instanceId}/catchups/merge`,
+          { from, to },
+        ),
+      );
+    } catch (err) {
+      // The manager rejects a gappy range with a sentence — show its words.
+      setMergeError(
+        (err as { detail?: string } | null)?.detail ??
+          "Could not merge those catch-ups.",
+      );
+    } finally {
+      setMerging(false);
+    }
+  }
+
+  async function selectDay(day: number) {
+    setArchiveDay(day);
+    setArchive(null);
+    setArchiveError(null);
+    try {
+      setArchive(
+        await apiGet<SummaryArchive>(
+          `/admin/api/instances/${instanceId}/summaries/${day}`,
+        ),
+      );
+    } catch {
+      setArchiveError("Could not load that day's archive.");
     }
   }
 
@@ -531,6 +602,9 @@ function CatchupDrawer({
   }
 
   const newestFirst = markers ? [...markers].reverse() : [];
+  const ns = markers?.map((m) => m.n) ?? [];
+  const from = range?.from ?? ns[0] ?? 0;
+  const to = range?.to ?? ns[ns.length - 1] ?? 0;
 
   return (
     <>
@@ -538,7 +612,7 @@ function CatchupDrawer({
       <aside className="fixed right-0 top-0 z-50 flex h-full w-[34rem] max-w-full flex-col bg-primary text-text shadow-2xl">
         <header className="flex items-center gap-2 border-b border-muted px-4 py-3">
           <History size={16} className="text-text/50" />
-          <h3 className="flex-1 text-sm font-semibold">Catch-ups — {title}</h3>
+          <h3 className="flex-1 text-sm font-semibold">History — {title}</h3>
           <button
             type="button"
             onClick={onClose}
@@ -549,83 +623,214 @@ function CatchupDrawer({
           </button>
         </header>
 
-        <div className="flex-1 overflow-y-auto px-4 py-3">
-          {markers == null ? (
-            <p className="py-8 text-center text-sm text-text/40">Loading…</p>
-          ) : markers.length === 0 ? (
-            <p className="py-8 text-center text-sm text-text/40">
-              No catch-ups captured yet — press “Catch up” on the card.
-            </p>
-          ) : (
-            <div className="flex flex-col gap-1">
-              {newestFirst.map((m) => (
-                <button
-                  key={m.n}
-                  type="button"
-                  onClick={() => select(m.n)}
-                  className={
-                    selected === m.n
-                      ? "flex items-center gap-2 rounded-md border border-accent bg-surface px-2 py-1.5 text-left text-xs"
-                      : "flex items-center gap-2 rounded-md border border-muted bg-surface px-2 py-1.5 text-left text-xs hover:border-text/30"
-                  }
-                >
-                  <span className="w-8 shrink-0 font-semibold text-text/60">#{m.n}</span>
-                  <span className="min-w-0 flex-1 text-text/70">
-                    {fmtSim(m.since_sim)} → {fmtSim(m.until_sim)}
-                  </span>
-                  <span className="shrink-0 text-text/40">{m.event_count} events</span>
-                  {m.summary && (
-                    <span
-                      className={
-                        m.summary.error
-                          ? "shrink-0 rounded bg-danger/15 px-1.5 text-[11px] font-semibold text-danger"
-                          : "shrink-0 rounded bg-success/15 px-1.5 text-[11px] font-semibold text-success"
-                      }
-                    >
-                      {m.summary.error ? "failed" : "summarized"}
-                    </span>
-                  )}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {selected != null && (
-            <div className="mt-4 border-t border-muted pt-3">
-              {record == null ? (
-                <p className="text-sm text-text/40">{error ?? "Loading…"}</p>
-              ) : (
-                <>
-                  <div className="mb-2 flex items-center gap-2">
-                    <span className="text-xs text-text/50">
-                      Catch-up #{record.n} · {record.event_count} events
-                    </span>
-                    <button
-                      type="button"
-                      disabled={summarizing}
-                      onClick={summarize}
-                      className="ml-auto rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
-                    >
-                      {summarizing
-                        ? "Summarizing…"
-                        : record.summary
-                          ? "Re-summarize"
-                          : "Summarize"}
-                    </button>
-                  </div>
-                  {error && <p className="mb-2 text-xs text-danger">{error}</p>}
-                  {record.summary ? (
-                    <CatchupSummaryView summary={record.summary} events={record.events} />
-                  ) : (
-                    <p className="text-sm text-text/40">
-                      Not summarized yet.
-                    </p>
-                  )}
-                </>
-              )}
-            </div>
-          )}
+        <div className="flex gap-1 border-b border-muted px-4 py-2">
+          <button
+            type="button"
+            onClick={() => setView("catchups")}
+            className={view === "catchups" ? TOGGLE_ON : TOGGLE_OFF}
+          >
+            Catch-ups
+          </button>
+          <button
+            type="button"
+            onClick={() => setView("archive")}
+            className={view === "archive" ? TOGGLE_ON : TOGGLE_OFF}
+          >
+            Day archive
+          </button>
         </div>
+
+        {view === "archive" ? (
+          <div className="flex-1 overflow-y-auto px-4 py-3">
+            {days == null ? (
+              <p className="py-8 text-center text-sm text-text/40">Loading…</p>
+            ) : days.length === 0 ? (
+              <p className="py-8 text-center text-sm text-text/40">
+                No day archived yet — the manager snapshots the portfolio when this
+                restaurant's sim-day rolls over.
+              </p>
+            ) : (
+              <>
+                <div className="flex flex-wrap gap-1">
+                  {days.map((d) => (
+                    <button
+                      key={d.day}
+                      type="button"
+                      onClick={() => selectDay(d.day)}
+                      title={`Archived ${fmtWhen(d.created_at)}`}
+                      className={archiveDay === d.day ? TOGGLE_ON : TOGGLE_OFF}
+                    >
+                      Day {d.day}
+                    </button>
+                  ))}
+                </div>
+                {archiveDay != null && (
+                  <div className="mt-3 border-t border-muted pt-3 text-sm">
+                    {archive == null ? (
+                      <p className="text-sm text-text/40">
+                        {archiveError ?? "Loading…"}
+                      </p>
+                    ) : (
+                      <>
+                        <div className="mb-2 flex flex-wrap items-baseline gap-2">
+                          <h4 className="text-sm font-semibold text-text">
+                            End of sim-day {archive.day}
+                          </h4>
+                          <span className="text-[11px] text-text/40">
+                            snapshot taken {fmtWhen(archive.created_at)} — frozen, not
+                            live
+                          </span>
+                        </div>
+                        {/* Portfolio-wide on purpose: the archive freezes the whole
+                            board at this restaurant's rollover. */}
+                        <SummaryView summary={archive.summary} />
+                      </>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        ) : (
+          <div className="flex-1 overflow-y-auto px-4 py-3">
+            {ns.length > 1 && (
+              <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-muted bg-surface px-2 py-1.5 text-xs">
+                <select
+                  value={from}
+                  onChange={(e) => setRange({ from: Number(e.target.value), to })}
+                  aria-label="Merge from"
+                  className="rounded border border-muted bg-primary px-1 py-0.5 text-xs text-text"
+                >
+                  {ns.map((n) => (
+                    <option key={n} value={n}>
+                      Catch-up {n}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-text/40">→</span>
+                <select
+                  value={to}
+                  onChange={(e) => setRange({ from, to: Number(e.target.value) })}
+                  aria-label="Merge to"
+                  className="rounded border border-muted bg-primary px-1 py-0.5 text-xs text-text"
+                >
+                  {ns.map((n) => (
+                    <option key={n} value={n}>
+                      Catch-up {n}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  disabled={merging || from > to}
+                  onClick={merge}
+                  className="rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
+                >
+                  {merging ? "Merging…" : "Merge"}
+                </button>
+                <span className="text-text/40">
+                  {from > to ? "end must not precede the start" : "read-only, nothing is saved"}
+                </span>
+              </div>
+            )}
+
+            {markers == null ? (
+              <p className="py-8 text-center text-sm text-text/40">Loading…</p>
+            ) : markers.length === 0 ? (
+              <p className="py-8 text-center text-sm text-text/40">
+                No catch-ups captured yet — press “Catch up” on the card.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-1">
+                {newestFirst.map((m) => (
+                  <button
+                    key={m.n}
+                    type="button"
+                    onClick={() => select(m.n)}
+                    className={
+                      selected === m.n
+                        ? "flex items-center gap-2 rounded-md border border-accent bg-surface px-2 py-1.5 text-left text-xs"
+                        : "flex items-center gap-2 rounded-md border border-muted bg-surface px-2 py-1.5 text-left text-xs hover:border-text/30"
+                    }
+                  >
+                    <span className="w-8 shrink-0 font-semibold text-text/60">#{m.n}</span>
+                    <span className="min-w-0 flex-1 text-text/70">
+                      {fmtSim(m.since_sim)} → {fmtSim(m.until_sim)}
+                    </span>
+                    <span className="shrink-0 text-text/40">{m.event_count} events</span>
+                    {m.summary && (
+                      <span
+                        className={
+                          m.summary.error
+                            ? "shrink-0 rounded bg-danger/15 px-1.5 text-[11px] font-semibold text-danger"
+                            : "shrink-0 rounded bg-success/15 px-1.5 text-[11px] font-semibold text-success"
+                        }
+                      >
+                        {m.summary.error ? "failed" : "summarized"}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {mergeError && <p className="mt-3 text-xs text-danger">{mergeError}</p>}
+
+            {merged && (
+              <div className="mt-4 border-t border-muted pt-3">
+                <div className="mb-2 flex flex-wrap items-baseline gap-2">
+                  <h4 className="text-sm font-semibold text-text">
+                    Catch-ups #{merged.from}–#{merged.to}, merged
+                  </h4>
+                  <span className="rounded bg-muted px-1.5 text-[11px] font-medium text-text/60">
+                    not saved
+                  </span>
+                  <span className="text-[11px] text-text/40">
+                    {fmtSim(merged.since_sim)} → {fmtSim(merged.until_sim)} ·{" "}
+                    {merged.event_count} events · the captures themselves are untouched
+                  </span>
+                </div>
+                <CatchupSummaryView summary={merged.summary} events={merged.events} />
+              </div>
+            )}
+
+            {selected != null && (
+              <div className="mt-4 border-t border-muted pt-3">
+                {record == null ? (
+                  <p className="text-sm text-text/40">{error ?? "Loading…"}</p>
+                ) : (
+                  <>
+                    <div className="mb-2 flex items-center gap-2">
+                      <span className="text-xs text-text/50">
+                        Catch-up #{record.n} · {record.event_count} events
+                      </span>
+                      <button
+                        type="button"
+                        disabled={summarizing}
+                        onClick={summarize}
+                        className="ml-auto rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
+                      >
+                        {summarizing
+                          ? "Summarizing…"
+                          : record.summary
+                            ? "Re-summarize"
+                            : "Summarize"}
+                      </button>
+                    </div>
+                    {error && <p className="mb-2 text-xs text-danger">{error}</p>}
+                    {record.summary ? (
+                      <CatchupSummaryView summary={record.summary} events={record.events} />
+                    ) : (
+                      <p className="text-sm text-text/40">
+                        Not summarized yet.
+                      </p>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </aside>
     </>
   );
@@ -975,6 +1180,79 @@ function IncidentHistory() {
   );
 }
 
+/** The written briefing over the numbers below it. On demand only: it is a real
+ *  LLM round trip (tens of seconds), while the numbers underneath poll every
+ *  30s — wiring this to that poll would bill a Gemini call twice a minute.
+ *  A degraded provider is rendered as an error and never as prose (§4 of
+ *  docs/fable/progress.md — the canned-fallback trap). */
+function BriefingProse() {
+  const [briefing, setBriefing] = useState<Briefing | null>(null);
+  const [writing, setWriting] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  async function write() {
+    setWriting(true);
+    setFailed(false);
+    try {
+      setBriefing(await apiPost<Briefing>("/admin/api/briefing"));
+    } catch {
+      setBriefing(null);
+      setFailed(true);
+    } finally {
+      setWriting(false);
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-muted bg-surface p-4 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-sm font-semibold text-text">Written briefing</h3>
+        <button
+          type="button"
+          disabled={writing}
+          onClick={write}
+          className="ml-auto flex items-center gap-1 rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
+        >
+          <Sparkles size={13} /> {writing ? "Writing…" : "Write briefing"}
+        </button>
+      </div>
+
+      {briefing == null && !failed && (
+        <p className="mt-1 text-xs text-text/40">
+          The numbers below are live. The written briefing is generated on demand —
+          it takes half a minute.
+        </p>
+      )}
+
+      {failed && (
+        <p className="mt-2 text-xs text-danger">
+          The manager could not write a briefing.
+        </p>
+      )}
+
+      {briefing &&
+        (briefing.error ? (
+          <div className="mt-2 rounded-md border border-danger/40 bg-danger/10 p-3">
+            <div className="flex items-center gap-1.5 text-sm font-semibold text-danger">
+              <AlertTriangle size={14} /> Briefing failed — nothing was written
+            </div>
+            <p className="mt-1 text-xs text-danger/90">{briefing.error}</p>
+            <p className="mt-1 text-[11px] text-text/40">model: {briefing.model}</p>
+          </div>
+        ) : (
+          <>
+            <p className="mt-2 whitespace-pre-wrap text-sm text-text/80">
+              {briefing.prose}
+            </p>
+            <p className="mt-2 text-[11px] text-text/30">
+              {briefing.model} · {fmtWhen(briefing.generated_at)}
+            </p>
+          </>
+        ))}
+    </div>
+  );
+}
+
 export default function AdminPage() {
   const data = useAdminData();
   const [tab, setTab] = useState<Tab>("queue");
@@ -1190,36 +1468,42 @@ export default function AdminPage() {
           </>
         )}
 
-        {tab === "briefing" &&
-          (data.summary == null ? (
-            <p className="py-8 text-center text-sm text-text/40">Loading…</p>
-          ) : (
-            <div className="rounded-lg border border-muted bg-surface p-4 text-sm">
-              <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-4">
-                <Metric
-                  label="Portfolio sales / forecast"
-                  value={`${fmtMoney(data.summary.totals.sales_today)} / ${fmtMoney(data.summary.totals.forecast_today)}`}
-                />
-                <Metric
-                  label="Waste today"
-                  value={fmtMoney(data.summary.totals.waste_today)}
-                />
-                <Metric label="Stock risks" value={data.summary.totals.stock_risks} />
-                <Metric label="Staff absent" value={data.summary.totals.staff_absent} />
+        {tab === "briefing" && (
+          <div className="flex flex-col gap-3">
+            <BriefingProse />
+            {data.summary == null ? (
+              <p className="py-8 text-center text-sm text-text/40">Loading…</p>
+            ) : (
+              <div className="rounded-lg border border-muted bg-surface p-4 text-sm">
+                <SummaryView summary={data.summary} />
               </div>
-              <SummaryList label="Major incidents" items={data.summary.major_incidents} />
-              <SummaryList
-                label="Pending decisions"
-                items={data.summary.pending_decisions}
-              />
-              <SummaryList
-                label="Risks for the next day"
-                items={data.summary.next_day_risks}
-              />
-            </div>
-          ))}
+            )}
+          </div>
+        )}
       </section>
     </div>
+  );
+}
+
+/** The numeric portfolio briefing. Rendered live in the briefing tab and frozen
+ *  in the day archive, from the same shape, so an archived day reads exactly
+ *  like today. */
+function SummaryView({ summary }: { summary: Summary }) {
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-4">
+        <Metric
+          label="Portfolio sales / forecast"
+          value={`${fmtMoney(summary.totals.sales_today)} / ${fmtMoney(summary.totals.forecast_today)}`}
+        />
+        <Metric label="Waste today" value={fmtMoney(summary.totals.waste_today)} />
+        <Metric label="Stock risks" value={summary.totals.stock_risks} />
+        <Metric label="Staff absent" value={summary.totals.staff_absent} />
+      </div>
+      <SummaryList label="Major incidents" items={summary.major_incidents} />
+      <SummaryList label="Pending decisions" items={summary.pending_decisions} />
+      <SummaryList label="Risks for the next day" items={summary.next_day_risks} />
+    </>
   );
 }
 

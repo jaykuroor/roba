@@ -6,12 +6,16 @@ import { describe, expect, it, vi } from "vitest";
 
 import type {
   ActionItem,
+  Briefing,
   CatchupMarker,
   CatchupRecord,
   CatchupSummary,
   Incident,
   IncidentHistoryRow,
   InstanceCard,
+  MergedCatchup,
+  SummaryArchive,
+  SummaryArchiveMarker,
 } from "../useAdminData";
 
 const overview: { instances: InstanceCard[]; actions: ActionItem[] } = {
@@ -25,10 +29,20 @@ const incidentData: { incidents: Incident[]; unavailable_categories: string[] } 
 };
 const history: { incidents: IncidentHistoryRow[] } = { incidents: [] };
 const posted: string[] = [];
+const postedBodies: Record<string, unknown> = {};
 // Catch-ups are fetched on demand, so the stub answers the marker list and one
 // record per `n` (docs/fable/catchup.md).
 let catchupMarkers: CatchupMarker[] = [];
 let catchupRecords: Record<number, CatchupRecord> = {};
+// Day archive (docs/fable/daily-summary.md) — same shape: a marker list plus
+// one snapshot per sim-day.
+let archiveDays: SummaryArchiveMarker[] = [];
+let archives: Record<number, SummaryArchive> = {};
+// A merge either returns a transient summary or 400s with the manager's own
+// sentence; the briefing is one on-demand LLM round trip. Both are thunks so
+// the fixtures below are read at call time, not at module init.
+let mergeAnswer: () => Promise<unknown> = () => Promise.resolve(mergedCatchup());
+let briefingAnswer: () => Briefing = () => briefing();
 
 vi.mock("../../api", () => ({
   apiGet: vi.fn((path: string) => {
@@ -43,12 +57,22 @@ vi.mock("../../api", () => ({
         catchup[1] == null ? catchupMarkers : catchupRecords[Number(catchup[1])],
       );
     }
+    const archive = path.match(/\/summaries(?:\/(\d+))?$/);
+    if (archive) {
+      return Promise.resolve(
+        archive[1] == null ? archiveDays : archives[Number(archive[1])],
+      );
+    }
     return new Promise(() => undefined); // /admin/api/summary — never resolves
   }),
-  apiPost: vi.fn((path: string) => {
+  apiPost: vi.fn((path: string, body?: unknown) => {
     posted.push(path);
+    postedBodies[path] = body;
     // /summarize returns the CatchupSummary it just persisted.
-    return Promise.resolve(path.endsWith("/summarize") ? freshSummary : {});
+    if (path.endsWith("/summarize")) return Promise.resolve(freshSummary);
+    if (path.endsWith("/catchups/merge")) return mergeAnswer();
+    if (path === "/admin/api/briefing") return Promise.resolve(briefingAnswer());
+    return Promise.resolve({});
   }),
   apiPatch: vi.fn(() => new Promise(() => undefined)),
   apiDelete: vi.fn(() => new Promise(() => undefined)),
@@ -320,22 +344,86 @@ function catchupRecord(m: CatchupMarker): CatchupRecord {
   };
 }
 
-describe("catch-up history drawer", () => {
-  /** Click something that kicks off a fetch, and let the resulting state
-   *  update land inside act() — the drawer loads on demand, not on render. */
-  async function click(el: HTMLElement) {
-    await act(async () => {
-      fireEvent.click(el);
-    });
-  }
+/** Click something that kicks off a fetch, and let the resulting state update
+ *  land inside act() — drawers and briefings load on demand, not on render. */
+async function click(el: HTMLElement) {
+  await act(async () => {
+    fireEvent.click(el);
+  });
+}
 
-  async function openDrawer(markers: CatchupMarker[]) {
+// --- merged catch-ups, briefing prose, day archive (Phase 6) --------------
+
+const MERGED_BULLET =
+  "Across both windows four purchase orders were placed and two arrived late.";
+const PROSE =
+  "Sales are 12% ahead of forecast across the portfolio.\nBella's is short a cook tonight.";
+
+function mergedCatchup(): MergedCatchup {
+  return {
+    from: 1,
+    to: 2,
+    since_sim: 0,
+    until_sim: 86400,
+    event_count: 14,
+    events: catchupRecord(marker()).events,
+    summary: bucketSummary({
+      buckets: [
+        {
+          bucket: "procurement",
+          event_count: 14,
+          truncated: 0,
+          bullets: [{ text: MERGED_BULLET, event_ids: [41] }],
+        },
+      ],
+    }),
+  };
+}
+
+function briefing(overrides: Partial<Briefing> = {}): Briefing {
+  return {
+    generated_at: 1700000200,
+    model: "gemini-2.5-pro",
+    error: null,
+    prose: PROSE,
+    ...overrides,
+  };
+}
+
+const archivedDay: SummaryArchive = {
+  day: 2,
+  created_at: 1700000000,
+  instance_id: "running_fox",
+  summary: {
+    generated_at: 1700000000,
+    totals: {
+      sales_today: 480,
+      forecast_today: 500,
+      waste_today: 12.5,
+      stock_risks: 3,
+      staff_absent: 1,
+      pending_approvals: 2,
+      offline: 0,
+    },
+    major_incidents: [action({ problem: "Freezer above 5°C for 40 minutes" })],
+    pending_decisions: [],
+    next_day_risks: [],
+  },
+};
+
+describe("catch-up history drawer", () => {
+  async function openDrawer(
+    markers: CatchupMarker[],
+    days: SummaryArchiveMarker[] = [],
+  ) {
     overview.instances = [card()];
     overview.actions = [];
     catchupMarkers = markers;
     catchupRecords = Object.fromEntries(
       markers.map((m) => [m.n, catchupRecord(m)]),
     );
+    archiveDays = days;
+    mergeAnswer = () => Promise.resolve(mergedCatchup());
     posted.length = 0;
     render(<AdminPage />);
     await waitFor(() => expect(screen.getByText("Bella's")).toBeInTheDocument());
@@ -421,5 +509,98 @@ describe("catch-up history drawer", () => {
     expect(await screen.findByText("delivery ops")).toBeInTheDocument();
     expect(screen.getByText("A courier no-showed.")).toBeInTheDocument();
     expect(screen.getByText("3 older events not summarized")).toBeInTheDocument();
+  });
+
+  it("merges a range of captures into one transient summary", async () => {
+    // The range defaults to every capture there is: #1 → #2.
+    await openDrawer([marker(), summarized]);
+    await click(await screen.findByText("Merge"));
+    const path = "/admin/api/instances/running_fox/catchups/merge";
+    expect(posted).toContain(path);
+    expect(postedBodies[path]).toEqual({ from: 1, to: 2 });
+    expect(await screen.findByText(MERGED_BULLET)).toBeInTheDocument();
+    // Merging never writes: the captures stay the audit trail.
+    expect(screen.getByText("Catch-ups #1–#2, merged")).toBeInTheDocument();
+    expect(screen.getByText("not saved")).toBeInTheDocument();
+  });
+
+  it("cannot submit a range whose end precedes its start", async () => {
+    await openDrawer([marker(), summarized]);
+    await act(async () => {
+      fireEvent.change(await screen.findByLabelText("Merge from"), {
+        target: { value: "2" },
+      });
+      fireEvent.change(screen.getByLabelText("Merge to"), { target: { value: "1" } });
+    });
+    expect(screen.getByText("Merge")).toBeDisabled();
+    await click(screen.getByText("Merge"));
+    expect(posted).not.toContain("/admin/api/instances/running_fox/catchups/merge");
+  });
+
+  it("shows the manager's own sentence when a range cannot be merged", async () => {
+    await openDrawer([marker(), summarized]);
+    mergeAnswer = () =>
+      Promise.reject(
+        Object.assign(new Error("POST /catchups/merge -> 400"), {
+          detail: "Catch-up 2 is missing — the range is not contiguous.",
+        }),
+      );
+    await click(screen.getByText("Merge"));
+    expect(
+      await screen.findByText("Catch-up 2 is missing — the range is not contiguous."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(MERGED_BULLET)).not.toBeInTheDocument();
+  });
+
+  it("lists archived sim-days and renders the selected day's snapshot", async () => {
+    archives = { 2: archivedDay };
+    await openDrawer([marker()], [
+      { day: 2, created_at: 1700000000 },
+      { day: 1, created_at: 1699913600 },
+    ]);
+    await click(await screen.findByText("Day archive"));
+    expect(await screen.findByText("Day 2")).toBeInTheDocument();
+    expect(screen.getByText("Day 1")).toBeInTheDocument();
+
+    await click(screen.getByText("Day 2"));
+    expect(await screen.findByText("End of sim-day 2")).toBeInTheDocument();
+    // Same rendering as the live briefing tab, from the same Summary shape.
+    expect(screen.getByText("€480.00 / €500.00")).toBeInTheDocument();
+    expect(screen.getByText("€12.50")).toBeInTheDocument();
+    expect(screen.getByText(/Freezer above 5°C/)).toBeInTheDocument();
+  });
+});
+
+
+// --- daily briefing prose (docs/fable/daily-summary.md) -------------------
+
+describe("daily briefing — written prose", () => {
+  async function writeBriefing(b: Briefing) {
+    overview.instances = [card()];
+    overview.actions = [];
+    briefingAnswer = () => b;
+    posted.length = 0;
+    render(<AdminPage />);
+    await waitFor(() => expect(screen.getByText("Bella's")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Daily briefing"));
+    await click(await screen.findByText("Write briefing"));
+  }
+
+  it("writes a briefing on demand and renders the prose", async () => {
+    await writeBriefing(briefing());
+    expect(posted).toContain("/admin/api/briefing");
+    expect(await screen.findByText(/Sales are 12% ahead of forecast/)).toBeInTheDocument();
+    expect(screen.getByText(/gemini-2\.5-pro/)).toBeInTheDocument();
+  });
+
+  it("renders a degraded briefing as an error and never as prose", async () => {
+    // A real failure carries prose: ""; carry the real thing anyway so this
+    // fails loudly if the view ever falls through (progress.md §4).
+    await writeBriefing(briefing({ error: "LLM returned the canned no-op response" }));
+    expect(
+      await screen.findByText("LLM returned the canned no-op response"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Briefing failed/)).toBeInTheDocument();
+    expect(screen.queryByText(/Sales are 12% ahead of forecast/)).not.toBeInTheDocument();
   });
 });
