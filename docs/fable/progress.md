@@ -50,7 +50,7 @@ Last full audit of the codebase against the docs: **2026-07-27**.
 | [kitchen-task-notices.md](kitchen-task-notices.md) | ✅ implemented | — | — |
 | [portfolio-overview.md](portfolio-overview.md) | ✅ implemented | — | — |
 | [priority-action-queue.md](priority-action-queue.md) | ✅ implemented | — | — |
-| [incidents.md](incidents.md) | 🟡 partial | all 7 categories detected; incidents not first-class objects | 4 |
+| [incidents.md](incidents.md) | ✅ implemented | — | — |
 | [catchup.md](catchup.md) | 🟠 infra only | LLM summary, expand-for-detail, history drawer, merge, auto-capture | 5, 6 |
 | [daily-summary.md](daily-summary.md) | 🟡 partial | LLM prose briefing, tomorrow-specific risk, end-of-day archive | 6 |
 
@@ -62,7 +62,8 @@ escalating notices, the `/admin` UI with its 4 tabs, (Phase 1) the kitchen ticke
 lifecycle with its `Tickets` card metric and Controls mode toggle, (Phase 2) the
 `FOOD_SAFETY_CHECK` detector feeding `safety_issues` / `task_compliance` and the
 `food_safety_checks` incident category, and (Phase 3) the `ORDER_BACKLOG` /
-`EQUIPMENT_FAILURE` detectors plus € at stake and order-by deadlines on the action queue.
+`EQUIPMENT_FAILURE` detectors plus € at stake and order-by deadlines on the action queue,
+and (Phase 4) first-class incidents in `dbdata/manager.db` with ack / resolve / history.
 `/admin/api/incidents` now covers **all 7 categories** (`unavailable_categories` is `[]`).
 
 ---
@@ -292,27 +293,49 @@ show € at stake.
 
 ### Phase 4 — Incidents as first-class objects
 
-[incidents.md](incidents.md) §"Incidents as first-class objects". Today an incident vanishes
-when its source signal expires — no ack, no assign, no history.
+[incidents.md](incidents.md) §"Incidents as first-class objects". ~~Today an incident
+vanishes when its source signal expires — no ack, no assign, no history.~~ Incidents are now
+rows in `dbdata/manager.db`: detection stays derived (signals are still the source of truth)
+but the row outlives the signal, so it can be acknowledged, resolved and looked up later.
 
-- [ ] `dbdata/manager.db` via **stdlib `sqlite3`** (manager has no ORM dependency and should
+- [x] `dbdata/manager.db` via **stdlib `sqlite3`** (manager has no ORM dependency and should
       not gain one): `incidents(incident_id, instance_id, category, summary, opened_at,
-      status, acked_by, resolved_at, source_signal_id)`.
-- [ ] A **pure** `reconcile_incidents(derived, stored)` in `manager.py`, unit-tested like
+      status, acked_by, resolved_at, source_signal_id)`. — 36dd54b. Schema exactly as
+      specified; `incidents_db()` reads `STATE_DIR` at call time so tests relocate the whole
+      footprint with one monkeypatch. `opened_at` is child **sim**-time, `resolved_at` is
+      **wall-clock** — see §4.
+- [x] A **pure** `reconcile_incidents(derived, stored)` in `manager.py`, unit-tested like
       `merge_incidents`, called from `GET /admin/api/incidents`: opens rows for new derived
       incidents, auto-resolves rows whose source disappeared. Stable key =
       `(instance_id, category, summary)` — `merge_incidents` already dedupes by summary.
-- [ ] `POST /admin/api/incidents/{id}/ack`, `POST .../resolve`,
-      `GET /admin/api/incidents/history?instance_id=&since=`.
-- [ ] UI: Acknowledge / Resolve on incident rows, acknowledged styling, a history view.
-- [ ] Tests: reconcile open / auto-resolve / re-open; ack survives a manager restart.
-- [ ] Cover the remediated-`FOOD_SAFETY_CHECK` case (added 2026-07-27): its signal cannot be
+      — 36dd54b. Returns `{"open": [...], "resolve": [ids]}`; the sqlite side is a thin
+      `apply_reconcile` wrapper so the decision logic stays pure.
+- [x] `POST /admin/api/incidents/{id}/ack`, `POST .../resolve`,
+      `GET /admin/api/incidents/history?instance_id=&since=`. — 36dd54b (`since` filters
+      `opened_at`, i.e. sim-time, so it lines up with the clock the UI shows)
+- [x] UI: Acknowledge / Resolve on incident rows, acknowledged styling, a history view.
+      — 36dd54b (`IncidentRow` + `IncidentHistory`; acked rows dim, keep a `Resolve`
+      button and lose `Acknowledge`, since acked means "seen", not "fixed")
+- [x] Tests: reconcile open / auto-resolve / re-open; ack survives a manager restart.
+      — 36dd54b. `tests/test_incident_store.py` (13) + `AdminPage.test.tsx` (+4).
+- [x] Cover the remediated-`FOOD_SAFETY_CHECK` case (added 2026-07-27): its signal cannot be
       retracted, so a fixed check leaves the card `normal` while the incident stays open for
       24h (§4). Explicit resolve is the intended fix — make sure `reconcile_incidents`
-      auto-resolves it rather than waiting on the TTL.
+      auto-resolves it rather than waiting on the TTL. — 36dd54b. Solved a layer earlier:
+      the incidents fan-out now also reads `/api/ops/snapshot`, and `merge_incidents` drops
+      FOOD_SAFETY_CHECK rows whose `task_id` is no longer in `safety_issues`. The check
+      leaves the *derived* set, so ordinary auto-resolve closes it — no special case in
+      reconcile. A missing snapshot passes `None`, which keeps every row (an unreachable
+      child must never silently close incidents).
 
 **Done when** acknowledging an incident, restarting the manager, and reloading `/admin`
 still shows it acknowledged.
+
+> Verified across two real OS processes (36dd54b): process #1 polls
+> `/admin/api/incidents` (opens incident 1), acks it as `jay`, and exits; process #2 starts
+> with only `MANAGER_STATE_DIR` in common, polls again, and gets the **same** `incident_id`
+> back with `status=acked acked_by=jay`, plus one history row. The only thing on disk
+> between them is `dbdata/manager.db`.
 
 ---
 
@@ -337,6 +360,11 @@ Capture infrastructure already exists; `summary` is a `null` slot at `manager.py
       prose (§4 — this has bitten the project twice).
 - [ ] UI: per-card catch-up history drawer (`GET .../catchups` is already served and unused
       by the frontend), bullets expanding to raw events.
+- [ ] "Major incidents since you left" should read the **Phase 4 incident store**
+      (added 2026-07-27), not re-derive from signals: `GET /admin/api/incidents/history
+      ?instance_id=&since=` already returns everything opened in a window, including rows
+      that have since resolved — which is exactly what a catch-up wants and what live
+      signals can no longer tell you.
 - [ ] Tests: bucketing is deterministic; a canned response yields an error, never a summary.
 
 **Done when** a catch-up produces a readable per-subsystem summary whose bullets expand to
@@ -489,9 +517,17 @@ The non-obvious facts that shape this work. **Read this section before starting 
 - **`manager.py` imports no `core.*` module, has no DB and no LLM.** Its rule — "do not
   reach into child DBs, the HTTP surface is the contract" — is about *child data*. Importing
   `core.llm` / `core.config` as a *library* is fine, and is the intended path for Phases 5-6.
-- **Manager persistence should be stdlib `sqlite3`.** The manager has no ORM dependency;
+- **Manager persistence is stdlib `sqlite3`** — realized in Phase 4 as
+  `dbdata/manager.db` (`manager.incidents_db()`). The manager still has no ORM dependency;
   keep it that way. All state lives under `STATE_DIR` (`MANAGER_STATE_DIR`, default
-  `./dbdata`), so tests can relocate the whole footprint.
+  `./dbdata`), and `incidents_db()` reads `STATE_DIR` **at call time**, so a test relocates
+  the entire footprint with `monkeypatch.setattr(manager, "STATE_DIR", tmp_path)`. A
+  module-level path constant would have broken that — don't add one.
+- **`opened_at` is sim-time; `resolved_at` is wall-clock** (added 2026-07-27). Deliberate,
+  and the one place the manager mixes clocks: an incident *opens* because of something that
+  happened in the child's sim (so it sorts and renders with `fmtSim` like everything else),
+  but it *resolves* because a human clicked a button in real time. `history?since=` filters
+  `opened_at`, i.e. sim-time. Don't "unify" them without deciding which clock the UI means.
 - **Card fields are assembled in two places** — `_instance_overview` has an offline/busy
   branch (`:584`) and an online branch (`:624`). Every new field must be added to both.
 - **Cuisine resolution lives in `kitchen_tasks.active_cuisine(session)`** (moved there

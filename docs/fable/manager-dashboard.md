@@ -20,6 +20,7 @@ browser ── vite :5173 ──┬── /admin/api/*         → manager :8100
 
 manager :8100
   ├─ registry: dbdata/manager_registry.json   {id, preset, port, title, created_at}
+  ├─ incidents: dbdata/manager.db (stdlib sqlite3) — ack / resolve / history
   ├─ children: uvicorn core.api:app, DB_PATH=dbdata/<instance_id>.db, log dbdata/<instance_id>.log
   └─ catch-up captures: dbdata/catchups/<instance_id>/NNNNNN.json
 ```
@@ -83,9 +84,12 @@ Open `https://localhost:5173/admin`.
   (`derive_status`, `build_issues`, `rank_issues`) tested in
   `tests/test_manager.py`. Keep new derivations pure and unit-tested the same
   way; the async endpoints should only fetch and delegate.
-- **Manager has no DB.** Registry and catch-ups are JSON files. If manager
-  state outgrows that (per-user prefs, incident acknowledgements), add a small
-  SQLite next to the registry rather than complicating the children.
+- **Manager state is small and stdlib-only.** The registry and catch-ups are
+  JSON files; incidents live in `dbdata/manager.db` via stdlib `sqlite3`
+  (added for acknowledgement / resolve / history — see
+  [incidents.md](incidents.md)). The manager has no ORM dependency and should
+  not gain one; put new manager state next to these rather than complicating
+  the children.
 - **No auth exists** anywhere in roba; `/admin` inherits that. Whatever auth is
   added later must cover `/i/*` too (it is a full-power proxy into each
   restaurant, including CRUD and sim control).

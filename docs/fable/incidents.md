@@ -1,7 +1,6 @@
 # Incident Management
 
-Status: **partial** — every category has a detector; incidents are not yet
-first-class objects (no ack / assign / resolve / history).
+Status: **implemented**.
 
 ## What exists
 
@@ -67,16 +66,30 @@ line to `SIGNAL_TO_INCIDENT`. Two implementation notes worth keeping:
   deep, so one live row tracks the current depth rather than one signal per
   tick, and the TTL retires it once the pass drains.
 
-**Incidents as first-class objects.** Today an incident disappears when the
-underlying signal expires — there is no acknowledge / assign / resolve, and no
-history. When that is needed:
+## Incidents as first-class objects
 
-1. Keep detection derived (signals stay the source of truth); add a small
-   manager-side store (SQLite next to the registry, see manager-dashboard.md)
-   holding `{incident_id, instance_id, category, opened_at, status,
-   acked_by, resolved_at, source_signal_id}`.
-2. A reconcile pass in the manager (on each `/admin/api/incidents` call is
-   fine at demo scale) opens rows for new derived incidents and auto-resolves
-   rows whose source disappeared.
-3. This store is also what the catch-up summarizer should read for "major
-   incidents since you left" ([catchup.md](catchup.md)).
+Detection stays derived — signals remain the source of truth — but each incident
+is now a row in the manager's own store, so it survives its source signal and a
+manager restart.
+
+- **Store**: `dbdata/manager.db` via stdlib `sqlite3` (the manager has no ORM and
+  should not gain one), table `incidents(incident_id, instance_id, category,
+  summary, opened_at, status, acked_by, resolved_at, source_signal_id)`.
+  `opened_at` is child sim-time (from the source signal); `resolved_at` is
+  wall-clock, because resolving is an operator action rather than a sim event.
+- **Reconcile**: `manager.reconcile_incidents(derived, stored)` is pure and unit
+  tested. It runs on every `GET /admin/api/incidents` and returns
+  `{"open": [...], "resolve": [incident_ids]}`. Key =
+  `(instance_id, category, summary)` — `merge_incidents` phrases
+  deterministically and dedupes by summary, which is what makes that stable.
+  A resolved row is **never revived**: a recurrence opens a new row, so history
+  reads as two episodes rather than one flapping row.
+- **Actions**: `POST /admin/api/incidents/{id}/ack` (optional `acked_by`),
+  `POST /admin/api/incidents/{id}/resolve`, and
+  `GET /admin/api/incidents/history?instance_id=&since=` (`since` filters
+  `opened_at`, i.e. sim-time).
+- **Manual resolve exists because auto-resolve cannot always fire.** A
+  `FOOD_SAFETY_CHECK` signal only expires on its 24h TTL — the bus has no
+  retract. For that one case the derived set is filtered by the child snapshot's
+  still-failing `safety_issues`, so a remediated check drops out and reconcile
+  auto-resolves it. Every other category auto-resolves when its signal expires.
