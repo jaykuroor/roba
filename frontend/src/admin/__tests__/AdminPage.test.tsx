@@ -1,26 +1,36 @@
 // Restaurant-card rendering with real data, driven through the real
 // useAdminData hook by stubbing apiGet per path. The pattern for later phases:
 // add a field to the stub payload and assert what the card shows.
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { ActionItem, InstanceCard } from "../useAdminData";
+import type { ActionItem, Incident, IncidentHistoryRow, InstanceCard } from "../useAdminData";
 
 const overview: { instances: InstanceCard[]; actions: ActionItem[] } = {
   instances: [],
   actions: [],
 };
 
+const incidentData: { incidents: Incident[]; unavailable_categories: string[] } = {
+  incidents: [],
+  unavailable_categories: [],
+};
+const history: { incidents: IncidentHistoryRow[] } = { incidents: [] };
+const posted: string[] = [];
+
 vi.mock("../../api", () => ({
   apiGet: vi.fn((path: string) => {
     if (path.startsWith("/admin/api/overview")) return Promise.resolve(overview);
-    if (path.startsWith("/admin/api/incidents"))
-      return Promise.resolve({ incidents: [], unavailable_categories: [] });
+    if (path.startsWith("/admin/api/incidents/history")) return Promise.resolve(history);
+    if (path.startsWith("/admin/api/incidents")) return Promise.resolve(incidentData);
     if (path.startsWith("/admin/api/presets")) return Promise.resolve([]);
     if (path.startsWith("/admin/api/approvals")) return Promise.resolve([]);
     return new Promise(() => undefined); // /admin/api/summary — never resolves
   }),
-  apiPost: vi.fn(() => new Promise(() => undefined)),
+  apiPost: vi.fn((path: string) => {
+    posted.push(path);
+    return Promise.resolve({});
+  }),
   apiPatch: vi.fn(() => new Promise(() => undefined)),
   apiDelete: vi.fn(() => new Promise(() => undefined)),
 }));
@@ -158,5 +168,70 @@ describe("priority queue — € at stake", () => {
                deadline_sim: 3000, impact_eur: null }),
     ]);
     expect(screen.getByText(/deadline Day 0 00:50/)).toBeInTheDocument();
+  });
+});
+
+
+function incident(overrides: Partial<Incident> = {}): Incident {
+  return {
+    instance_id: "running_fox",
+    restaurant: "Bella's",
+    category: "order_backlog",
+    signal_type: "ORDER_BACKLOG",
+    summary: "24 tickets are backed up on the pass with nobody cooking.",
+    count: 1,
+    names: [],
+    created_at: 43200,
+    incident_id: 7,
+    status: "open",
+    acked_by: null,
+    ...overrides,
+  };
+}
+
+describe("incidents — acknowledge / resolve / history", () => {
+  async function openIncidentsTab(rows: Incident[]) {
+    overview.instances = [card()];
+    incidentData.incidents = rows;
+    posted.length = 0;
+    render(<AdminPage />);
+    await waitFor(() => expect(screen.getByText("Bella's")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Incidents"));
+  }
+
+  it("acknowledges an incident through the manager", async () => {
+    await openIncidentsTab([incident()]);
+    fireEvent.click(await screen.findByText("Acknowledge"));
+    await waitFor(() =>
+      expect(posted).toContain("/admin/api/incidents/7/ack"),
+    );
+  });
+
+  it("resolves an incident through the manager", async () => {
+    await openIncidentsTab([incident()]);
+    fireEvent.click(await screen.findByText("Resolve"));
+    await waitFor(() =>
+      expect(posted).toContain("/admin/api/incidents/7/resolve"),
+    );
+  });
+
+  it("marks an acknowledged incident and drops its Acknowledge button", async () => {
+    await openIncidentsTab([incident({ status: "acked", acked_by: "jay" })]);
+    expect(await screen.findByText("acked · jay")).toBeInTheDocument();
+    expect(screen.queryByText("Acknowledge")).not.toBeInTheDocument();
+    // Resolve stays available — acked is "seen", not "fixed".
+    expect(screen.getByText("Resolve")).toBeInTheDocument();
+  });
+
+  it("shows resolved incidents in the history view", async () => {
+    history.incidents = [{
+      incident_id: 3, instance_id: "running_fox", category: "stockout",
+      summary: "Running low on Basil.", opened_at: 100, status: "resolved",
+      acked_by: "jay", resolved_at: 1700000000,
+    }];
+    await openIncidentsTab([]);
+    fireEvent.click(screen.getByText("History"));
+    expect(await screen.findByText("Running low on Basil.")).toBeInTheDocument();
+    expect(screen.getByText("resolved")).toBeInTheDocument();
   });
 });

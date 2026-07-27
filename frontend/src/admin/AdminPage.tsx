@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -10,11 +10,13 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { apiDelete, apiPost } from "../api";
+import { apiDelete, apiGet, apiPost } from "../api";
 import { PRESET_EMOJI, RestaurantLogo } from "../shell/RestaurantLogo";
 import {
   type ActionItem,
   type AdminApproval,
+  type Incident,
+  type IncidentHistoryRow,
   type InstanceCard,
   fmtMoney,
   fmtSim,
@@ -50,6 +52,12 @@ const STATUS_BORDER: Record<string, string> = {
 // card colours the backlog at the same points derive_status changes status.
 const BACKLOG_WARN = 8;
 const BACKLOG_CRIT = 20;
+
+const INCIDENT_STATUS_STYLE: Record<string, string> = {
+  open: "bg-danger/15 text-danger",
+  acked: "bg-amber-500/15 text-amber-400",
+  resolved: "bg-success/15 text-success",
+};
 
 const SEVERITY_STYLE: Record<string, string> = {
   critical: "bg-danger text-white",
@@ -536,9 +544,123 @@ function ApprovalRow({
 
 type Tab = "queue" | "approvals" | "incidents" | "briefing";
 
+/** One live incident, with the two things a manager can do about it.
+ *  Acknowledge = "seen, being handled"; Resolve = close it by hand, which is
+ *  the only way out for a source signal that cannot be retracted. */
+function IncidentRow({
+  incident,
+  onChanged,
+}: {
+  incident: Incident;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const acked = incident.status === "acked";
+
+  async function act(decision: "ack" | "resolve") {
+    if (incident.incident_id == null) return;
+    setBusy(true);
+    try {
+      await apiPost(`/admin/api/incidents/${incident.incident_id}/${decision}`);
+      onChanged();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm ${
+        acked ? "border-muted/60 bg-surface/50" : "border-muted bg-surface"
+      }`}
+    >
+      <span className="w-28 shrink-0 rounded bg-muted px-2 py-0.5 text-center text-[11px] font-medium uppercase text-text/60">
+        {incident.category.replace(/_/g, " ")}
+      </span>
+      <RestaurantLogo id={incident.instance_id} title={incident.restaurant} size={22} />
+      <span className={`min-w-0 flex-1 ${acked ? "text-text/50" : "text-text"}`}>
+        {incident.summary}
+      </span>
+      {acked && (
+        <span className="shrink-0 rounded bg-muted px-1.5 text-[11px] font-medium text-text/60">
+          acked{incident.acked_by ? ` · ${incident.acked_by}` : ""}
+        </span>
+      )}
+      {incident.count > 1 && (
+        <span className="shrink-0 rounded-full bg-muted px-1.5 text-[11px] font-semibold text-text/60">
+          ×{incident.count}
+        </span>
+      )}
+      <span className="shrink-0 text-xs text-text/40">{fmtSim(incident.created_at)}</span>
+      {incident.incident_id != null && (
+        <div className="flex shrink-0 items-center gap-1">
+          {!acked && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => act("ack")}
+              className="rounded-md bg-muted px-2 py-1 text-xs font-medium text-text disabled:opacity-50"
+            >
+              Acknowledge
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => act("resolve")}
+            className="rounded-md bg-success px-2 py-1 text-xs font-medium text-white disabled:opacity-50"
+          >
+            Resolve
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Every incident ever opened, resolved ones included. Fetched on open rather
+ *  than polled — history does not change while you are reading it. */
+function IncidentHistory() {
+  const [rows, setRows] = useState<IncidentHistoryRow[] | null>(null);
+
+  useEffect(() => {
+    apiGet<{ incidents: IncidentHistoryRow[] }>("/admin/api/incidents/history")
+      .then((d) => setRows(d.incidents))
+      .catch(() => setRows([]));
+  }, []);
+
+  if (rows == null) return <p className="py-8 text-center text-sm text-text/40">Loading…</p>;
+  if (rows.length === 0) {
+    return <p className="py-8 text-center text-sm text-text/40">No incidents recorded yet.</p>;
+  }
+  return (
+    <div className="flex flex-col gap-1.5">
+      {rows.map((row) => (
+        <div
+          key={row.incident_id}
+          className="flex items-center gap-2 rounded-md border border-muted bg-surface px-3 py-1.5 text-sm"
+        >
+          <span className="w-28 shrink-0 rounded bg-muted px-2 py-0.5 text-center text-[11px] font-medium uppercase text-text/60">
+            {row.category.replace(/_/g, " ")}
+          </span>
+          <span className="w-28 shrink-0 truncate text-xs text-text/40">{row.instance_id}</span>
+          <span className="min-w-0 flex-1 text-text/70">{row.summary}</span>
+          <span
+            className={`shrink-0 rounded px-1.5 text-[11px] font-semibold ${INCIDENT_STATUS_STYLE[row.status] ?? INCIDENT_STATUS_STYLE.open}`}
+          >
+            {row.status}
+          </span>
+          <span className="shrink-0 text-xs text-text/40">{fmtSim(row.opened_at)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function AdminPage() {
   const data = useAdminData();
   const [tab, setTab] = useState<Tab>("queue");
+  const [showHistory, setShowHistory] = useState(false);
   const [restaurantFilter, setRestaurantFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
   const [kindFilter, setKindFilter] = useState("all");
@@ -710,37 +832,33 @@ export default function AdminPage() {
 
         {tab === "incidents" && (
           <>
-            {data.incidents.length === 0 ? (
+            <div className="mb-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowHistory((v) => !v)}
+                className={
+                  showHistory
+                    ? "flex items-center gap-1 rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-text"
+                    : "flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium text-text/60 hover:bg-muted"
+                }
+              >
+                <History size={13} /> {showHistory ? "Showing history" : "History"}
+              </button>
+            </div>
+            {showHistory ? (
+              <IncidentHistory />
+            ) : data.incidents.length === 0 ? (
               <p className="py-8 text-center text-sm text-text/40">
                 No open incidents.
               </p>
             ) : (
               <div className="flex flex-col gap-1.5">
                 {data.incidents.map((incident, i) => (
-                  <div
-                    key={i}
-                    className="flex items-center gap-2 rounded-md border border-muted bg-surface px-3 py-1.5 text-sm"
-                  >
-                    <span className="w-28 shrink-0 rounded bg-muted px-2 py-0.5 text-center text-[11px] font-medium uppercase text-text/60">
-                      {incident.category.replace(/_/g, " ")}
-                    </span>
-                    <RestaurantLogo
-                      id={incident.instance_id}
-                      title={incident.restaurant}
-                      size={22}
-                    />
-                    <span className="min-w-0 flex-1 text-text">
-                      {incident.summary}
-                    </span>
-                    {incident.count > 1 && (
-                      <span className="shrink-0 rounded-full bg-muted px-1.5 text-[11px] font-semibold text-text/60">
-                        ×{incident.count}
-                      </span>
-                    )}
-                    <span className="shrink-0 text-xs text-text/40">
-                      {fmtSim(incident.created_at)}
-                    </span>
-                  </div>
+                  <IncidentRow
+                    key={incident.incident_id ?? i}
+                    incident={incident}
+                    onChanged={data.refresh}
+                  />
                 ))}
               </div>
             )}

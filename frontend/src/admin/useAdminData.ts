@@ -80,6 +80,24 @@ export interface Incident {
   count: number;
   names: string[];
   created_at: number | null;
+  /** Manager-side row id — incidents persist across polls and restarts. */
+  incident_id: number | null;
+  status: IncidentStatus;
+  acked_by: string | null;
+}
+
+export type IncidentStatus = "open" | "acked" | "resolved";
+
+/** A row straight from the manager's incident store (includes resolved ones). */
+export interface IncidentHistoryRow {
+  incident_id: number;
+  instance_id: string;
+  category: string;
+  summary: string;
+  opened_at: number | null;
+  status: IncidentStatus;
+  acked_by: string | null;
+  resolved_at: number | null;
 }
 
 export interface Summary {

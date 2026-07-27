@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import sqlite3
 import subprocess
 import sys
 import time
@@ -305,6 +306,110 @@ def build_issues(
     return issues
 
 
+# Incident lifecycle: an incident is "live" while it still needs a human.
+OPEN_STATUSES = ("open", "acked")
+
+
+def incident_key(row: Dict[str, Any]) -> tuple:
+    """Stable identity for an incident across polls.
+
+    ``merge_incidents`` already dedupes by summary and phrases deterministically,
+    so the same ongoing problem produces the same summary every poll — which is
+    what makes ``(instance_id, category, summary)`` a usable key without storing
+    a fingerprint on the child side.
+    """
+    return (row.get("instance_id"), row.get("category"), row.get("summary"))
+
+
+def reconcile_incidents(
+    derived: List[Dict[str, Any]], stored: List[Dict[str, Any]]
+) -> Dict[str, List[Any]]:
+    """Pure: which incidents to open, and which stored rows to auto-resolve.
+
+    ``derived`` is this poll's incidents (from ``merge_incidents``); ``stored``
+    is every row currently in the manager DB. Returns
+    ``{"open": [derived rows], "resolve": [incident_ids]}``.
+
+    A resolved row is never revived — if the same problem comes back a *new* row
+    opens, so the history reads as two episodes rather than one flapping row.
+    """
+    live = {
+        incident_key(r): r for r in stored if r.get("status") in OPEN_STATUSES
+    }
+    derived_by_key = {incident_key(r): r for r in derived}
+    return {
+        "open": [r for k, r in derived_by_key.items() if k not in live],
+        "resolve": sorted(
+            r["incident_id"] for k, r in live.items() if k not in derived_by_key
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Incident store — stdlib sqlite3 (the manager has no ORM and should not gain
+# one). Everything lives under STATE_DIR so tests relocate the whole footprint.
+# ---------------------------------------------------------------------------
+
+_INCIDENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS incidents (
+    incident_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id      TEXT NOT NULL,
+    category         TEXT NOT NULL,
+    summary          TEXT NOT NULL,
+    opened_at        REAL,          -- child sim-time the source signal fired
+    status           TEXT NOT NULL DEFAULT 'open',   -- open | acked | resolved
+    acked_by         TEXT,
+    resolved_at      REAL,          -- wall-clock epoch (an operator action)
+    source_signal_id TEXT           -- NULL when the row batches several signals
+);
+CREATE INDEX IF NOT EXISTS incidents_status ON incidents (status);
+CREATE INDEX IF NOT EXISTS incidents_instance ON incidents (instance_id);
+"""
+
+
+def incidents_db() -> sqlite3.Connection:
+    """Open (and lazily create) the manager incident store.
+
+    One connection per request — at portfolio scale the cost is a rounding error
+    next to the child fan-out, and it keeps the manager free of connection-pool
+    state. ``STATE_DIR`` is read at call time so tests can monkeypatch it.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(STATE_DIR / "manager.db")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_INCIDENT_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def apply_reconcile(
+    conn: sqlite3.Connection, derived: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Persist one reconcile pass and return the live rows afterwards."""
+    stored = [dict(r) for r in conn.execute("SELECT * FROM incidents")]
+    plan = reconcile_incidents(derived, stored)
+
+    for row in plan["open"]:
+        conn.execute(
+            "INSERT INTO incidents (instance_id, category, summary, opened_at,"
+            " status, source_signal_id) VALUES (?, ?, ?, ?, 'open', ?)",
+            (row.get("instance_id"), row.get("category"), row.get("summary"),
+             row.get("created_at"), row.get("source_signal_id")),
+        )
+    if plan["resolve"]:
+        conn.execute(
+            "UPDATE incidents SET status = 'resolved', resolved_at = ?"
+            f" WHERE incident_id IN ({','.join('?' * len(plan['resolve']))})",
+            [time.time(), *plan["resolve"]],
+        )
+    conn.commit()
+    return [
+        dict(r) for r in conn.execute(
+            f"SELECT * FROM incidents WHERE status IN {OPEN_STATUSES}"
+        )
+    ]
+
+
 def rank_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Severity first, then earliest deadline (no deadline sorts last)."""
     return sorted(issues, key=lambda i: (
@@ -369,11 +474,19 @@ def merge_incidents(
     signals: List[Dict[str, Any]],
     plan_items: List[Dict[str, Any]],
     ingredient_names: Dict[int, str],
+    open_safety_task_ids: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Turn raw live signals + at-risk plan items into merged, human-readable
     incidents: similar items are batched (per supplier / per signal type) and
     phrased for a manager, never as raw status codes. Pure + deterministic
-    (tested in tests/test_manager.py)."""
+    (tested in tests/test_manager.py).
+
+    ``open_safety_task_ids`` is the set of temp/safety checks *still* failing
+    (from the child's snapshot). A FOOD_SAFETY_CHECK signal cannot be retracted —
+    the bus only expires by TTL — so without this a remediated check would sit on
+    the incident board for 24h after the kitchen fixed it. Pass ``None`` when the
+    snapshot is unavailable: an unreachable child must not silently close
+    incidents."""
 
     def ingredient_name(payload: Dict[str, Any]) -> str:
         return (
@@ -407,6 +520,7 @@ def merge_incidents(
                            else f"{cooks} cooks working"),
                 ),
                 "count": 1, "names": [], "created_at": s.get("created_at"),
+                "source_signal_id": s.get("signal_id"),
             })
         elif sig_type == "EQUIPMENT_FAILURE":
             rows.append({
@@ -417,8 +531,14 @@ def merge_incidents(
                     f"the menu until it is back."
                 ),
                 "count": 1, "names": [], "created_at": s.get("created_at"),
+                "source_signal_id": s.get("signal_id"),
             })
         elif sig_type == "FOOD_SAFETY_CHECK":
+            if (
+                open_safety_task_ids is not None
+                and payload.get("task_id") not in open_safety_task_ids
+            ):
+                continue  # the kitchen has since done it — stop showing it
             note = str(payload.get("note") or "").strip()
             rows.append({
                 "category": category, "signal_type": sig_type,
@@ -430,6 +550,7 @@ def merge_incidents(
                     overdue_min=payload.get("overdue_min") or 0,
                 ),
                 "count": 1, "names": [], "created_at": s.get("created_at"),
+                "source_signal_id": s.get("signal_id"),
             })
         elif sig_type == "STAFF_COVERAGE":
             # Routine coverage broadcast — only a lost station is an incident.
@@ -440,6 +561,7 @@ def merge_incidents(
                 "category": category, "signal_type": sig_type,
                 "summary": f"Station {station} has no qualified cover — its dishes are blocked.",
                 "count": 1, "names": [], "created_at": s.get("created_at"),
+                "source_signal_id": s.get("signal_id"),
             })
         else:  # STAFF_AVAILABILITY
             who = payload.get("staff_name") or payload.get("name") or "A staff member"
@@ -450,6 +572,7 @@ def merge_incidents(
                 "category": category, "signal_type": sig_type,
                 "summary": summary,
                 "count": 1, "names": [], "created_at": s.get("created_at"),
+                "source_signal_id": s.get("signal_id"),
             })
 
     for sig_type, members in grouped.items():
@@ -461,6 +584,8 @@ def merge_incidents(
             "count": len(members),
             "names": sorted({n for n in names if n}),
             "created_at": max((m.get("created_at") or 0) for m in members),
+            # Batched: no single source signal to point at.
+            "source_signal_id": None,
         })
 
     # --- supplier delays batched per (supplier, status) ---------------------
@@ -478,6 +603,7 @@ def merge_incidents(
             "count": len(members),
             "names": sorted(set(names)),
             "created_at": max((m.get("order_date") or 0) for m in members),
+            "source_signal_id": None,
         })
 
     # Dedupe identical summaries (e.g. repeated coverage signals), keep newest.
@@ -819,20 +945,47 @@ async def resolve_approval(instance_id: str, approval_id: int, decision: str) ->
 @app.get("/admin/api/incidents")
 async def incidents() -> Dict[str, Any]:
     async def fetch(inst: Dict[str, Any]) -> List[Dict[str, Any]]:
-        signals, plan, ingredients = await asyncio.gather(
+        signals, plan, ingredients, snapshot = await asyncio.gather(
             _get(inst, "/api/signals?status=live"),
             _get(inst, "/api/track-b/procurement/plan"),
             _get(inst, "/api/ingredients"),
+            # Live truth for which safety checks are *still* failing — a
+            # FOOD_SAFETY_CHECK signal cannot be retracted, only expired.
+            _get(inst, "/api/ops/snapshot"),
         )
         names = {int(i["id"]): i.get("name") for i in ingredients or [] if i.get("id")}
+        open_safety = (
+            {c.get("task_id") for c in snapshot.get("safety_issues") or []}
+            if isinstance(snapshot, dict) and "safety_issues" in snapshot
+            else None  # unreachable child → never silently close incidents
+        )
         merged = merge_incidents(
-            signals or [], (plan or {}).get("items") or [], names
+            signals or [], (plan or {}).get("items") or [], names, open_safety
         )
         return [{**r, "instance_id": inst["id"], "restaurant": inst["title"]}
                 for r in merged]
 
     nested = await asyncio.gather(*(fetch(i) for i in registry.instances.values()))
-    rows = [r for batch in nested for r in batch]
+    derived = [r for batch in nested for r in batch]
+
+    # Incidents are first-class rows now: this pass opens the new ones, resolves
+    # the ones whose source is gone, and carries ack state back onto the view.
+    conn = incidents_db()
+    try:
+        live = apply_reconcile(conn, derived)
+    finally:
+        conn.close()
+    stored_by_key = {incident_key(r): r for r in live}
+
+    rows: List[Dict[str, Any]] = []
+    for row in derived:
+        stored = stored_by_key.get(incident_key(row)) or {}
+        rows.append({
+            **row,
+            "incident_id": stored.get("incident_id"),
+            "status": stored.get("status", "open"),
+            "acked_by": stored.get("acked_by"),
+        })
     rows.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
     return {
         "incidents": rows,
@@ -840,6 +993,89 @@ async def incidents() -> Dict[str, Any]:
         # the UI contract is stable and a future gap can be declared again.
         "unavailable_categories": [],
     }
+
+
+class AckBody(BaseModel):
+    acked_by: Optional[str] = None
+
+
+@app.post("/admin/api/incidents/{incident_id}/ack")
+def ack_incident(incident_id: int, body: Optional[AckBody] = None) -> Dict[str, Any]:
+    """Acknowledge an incident — "seen, being handled", not "fixed"."""
+    return _set_incident_state(
+        incident_id, "acked",
+        acked_by=(body.acked_by if body else None) or "manager",
+    )
+
+
+@app.post("/admin/api/incidents/{incident_id}/resolve")
+def resolve_incident(incident_id: int) -> Dict[str, Any]:
+    """Close an incident by hand.
+
+    Needed because not every incident's source disappears on its own — a
+    FOOD_SAFETY_CHECK signal, for instance, only expires on its 24h TTL.
+    Reconcile will not re-open this row; a recurrence opens a fresh one.
+    """
+    return _set_incident_state(incident_id, "resolved", resolved_at=time.time())
+
+
+def _set_incident_state(
+    incident_id: int,
+    status: str,
+    *,
+    acked_by: Optional[str] = None,
+    resolved_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    conn = incidents_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, f"Incident {incident_id} not found")
+        conn.execute(
+            "UPDATE incidents SET status = ?,"
+            " acked_by = COALESCE(?, acked_by), resolved_at = COALESCE(?, resolved_at)"
+            " WHERE incident_id = ?",
+            (status, acked_by, resolved_at, incident_id),
+        )
+        conn.commit()
+        return dict(conn.execute(
+            "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
+        ).fetchone())
+    finally:
+        conn.close()
+
+
+@app.get("/admin/api/incidents/history")
+def incidents_history(
+    instance_id: Optional[str] = None,
+    since: Optional[float] = None,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """Every incident ever opened, newest first — including resolved ones.
+
+    ``since`` filters on ``opened_at`` (child sim-time, as recorded when the row
+    was opened), so it lines up with the sim clock the rest of the UI shows.
+    """
+    clauses, params = [], []
+    if instance_id:
+        clauses.append("instance_id = ?")
+        params.append(instance_id)
+    if since is not None:
+        clauses.append("opened_at >= ?")
+        params.append(float(since))
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = incidents_db()
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM incidents{where}"
+            " ORDER BY COALESCE(opened_at, 0) DESC, incident_id DESC LIMIT ?",
+            [*params, max(1, min(int(limit), 1000))],
+        ).fetchall()
+        return {"incidents": [dict(r) for r in rows]}
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
