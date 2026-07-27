@@ -72,6 +72,75 @@ def test_derive_status_kitchen_backlog():
                                  pending_approvals=[]) == "normal"
 
 
+def test_derive_status_failed_food_safety_check_is_critical():
+    """A missed temperature log is never "have a look later" (Phase 2)."""
+    healthy = {"low_stock_ingredients": [], "stations": [{"covered": True}],
+               "staff": [{"status": "present"}]}
+    failed = {**healthy, "safety_issues": [
+        {"title": "Record walk-in fridge & freezer temperatures",
+         "outcome": "not_done", "note": "walk-in reading 9C", "severity": "high"},
+    ]}
+    assert manager.derive_status(online=True, snapshot=failed, warnings=[],
+                                 pending_approvals=[]) == "critical"
+    # An empty list is not a failure, and a snapshot predating Phase 2 has no key.
+    assert manager.derive_status(online=True, snapshot={**healthy, "safety_issues": []},
+                                 warnings=[], pending_approvals=[]) == "normal"
+    assert manager.derive_status(online=True, snapshot=healthy, warnings=[],
+                                 pending_approvals=[]) == "normal"
+
+
+def test_build_issues_surfaces_failed_safety_checks():
+    snapshot = {"safety_issues": [
+        {"task_id": 4, "title": "Midday hot-holding temperature check",
+         "outcome": "not_done", "note": "unit reading 51C", "severity": "high",
+         "overdue_min": 0},
+        {"task_id": 9, "title": "Break down & sanitize the deli slicer",
+         "outcome": "overdue", "note": None, "severity": "high", "overdue_min": 20},
+    ]}
+    issues = manager.build_issues("running_fox", "Bella's", snapshot=snapshot,
+                                  warnings=[], pending_approvals=[])
+    safety = [i for i in issues if i["kind"] == "safety"]
+    assert len(safety) == 2
+    assert all(i["severity"] == "critical" for i in safety)
+    not_done = next(i for i in safety if "hot-holding" in i["problem"])
+    assert "unit reading 51C" in not_done["impact"]
+    overdue = next(i for i in safety if "slicer" in i["problem"])
+    assert "20 min past due" in overdue["impact"]
+    # Raw payload keys never leak into what the manager reads.
+    assert "not_done" not in not_done["problem"]
+
+
+def test_merge_incidents_phrases_food_safety_checks():
+    signals = [
+        {"type": "FOOD_SAFETY_CHECK", "created_at": 30.0, "payload": {
+            "task_id": 2, "title": "Record walk-in fridge & freezer temperatures",
+            "category": "temp", "outcome": "not_done", "severity": "high",
+            "note": "walk-in reading 9C"}},
+        {"type": "FOOD_SAFETY_CHECK", "created_at": 31.0, "payload": {
+            "task_id": 9, "title": "Break down & sanitize the deli slicer",
+            "category": "safety", "outcome": "overdue", "severity": "high",
+            "overdue_min": 20}},
+    ]
+    rows = manager.merge_incidents(signals, [], {})
+    checks = [r for r in rows if r["category"] == "food_safety_checks"]
+    assert len(checks) == 2, checks
+
+    not_done = next(r for r in checks if "fridge" in r["summary"])
+    assert not_done["summary"] == (
+        "Record walk-in fridge & freezer temperatures — the kitchen reported "
+        "this not done: walk-in reading 9C."
+    )
+    overdue = next(r for r in checks if "slicer" in r["summary"])
+    assert "20 min past due" in overdue["summary"]
+    # No raw status codes or payload keys reach the manager.
+    for row in checks:
+        assert "not_done" not in row["summary"] and "outcome" not in row["summary"]
+
+
+def test_food_safety_checks_is_no_longer_an_unavailable_category():
+    assert manager.SIGNAL_TO_INCIDENT["FOOD_SAFETY_CHECK"] == "food_safety_checks"
+
+
 def test_build_issues_and_ranking():
     snapshot = {
         "low_stock_ingredients": [{"ingredient": "milk", "status": "below_safety_stock", "on_hand_display": "200 ml"}],
@@ -209,6 +278,7 @@ def test_instance_overview_reports_tickets_from_the_snapshot(monkeypatch):
             "staff": [{"name": "Luca", "status": "present"}],
             "dishes": [], "stations": [], "low_stock_ingredients": [],
             "queued_count": 11, "cooking_count": 1, "avg_ticket_minutes": 7.5,
+            "safety_issues": [], "task_compliance": {"rate": 0.9, "accountable": 10},
         },
         "/api/pos/stats": {"revenue": 120.0, "orders": 9},
         "/api/approvals": [],
@@ -217,6 +287,29 @@ def test_instance_overview_reports_tickets_from_the_snapshot(monkeypatch):
     assert card["orders_waiting"] == 11
     assert card["ticket_time_min"] == 7.5
     assert card["status"] == "warning"  # 11 ≥ BACKLOG_WARN
+    # The snapshot carries the failures; the card carries a count.
+    assert card["safety_issues"] == 0
+    assert card["task_compliance"] == {"rate": 0.9, "accountable": 10}
+
+
+def test_instance_overview_counts_safety_failures(monkeypatch):
+    card = _overview(monkeypatch, {
+        "/api/health": {"sim": {"sim_time": 48000.0}},
+        "/api/ops/snapshot": {
+            "staff": [], "dishes": [], "stations": [], "low_stock_ingredients": [],
+            "queued_count": 0, "avg_ticket_minutes": None,
+            "safety_issues": [
+                {"task_id": 2, "title": "Afternoon fridge temperature log",
+                 "outcome": "not_done", "note": "door seal broken", "severity": "high"},
+            ],
+            "task_compliance": {"rate": 0.5, "accountable": 4},
+        },
+        "/api/pos/stats": {}, "/api/approvals": [],
+        "/api/track-b/procurement/warnings": [],
+    })
+    assert card["safety_issues"] == 1
+    assert card["status"] == "critical"
+    assert [i["kind"] for i in card["issues"]] == ["safety"]
 
 
 def test_offline_card_reports_no_ticket_numbers(monkeypatch):

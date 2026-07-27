@@ -66,6 +66,10 @@ class SignalType(str, Enum):
     DEMAND_FORECAST_HORIZON = "DEMAND_FORECAST_HORIZON"
     # Ingredient demand cannot be covered — no lead-feasible / in-stock supply.
     INGREDIENT_UNCOVERABLE = "INGREDIENT_UNCOVERABLE"
+    # A temp/safety kitchen check was reported not done, or ran past its final
+    # overdue escalation — the HACCP failure behind the food_safety_checks
+    # incident category (docs/fable/incidents.md).
+    FOOD_SAFETY_CHECK = "FOOD_SAFETY_CHECK"
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +265,15 @@ SIGNAL_REGISTRY: Dict[SignalType, Dict[str, Any]] = {
         "groups": ["procurement", "inventory", "human", "frontend"],
         "priority": 5,
         "default_ttl_sim_s": 86400.0,          # 24h — refreshed each plan rebuild
+    },
+    SignalType.FOOD_SAFETY_CHECK: {
+        # "inventory" is the group that actually has subscribers (ledger /
+        # optimizer both ignore unknown types safely), so the emit is routed
+        # rather than dead-lettered; "frontend" pushes it live to the cook desk
+        # and "human"/"kitchen" carry the intent.
+        "groups": ["kitchen", "inventory", "human", "frontend"],
+        "priority": 5,
+        "default_ttl_sim_s": 86400.0,          # 24h — a failed check stands all day
     },
 }
 
@@ -632,6 +645,23 @@ class IngredientUncoverablePayload(BaseModel):
     reason: str                 # human-readable explanation from the planner
 
 
+class FoodSafetyCheckPayload(BaseModel):
+    """Payload for FOOD_SAFETY_CHECK — a ``temp``/``safety`` kitchen task the
+    cook reported not done, or one left pending past its final overdue tier.
+
+    There is no distinct "failed" task status: ``not_done`` plus ``severity``
+    *is* the failure (``core/kitchen_tasks.py``), which is why ``outcome``
+    carries the distinction rather than a status string.
+    """
+    task_id: int
+    title: str
+    category: str               # "temp" | "safety"
+    outcome: str                # "not_done" | "overdue"
+    severity: str               # low | medium | high
+    note: Optional[str] = None
+    overdue_min: Optional[int] = None
+
+
 # Convenience map: SignalType -> its payload model.
 SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.DEMAND_FORECAST: DemandForecastPayload,
@@ -671,4 +701,5 @@ SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.BATCH_PROGRESS: BatchProgressPayload,
     SignalType.DEMAND_FORECAST_HORIZON: DemandForecastHorizonPayload,
     SignalType.INGREDIENT_UNCOVERABLE: IngredientUncoverablePayload,
+    SignalType.FOOD_SAFETY_CHECK: FoodSafetyCheckPayload,
 }

@@ -241,7 +241,8 @@ def _kitchen_engine_tick() -> None:
     now = float(ctx.clock.sim_time)
     session = db.new_session()
     try:
-        kitchen_tasks.reconcile(session, now=now, cuisine=_active_cuisine(), approvals=ctx.approvals)
+        kitchen_tasks.reconcile(session, now=now, cuisine=_active_cuisine(),
+                                approvals=ctx.approvals, bus=ctx.bus)
         staff_shifts.reconcile(session, now=now, approvals=ctx.approvals)
     except Exception:  # noqa: BLE001 - a reconcile hiccup must not stall the sim
         logger.exception("kitchen_engine tick failed")
@@ -2166,27 +2167,15 @@ def kitchen_waste(body: KitchenWasteBody) -> Dict[str, Any]:
 def _active_cuisine() -> Optional[str]:
     """Resolve the current restaurant cuisine from the active seed.
 
-    Prefers the preset bundle's ``meta.cuisine``; falls back to treating the
-    seed id itself as a cuisine (generated restaurants set it to the cuisine).
+    Thin session wrapper — the resolution itself lives in ``kitchen_tasks`` so
+    callers that already hold a session (``core/ops_snapshot``) can share it.
     """
+    from . import kitchen_tasks
     session = db.new_session()
     try:
-        state = get_or_create_sim_state(session)
-        seed = state.active_seed_id if state is not None else None
+        return kitchen_tasks.active_cuisine(session)
     finally:
         session.close()
-    if not seed:
-        return None
-    try:
-        from .seeding import DATA_DIR
-        path = DATA_DIR / f"{seed}.json"
-        if path.exists():
-            import json as _json
-            meta = _json.loads(path.read_text()).get("meta", {})
-            return meta.get("cuisine") or seed
-    except Exception:  # noqa: BLE001
-        pass
-    return str(seed)
 
 
 class TaskOutcomeBody(BaseModel):
@@ -2210,7 +2199,8 @@ def kitchen_tasks_board(db_session: Any = Depends(db.get_db)) -> Dict[str, Any]:
     from . import kitchen_tasks
     now = float(ctx.clock.sim_time)
     cuisine = _active_cuisine()
-    kitchen_tasks.reconcile(db_session, now=now, cuisine=cuisine, approvals=ctx.approvals)
+    kitchen_tasks.reconcile(db_session, now=now, cuisine=cuisine,
+                            approvals=ctx.approvals, bus=ctx.bus)
     return kitchen_tasks.task_board(db_session, now=now, cuisine=cuisine)
 
 
@@ -2223,7 +2213,7 @@ def kitchen_task_outcome(task_id: int, body: TaskOutcomeBody) -> Dict[str, Any]:
     try:
         t = kitchen_tasks.set_outcome(
             session, task_id, status=body.status, note=body.note, by=body.by,
-            now=now, approvals=ctx.approvals,
+            now=now, approvals=ctx.approvals, bus=ctx.bus,
         )
         if t is None:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
@@ -2260,7 +2250,7 @@ def kitchen_task_report(task_id: int, body: TaskReportBody) -> Dict[str, Any]:
         kitchen_tasks.set_outcome(
             session, task_id,
             status=verdict["outcome"], note=verdict["note"], severity=verdict["severity"],
-            by="cook", now=now, approvals=ctx.approvals,
+            by="cook", now=now, approvals=ctx.approvals, bus=ctx.bus,
         )
     finally:
         session.close()

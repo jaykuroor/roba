@@ -109,14 +109,26 @@ function SalesVsForecast({ card }: { card: InstanceCard }) {
   );
 }
 
-/** Kitchen tickets still waiting, with the last sim-hour's average ticket time. */
+/** Kitchen tickets waiting + average ticket time, and any failed food-safety
+ *  check — the two things that make a kitchen unsafe to leave alone. */
 function TicketBacklog({ card }: { card: InstanceCard }) {
-  if (card.orders_waiting == null) return <span className="text-text/40">—</span>;
+  const safety = card.safety_issues ?? 0;
+  if (card.orders_waiting == null && safety === 0) {
+    return <span className="text-text/40">—</span>;
+  }
   return (
-    <span className="flex items-baseline gap-1.5">
-      {card.orders_waiting}
+    <span className="flex flex-wrap items-baseline gap-1.5">
+      {card.orders_waiting ?? "—"}
       {card.ticket_time_min != null && (
         <span className="text-xs text-text/40">{card.ticket_time_min}m avg</span>
+      )}
+      {safety > 0 && (
+        <span
+          className="rounded bg-danger/15 px-1 text-[11px] font-semibold text-danger"
+          title="Failed temperature / food-safety checks"
+        >
+          {safety} safety
+        </span>
       )}
     </span>
   );
@@ -170,9 +182,19 @@ function RestaurantCard({
 
   const backlog = card.orders_waiting ?? 0;
   const ticketAccent =
-    backlog >= BACKLOG_CRIT ? "text-danger" : backlog >= BACKLOG_WARN ? "text-amber-400" : undefined;
+    (card.safety_issues ?? 0) > 0 || backlog >= BACKLOG_CRIT
+      ? "text-danger"
+      : backlog >= BACKLOG_WARN
+        ? "text-amber-400"
+        : undefined;
+  // Only worth the manager's attention when checks are actually being missed.
+  const compliance = card.task_compliance?.rate;
 
   const issueBadges = [
+    compliance != null && compliance < 1 && {
+      label: `tasks ${Math.round(compliance * 100)}% on time`,
+      cls: compliance < 0.75 ? "bg-danger/15 text-danger" : "bg-amber-500/15 text-amber-400",
+    },
     card.pending_approvals > 0 && {
       label: `${card.pending_approvals} approval${card.pending_approvals > 1 ? "s" : ""}`,
       cls: "bg-amber-500/15 text-amber-400",
@@ -712,11 +734,13 @@ export default function AdminPage() {
                 ))}
               </div>
             )}
-            <p className="mt-3 text-xs text-text/30">
-              Not yet detected:{" "}
-              {data.unavailableCategories.join(", ").replace(/_/g, " ")} (see
-              docs/fable/incidents.md)
-            </p>
+            {data.unavailableCategories.length > 0 && (
+              <p className="mt-3 text-xs text-text/30">
+                Not yet detected:{" "}
+                {data.unavailableCategories.join(", ").replace(/_/g, " ")} (see
+                docs/fable/incidents.md)
+              </p>
+            )}
           </>
         )}
 

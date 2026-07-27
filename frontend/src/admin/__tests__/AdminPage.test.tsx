@@ -46,7 +46,8 @@ function card(overrides: Partial<InstanceCard> = {}): InstanceCard {
     pending_approvals: 0,
     orders_waiting: 0,
     ticket_time_min: null,
-    safety_issues: null,
+    safety_issues: 0,
+    task_compliance: null,
     issues: [],
     ...overrides,
   };
@@ -77,5 +78,41 @@ describe("restaurant card — Tickets metric", () => {
     const metric = await renderTicketMetric({ orders_waiting: 4, ticket_time_min: null });
     expect(within(metric).getByText("4")).toBeInTheDocument();
     expect(within(metric).queryByText(/m avg/)).not.toBeInTheDocument();
+  });
+
+  it("shows failed food-safety checks alongside the backlog", async () => {
+    const metric = await renderTicketMetric({ orders_waiting: 2, safety_issues: 3 });
+    expect(within(metric).getByText("2")).toBeInTheDocument();
+    expect(within(metric).getByText("3 safety")).toBeInTheDocument();
+  });
+
+  it("stays silent when no safety check has failed", async () => {
+    const metric = await renderTicketMetric({ orders_waiting: 2, safety_issues: 0 });
+    expect(within(metric).queryByText(/safety/)).not.toBeInTheDocument();
+  });
+});
+
+describe("restaurant card — task compliance", () => {
+  async function renderCard(overrides: Partial<InstanceCard>) {
+    overview.instances = [card(overrides)];
+    render(<AdminPage />);
+    await waitFor(() => expect(screen.getByText("Bella's")).toBeInTheDocument());
+  }
+
+  const counts = { done: 8, done_late: 2, pending: 0, overdue: 0, not_done: 0, accountable: 10 };
+
+  it("badges the on-time rate when checks are being missed", async () => {
+    await renderCard({ task_compliance: { ...counts, rate: 0.8 } });
+    expect(screen.getByText("tasks 80% on time")).toBeInTheDocument();
+  });
+
+  it("says nothing at full compliance", async () => {
+    await renderCard({ task_compliance: { ...counts, rate: 1 } });
+    expect(screen.queryByText(/on time/)).not.toBeInTheDocument();
+  });
+
+  it("says nothing before anything is due", async () => {
+    await renderCard({ task_compliance: { ...counts, accountable: 0, rate: null } });
+    expect(screen.queryByText(/on time/)).not.toBeInTheDocument();
   });
 });

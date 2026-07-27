@@ -117,6 +117,8 @@ def derive_status(
     backlog = snapshot.get("queued_count") or 0
     if warnings:  # INGREDIENT_UNCOVERABLE — nothing can source the demand
         return "critical"
+    if snapshot.get("safety_issues"):  # a failed temp/safety check is never "a look later"
+        return "critical"
     if backlog >= BACKLOG_CRIT:  # the pass is drowning — guests are waiting
         return "critical"
     if any(s.get("status") == "depleted" for s in low_stock):
@@ -216,6 +218,23 @@ def build_issues(
                 "approval_id": None,
             })
 
+    for check in snapshot.get("safety_issues") or []:
+        note = (check.get("note") or "").strip()
+        issues.append({
+            "instance_id": instance_id,
+            "restaurant": title,
+            "kind": "safety",
+            "problem": f"Food-safety check failed: {check.get('title', 'unknown check')}",
+            "severity": "critical",
+            "deadline_sim": None,
+            "impact": (
+                f"Kitchen reported: {note}" if note
+                else f"{check.get('overdue_min', 0)} min past due and still not done."
+            ),
+            "recommended_action": "Get the check done and logged now — HACCP records cannot be back-filled.",
+            "approval_id": None,
+        })
+
     for member in snapshot.get("staff") or []:
         if member.get("status") != "present" and member.get("sole_cover_dishes_at_risk"):
             issues.append({
@@ -250,6 +269,7 @@ SIGNAL_TO_INCIDENT = {
     "LOW_STOCK": "stockout",
     "INGREDIENT_UNCOVERABLE": "stockout",
     "EXPIRY_RISK": "food_safety",
+    "FOOD_SAFETY_CHECK": "food_safety_checks",
 }
 
 # One manager-readable sentence per merged group; {names} is the ingredient
@@ -263,6 +283,14 @@ _GROUP_PHRASES = {
 _DELAY_PHRASES = {
     "at_risk": "may arrive late — a one-day delivery slip would leave the kitchen short",
     "uncoverable": "cannot be delivered in time by any supplier — dishes will run short",
+}
+# Food-safety checks stay one row per check rather than batching into a
+# {names} list: the *reason* a fridge log was skipped is the whole point, and
+# merging two different HACCP failures into one sentence would lose it.
+_SAFETY_PHRASES = {
+    "not_done": "{title} — the kitchen reported this not done{reason}.",
+    "overdue": "{title} — still not done {overdue_min} min past due; a food-safety "
+               "check cannot be back-filled later.",
 }
 
 
@@ -305,6 +333,19 @@ def merge_incidents(
         payload = s.get("payload") or {}
         if sig_type in _GROUP_PHRASES:
             grouped.setdefault(sig_type, []).append(s)
+        elif sig_type == "FOOD_SAFETY_CHECK":
+            note = str(payload.get("note") or "").strip()
+            rows.append({
+                "category": category, "signal_type": sig_type,
+                "summary": _SAFETY_PHRASES[
+                    "overdue" if payload.get("outcome") == "overdue" else "not_done"
+                ].format(
+                    title=payload.get("title") or "A food-safety check",
+                    reason=f": {note}" if note else "",
+                    overdue_min=payload.get("overdue_min") or 0,
+                ),
+                "count": 1, "names": [], "created_at": s.get("created_at"),
+            })
         elif sig_type == "STAFF_COVERAGE":
             # Routine coverage broadcast — only a lost station is an incident.
             if payload.get("covered", False) and not payload.get("shortfall"):
@@ -592,9 +633,9 @@ async def _instance_overview(inst: Dict[str, Any]) -> Dict[str, Any]:
             "staff_present": None, "staff_total": None, "absent": [],
             "stock_risks": [], "pending_approvals": 0,
             # No snapshot to read them from — an offline card must not report
-            # the last numbers it saw. safety_issues lands in Phase 2
-            # (docs/fable/progress.md).
+            # the last numbers it saw.
             "orders_waiting": None, "ticket_time_min": None, "safety_issues": None,
+            "task_compliance": None,
         }
     sim_time = float((health.get("sim") or {}).get("sim_time") or 0.0)
     day_start = (sim_time // SECONDS_PER_DAY) * SECONDS_PER_DAY
@@ -635,8 +676,9 @@ async def _instance_overview(inst: Dict[str, Any]) -> Dict[str, Any]:
         "pending_approvals": len(approvals),
         "orders_waiting": snapshot.get("queued_count"),
         "ticket_time_min": snapshot.get("avg_ticket_minutes"),
-        # Phase 2 — see docs/fable/progress.md.
-        "safety_issues": None,
+        # The snapshot carries the failures themselves; the card carries a count.
+        "safety_issues": len(snapshot.get("safety_issues") or []),
+        "task_compliance": snapshot.get("task_compliance"),
     }
 
 
@@ -705,7 +747,7 @@ async def incidents() -> Dict[str, Any]:
     return {
         "incidents": rows,
         # Explicitly unavailable so the UI can label them honestly.
-        "unavailable_categories": ["equipment_failure", "order_backlog", "food_safety_checks"],
+        "unavailable_categories": ["equipment_failure", "order_backlog"],
     }
 
 

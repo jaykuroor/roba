@@ -26,14 +26,25 @@ export interface InstanceCard {
   /** Kitchen tickets still queued, and the last sim-hour's average ticket time. */
   orders_waiting: number | null;
   ticket_time_min: number | null;
-  safety_issues: null; // not implemented — docs/fable/progress.md Phase 2
+  /** Failed temperature/safety checks open right now. */
+  safety_issues: number | null;
+  /** Checklist counts for today; `rate` is on-time completion of due tasks. */
+  task_compliance: {
+    done: number;
+    done_late: number;
+    pending: number;
+    overdue: number;
+    not_done: number;
+    accountable: number;
+    rate: number | null;
+  } | null;
   issues: ActionItem[];
 }
 
 export interface ActionItem {
   instance_id: string;
   restaurant: string;
-  kind: "approval" | "stock" | "staff";
+  kind: "approval" | "stock" | "staff" | "safety";
   /** For kind==="approval": "decision" (approve/reject) or "notice" (acknowledge). */
   approval_kind?: "decision" | "notice";
   problem: string;

@@ -876,6 +876,7 @@ class VoiceActions:
                 kitchen_tasks.set_outcome(
                     s, task_id, status=status, note=notes, by="voice",
                     now=float(self.bus.sim_time), approvals=getattr(self.vp, "approvals", None),
+                    bus=self.bus,
                 )
             finally:
                 s.close()

@@ -204,6 +204,69 @@ def tier_urgency(tier: int, category: Optional[str]) -> str:
     return _TIER_URGENCY[max(0, min(idx, len(_TIER_URGENCY) - 1))]
 
 
+# HACCP-relevant categories: a failure here is a food-safety incident, not just
+# an overdue chore (docs/fable/incidents.md `food_safety_checks`).
+FOOD_SAFETY_CATEGORIES = ("temp", "safety")
+
+
+def active_cuisine(session: Any) -> Optional[str]:
+    """Cuisine of the active seed — the preset's ``meta.cuisine``, else the seed
+    id itself (generated restaurants set it to the cuisine).
+
+    Lives here rather than in ``core/api.py`` so read-only callers that already
+    hold a session (``core/ops_snapshot``) can materialize the right task set.
+    """
+    from .clock import get_or_create_sim_state
+    state = get_or_create_sim_state(session)
+    seed = state.active_seed_id if state is not None else None
+    if not seed:
+        return None
+    try:
+        import json as _json
+        from .seeding import DATA_DIR
+        path = DATA_DIR / f"{seed}.json"
+        if path.exists():
+            meta = _json.loads(path.read_text()).get("meta", {})
+            return meta.get("cuisine") or seed
+    except Exception:  # noqa: BLE001 — cuisine is a nicety, never break the board
+        pass
+    return str(seed)
+
+
+def _emit_food_safety(
+    bus: Any,
+    t: models.KitchenTask,
+    *,
+    outcome: str,
+    severity: str,
+    overdue_min: Optional[int] = None,
+) -> None:
+    """Emit FOOD_SAFETY_CHECK for a failed temp/safety task.
+
+    ``bus`` may be None (headless/tests). Non-HACCP categories never emit — a
+    missed floor mop is not a food-safety incident. The dedup key is per task,
+    so re-reporting the same check refreshes one live signal instead of piling
+    up duplicate incidents on the manager's board.
+    """
+    if bus is None or t.category not in FOOD_SAFETY_CATEGORIES:
+        return
+    from .signals import SignalType
+    bus.emit(
+        SignalType.FOOD_SAFETY_CHECK,
+        {
+            "task_id": int(t.id),
+            "title": t.title or "Food-safety check",
+            "category": t.category,
+            "outcome": outcome,
+            "severity": severity,
+            "note": (t.note or "").strip() or None,
+            "overdue_min": overdue_min,
+        },
+        source="kitchen_tasks",
+        dedup_key=f"food_safety:{int(t.id)}",
+    )
+
+
 def _find_pending_notice(session: Any, task_id: int) -> Optional[models.ApprovalRequest]:
     return (
         session.query(models.ApprovalRequest)
@@ -276,6 +339,7 @@ def set_outcome(
     by: str = "cook",
     now: float,
     approvals: Any = None,
+    bus: Any = None,
 ) -> Optional[models.KitchenTask]:
     """Set a task's outcome: ``done`` | ``not_done`` | ``pending``.
 
@@ -317,6 +381,10 @@ def set_outcome(
         t.notified_manager = len(_tiers_min())  # stops reconcile re-escalating it
         if not was_not_done:
             _notify_not_done(approvals, session, t)  # first transition → raise once
+            _emit_food_safety(
+                bus, t, outcome="not_done",
+                severity=t.severity or ("high" if t.category in FOOD_SAFETY_CATEGORIES else "medium"),
+            )
     else:  # pending (revert)
         t.status = "pending"
         t.note = None
@@ -328,7 +396,9 @@ def set_outcome(
     return t
 
 
-def reconcile(session: Any, *, now: float, cuisine: Optional[str], approvals: Any) -> list[int]:
+def reconcile(
+    session: Any, *, now: float, cuisine: Optional[str], approvals: Any, bus: Any = None
+) -> list[int]:
     """Escalate every pending task past due through the notice tiers.
 
     Each task owns ONE notice that is created at the first tier (5 min past
@@ -369,6 +439,14 @@ def reconcile(session: Any, *, now: float, cuisine: Optional[str], approvals: An
             urgency=tier_urgency(tier, t.category),
             extra_payload={"outcome": "overdue", "overdue_min": int(overdue_min), "tier": tier},
         )
+        # Past the final tier a temp/safety check has stopped being "late" and
+        # started being a food-safety failure — nobody is going to do it now.
+        if tier >= len(tiers):
+            _emit_food_safety(
+                bus, t, outcome="overdue",
+                severity=t.severity or "high",
+                overdue_min=int(overdue_min),
+            )
     session.commit()
     return escalated
 

@@ -22,6 +22,56 @@ logger = logging.getLogger(__name__)
 _TODAY_SECONDS = 86400.0
 
 
+def _kitchen_task_health(session: Any, now: float) -> tuple:
+    """``(safety_issues, task_compliance)`` from today's kitchen checklist.
+
+    Reuses ``kitchen_tasks.task_board`` rather than recounting, so the manager
+    card and the cook desk can never disagree about the same day.
+
+    A *safety issue* is a `temp`/`safety` task the kitchen reported ``not_done``,
+    or one still pending past its final overdue tier — the same two conditions
+    that emit ``FOOD_SAFETY_CHECK``, so the count and the incident agree.
+    Compliance is measured only over tasks whose due time has passed; tasks not
+    yet due are neither kept nor missed.
+    """
+    from . import kitchen_tasks  # noqa: PLC0415
+
+    board = kitchen_tasks.task_board(
+        session, now=now, cuisine=kitchen_tasks.active_cuisine(session)
+    )
+    final_tier = len(kitchen_tasks._tiers_min())
+
+    safety_issues: List[Dict[str, Any]] = []
+    for task in board["tasks"]:
+        if task["category"] not in kitchen_tasks.FOOD_SAFETY_CATEGORIES:
+            continue
+        abandoned = (
+            task["overdue"]
+            and kitchen_tasks.overdue_tier(task["overdue_min"]) >= final_tier
+        )
+        if task["status"] == "not_done" or abandoned:
+            safety_issues.append({
+                "task_id": task["id"],
+                "title": task["title"],
+                "category": task["category"],
+                "outcome": "not_done" if task["status"] == "not_done" else "overdue",
+                "severity": task["severity"] or "high",
+                "note": task["note"],
+                "overdue_min": task["overdue_min"],
+            })
+
+    counts = board["counts"]
+    accountable = counts["done"] + counts["not_done"] + counts["overdue"]
+    on_time = counts["done"] - counts["done_late"]
+    task_compliance = {
+        **counts,
+        "accountable": accountable,
+        # None until something is actually due — 0% at 08:00 would be a lie.
+        "rate": round(on_time / accountable, 2) if accountable else None,
+    }
+    return safety_issues, task_compliance
+
+
 def build_ops_snapshot(
     db_session_factory: Callable[[], Any],
     forecaster: Optional[Any],
@@ -246,6 +296,11 @@ def build_ops_snapshot(
             else None
         )
 
+        # ------------------------------------------------------------------
+        # 8. Food-safety checks + task compliance (docs/fable/incidents.md)
+        # ------------------------------------------------------------------
+        safety_issues, task_compliance = _kitchen_task_health(session, now)
+
     finally:
         session.close()
 
@@ -258,12 +313,18 @@ def build_ops_snapshot(
         "queued_count": int(ticket_counts.get("queued", 0)),
         "cooking_count": int(ticket_counts.get("cooking", 0)),
         "avg_ticket_minutes": avg_ticket_minutes,
+        # A list here (like low_stock_ingredients); the manager card carries the
+        # count under the same name (like stock_risks → pending_approvals).
+        "safety_issues": safety_issues,
+        "task_compliance": task_compliance,
         "note": (
             "forecast_qty is the most recent per-item demand forecast. "
             "revenue_estimate = forecast_qty × price. "
             "sole_cover_dishes_at_risk lists dishes that would lose their only "
             "qualified cook if that staffer is absent. "
             "queued_count is the kitchen ticket backlog and avg_ticket_minutes "
-            "the average order-to-served time over the last sim-hour."
+            "the average order-to-served time over the last sim-hour. "
+            "safety_issues lists failed temperature/safety checks and "
+            "task_compliance.rate is the share of due checklist tasks done on time."
         ),
     }
