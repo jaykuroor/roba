@@ -47,10 +47,10 @@ Last full audit of the codebase against the docs: **2026-07-27**.
 |---|---|---|---|
 | [manager-dashboard.md](manager-dashboard.md) | ✅ implemented | — | — |
 | [approvals.md](approvals.md) | ✅ implemented | — | — |
-| [kitchen-task-notices.md](kitchen-task-notices.md) | 🟡 partial | task compliance in the manager overview; failed temp/safety → signal | 2 |
-| [portfolio-overview.md](portfolio-overview.md) | 🟡 partial | `safety_issues` — still hardcoded `None` (`manager.py:639`); `orders_waiting` / `ticket_time_min` landed in Phase 1 | 2 |
+| [kitchen-task-notices.md](kitchen-task-notices.md) | ✅ implemented | — | — |
+| [portfolio-overview.md](portfolio-overview.md) | ✅ implemented | — | — |
 | [priority-action-queue.md](priority-action-queue.md) | 🟡 partial | € impact in `build_issues`; deadlines for non-approval issues | 3 |
-| [incidents.md](incidents.md) | 🟠 partial | 3 missing detectors; incidents not first-class objects | 2, 3, 4 |
+| [incidents.md](incidents.md) | 🟠 partial | 2 missing detectors (`equipment_failure`, `order_backlog`); incidents not first-class objects | 3, 4 |
 | [catchup.md](catchup.md) | 🟠 infra only | LLM summary, expand-for-detail, history drawer, merge, auto-capture | 5, 6 |
 | [daily-summary.md](daily-summary.md) | 🟡 partial | LLM prose briefing, tomorrow-specific risk, end-of-day archive | 6 |
 
@@ -58,8 +58,10 @@ Last full audit of the codebase against the docs: **2026-07-27**.
 HTTP+WS proxy, `/admin/api/overview` with the ranked `actions` queue, `/admin/api/approvals`
 with pass-through resolve, `/admin/api/incidents` (derived, 4 of 7 categories),
 `/admin/api/summary` (numeric briefing), catch-up **capture** infrastructure, kitchen-task
-escalating notices, the `/admin` UI with its 4 tabs, and (Phase 1) the kitchen ticket
-lifecycle with its `Tickets` card metric and Controls mode toggle.
+escalating notices, the `/admin` UI with its 4 tabs, (Phase 1) the kitchen ticket
+lifecycle with its `Tickets` card metric and Controls mode toggle, and (Phase 2) the
+`FOOD_SAFETY_CHECK` detector feeding `safety_issues` / `task_compliance` and the
+`food_safety_checks` incident category.
 
 ---
 
@@ -167,25 +169,53 @@ and flipping the Controls toggle to `instant` returns it to zero.
 Closes [kitchen-task-notices.md](kitchen-task-notices.md) §Future work and the
 `food_safety_checks` incident category.
 
-- [ ] New `SignalType.FOOD_SAFETY_CHECK` — **all four registration points** (§4), with
+- [x] New `SignalType.FOOD_SAFETY_CHECK` — **all four registration points** (§4), with
       `groups` an existing agent already subscribes to, or every emit dead-letters.
-- [ ] `core/kitchen_tasks.py`: emit it when a `temp`/`safety` task is reported `not_done`
+      — 4eb82fb. Groups are `["kitchen", "inventory", "human", "frontend"]`; `inventory`
+      is the one that actually has subscribers (see §4).
+- [x] `core/kitchen_tasks.py`: emit it when a `temp`/`safety` task is reported `not_done`
       (`set_outcome`, `:310-319`) or escalates past the final overdue tier (`reconcile`,
       `:331`). Note there is **no distinct "failed" status** — `not_done` + `severity` *is*
       the failure signal (`status ∈ pending|done|not_done|skipped`, and `skipped` is
-      unreachable).
-- [ ] `core/ops_snapshot.py`: add `safety_issues` (open temp/safety failures) and
+      unreachable). — 4eb82fb. `_emit_food_safety` + `FOOD_SAFETY_CATEGORIES`; the signal
+      carries `outcome` (`not_done` | `overdue`) since the status cannot express it.
+      `set_outcome` / `reconcile` gained `bus=None` alongside `approvals=None` (same
+      injection pattern), wired at all four call sites (`core/api.py` ×3,
+      `core/voice_actions.py` ×1).
+- [x] `core/ops_snapshot.py`: add `safety_issues` (open temp/safety failures) and
       `task_compliance` — reuse `kitchen_tasks.task_board()["counts"]` (`:144-178`) rather
-      than recounting.
-- [ ] `manager.py`: `safety_issues` on the card (both branches); `derive_status` →
+      than recounting. — 4eb82fb (`_kitchen_task_health`). `safety_issues` is a **list**
+      (like `low_stock_ingredients`) so `build_issues` gets the reason; the card carries the
+      count under the same name. Required moving cuisine resolution into
+      `kitchen_tasks.active_cuisine(session)` — see §4.
+- [x] `manager.py`: `safety_issues` on the card (both branches); `derive_status` →
       `critical` on a failed food-safety check; `SIGNAL_TO_INCIDENT` (`:236`) entry; a
       phrase in `_GROUP_PHRASES` (`:247`); drop `food_safety_checks` from
       `unavailable_categories` (`:673`); a `safety` issue kind in `build_issues` (`:130`).
-- [ ] UI: safety count in the Phase 1 metric slot; compliance rate on the card or briefing.
-- [ ] Tests: emission on a not-done temp task; `merge_incidents` phrasing; `derive_status`.
+      — 4eb82fb. **Phrases went in a new `_SAFETY_PHRASES` dict, not `_GROUP_PHRASES`** —
+      see §4 for why batching would have been wrong here.
+- [x] UI: safety count in the Phase 1 metric slot; compliance rate on the card or briefing.
+      — 4eb82fb (a red `N safety` chip inside the Tickets metric, which also forces the
+      metric's accent to danger; compliance renders as a card badge only below 100%).
+- [x] Tests: emission on a not-done temp task; `merge_incidents` phrasing; `derive_status`.
+      — 4eb82fb. `tests/test_food_safety_signal.py` (8) + `tests/test_manager.py` (+6) +
+      `AdminPage.test.tsx` (+5). Includes a **whole-enum** guard that every `SignalType` is
+      in both `SIGNAL_REGISTRY` and `SIGNAL_PAYLOADS`, so §4's four-place gotcha now fails a
+      test instead of a production emit.
 
 **Done when** reporting a temperature check not-done turns that restaurant's card critical
 and the incident appears under Incidents with human phrasing (not a raw status string).
+
+> Verified end to end on the Bella's preset (4eb82fb): reporting the 08:30 walk-in temp
+> log not done emits one `FOOD_SAFETY_CHECK`, `safety_issues` becomes 1, `derive_status`
+> returns `critical`, the queue shows *"CRITICAL | Food-safety check failed: Record walk-in
+> fridge & freezer temperatures | Kitchen reported: walk-in reading 9C, engineer called"*,
+> and Incidents shows *"Record walk-in fridge & freezer temperatures — the kitchen reported
+> this not done: walk-in reading 9C, engineer called."*
+>
+> Also fixed here (added 2026-07-27, out of phase scope but one line): the Incidents tab
+> rendered *"Not yet detected:  (see docs/…)"* with an empty list. Guarded, so Phase 3's
+> `unavailable_categories → []` genuinely needs no UI change.
 
 ---
 
@@ -207,6 +237,9 @@ Completes every incident category (`unavailable_categories` → `[]`) and finish
       `RC_STATION_UNSTAFFED` (`core/availability.py:46`), cleared by
       `recompute_availability` once `until_sim` passes.
 - [ ] `manager.SIGNAL_TO_INCIDENT` + phrases for both; `unavailable_categories` → `[]`.
+      Phase 2 removed `food_safety_checks`, so only `equipment_failure` and `order_backlog`
+      are left. Phrases go in their own dict or branch — **not** `_GROUP_PHRASES`, which is
+      ingredient-batching only (§4). The empty-list render is already guarded.
 - [ ] `manager.build_issues`: monetary `impact` from `revenue_estimate` on the snapshot's
       dishes (so "station unstaffed" prices its blocked dishes).
 - [ ] `manager.build_issues`: `deadline_sim` for stock issues from the plan's `order_date` /
@@ -239,6 +272,10 @@ when its source signal expires — no ack, no assign, no history.
       `GET /admin/api/incidents/history?instance_id=&since=`.
 - [ ] UI: Acknowledge / Resolve on incident rows, acknowledged styling, a history view.
 - [ ] Tests: reconcile open / auto-resolve / re-open; ack survives a manager restart.
+- [ ] Cover the remediated-`FOOD_SAFETY_CHECK` case (added 2026-07-27): its signal cannot be
+      retracted, so a fixed check leaves the card `normal` while the incident stays open for
+      24h (§4). Explicit resolve is the intended fix — make sure `reconcile_incidents`
+      auto-resolves it rather than waiting on the TTL.
 
 **Done when** acknowledging an incident, restarting the manager, and reloading `/admin`
 still shows it acknowledged.
@@ -361,6 +398,36 @@ The non-obvious facts that shape this work. **Read this section before starting 
   `KeyError` at `core/bus.py:168`; omitting the **payload** silently skips validation. Give
   the type `groups` an existing agent subscribes to, or every emit dead-letters
   (`core/orchestrator.py:240-247`).
+  `tests/test_food_safety_signal.py::test_every_signal_type_is_registered_at_all_four_points`
+  now walks the whole enum, so two of those four are caught by the suite.
+- **Only four groups have subscribers** (added 2026-07-27, enumerated):
+  `forecasting` (forecaster, staff), `sensing` (competitor, review),
+  `inventory` (ledger), `procurement`+`inventory` (market_spectator, optimizer).
+  **Nothing subscribes to `kitchen`, `human` or `frontend`** — `human`/`frontend` are
+  read-side conventions (the manager reads `/api/signals?status=live` regardless of group,
+  and `frontend` is auto-pushed over WS), not delivery targets. So a new type tagged only
+  `["kitchen", "human"]` dead-letters on every emit. `inventory` is the safe carrier:
+  `ledger.on_signal` and `optimizer.on_signal` are both if/elif chains that fall through
+  harmlessly on an unrecognized type.
+- **`_GROUP_PHRASES` is for *ingredient* batching only** (added 2026-07-27). Adding a key to
+  it routes the type through `merge_incidents`'s grouped branch, which builds `{names}` from
+  `ingredient_name(payload)` — a non-ingredient signal batches into the literal string
+  `"some items"`. `FOOD_SAFETY_CHECK` therefore uses `_SAFETY_PHRASES` and its own branch,
+  one row per check: the *reason* a fridge log was skipped is the incident, and merging two
+  different HACCP failures into one sentence throws it away.
+- **A remediated food-safety failure clears the card but not the incident**
+  (added 2026-07-27, deliberate). `safety_issues` reads live task status, so marking the
+  check done drops the count and the card leaves `critical` at once. The
+  `FOOD_SAFETY_CHECK` *signal* has no clear path — `core/bus.py` only expires by TTL
+  (`sweep`, `:331`), there is no "retract this signal" API — so the incident stands for its
+  24h TTL. That is defensible for a HACCP record (the failure did happen today) and is
+  exactly what Phase 4's explicit resolve is for; **do not** add a bus-retract API for it.
+- **`done_late` has no grace window** (added 2026-07-27). `task_board`'s `late` flag is
+  `late_min > 0` (`core/kitchen_tasks.py:118-124`), so a task done one sim-minute past due
+  is already `done_late` — even though the *notice* tiers give it 5 minutes before they
+  raise anything (`TASK_OVERDUE_NOTICE_TIERS_MIN`). `task_compliance.rate` deliberately uses
+  the zero-grace number so the card and the operator's Tasks panel show the same thing;
+  don't "fix" one without the other.
 
 ### Manager
 
@@ -372,6 +439,11 @@ The non-obvious facts that shape this work. **Read this section before starting 
   `./dbdata`), so tests can relocate the whole footprint.
 - **Card fields are assembled in two places** — `_instance_overview` has an offline/busy
   branch (`:584`) and an online branch (`:624`). Every new field must be added to both.
+- **Cuisine resolution lives in `kitchen_tasks.active_cuisine(session)`** (moved there
+  2026-07-27). It used to be `api._active_cuisine()`, which opens its own session — unusable
+  from `core/ops_snapshot`, which already holds one and cannot import `core.api` (circular).
+  `api._active_cuisine()` is now a thin session wrapper around it. Any read-side caller that
+  needs today's task list should take the session-taking version.
 - **Aggregation logic must stay pure and unit-tested** (`derive_status`, `build_issues`,
   `rank_issues`, `merge_incidents`); async endpoints only fetch and delegate.
 - **Shared constants are mirrored, not imported** (added 2026-07-27). `APPROVAL_TTL_SIM_S`

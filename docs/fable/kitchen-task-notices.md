@@ -39,10 +39,23 @@ via `ApprovalsHub.update()` + the `approval_updated` WS event:
 Covered end to end by `core/kitchen_tasks._demo` (runnable:
 `python -m core.kitchen_tasks`) and `tests/test_kitchen_task_notices.py`.
 
-## Future work
+## Food-safety failures + compliance
 
-- Per-restaurant task compliance in the manager overview (done-late /
-  not-done rates are one `counts` read away — add them to `/api/ops/snapshot`
-  per the fan-out guideline in [manager-dashboard.md](manager-dashboard.md)).
-- Failed temp/safety outcomes should also emit a signal so they surface as
-  `food_safety` incidents ([incidents.md](incidents.md)).
+A `temp`/`safety` task reported **not done**, or left pending past its final
+overdue tier, also emits `SignalType.FOOD_SAFETY_CHECK`
+(`kitchen_tasks._emit_food_safety`, deduped per task). There is no "failed"
+task status, so the payload carries `outcome` — `not_done` | `overdue` — plus
+the cook's reason and severity.
+
+`/api/ops/snapshot` exposes the two derived reads the manager needs:
+
+- `safety_issues` — the open temp/safety failures themselves (same two
+  conditions that emit the signal, so the count and the incident always agree).
+- `task_compliance` — today's `counts` plus `accountable` (tasks whose due time
+  has passed) and `rate` = on-time completions ÷ accountable, `null` until
+  something is actually due. Note `done_late` has **no** grace window, unlike
+  the 5-minute first notice tier.
+
+The manager turns a failure into a `critical` card, a `safety` row in the
+priority queue, and a `food_safety_checks` incident phrased from
+`manager._SAFETY_PHRASES`.

@@ -1,6 +1,6 @@
 # Portfolio Overview — all restaurants on one screen
 
-Status: **implemented** except `safety_issues` (below).
+Status: **implemented**.
 
 ## What exists
 
@@ -16,14 +16,16 @@ queue. Per card, sourced by fan-out to the child:
 | `stock_risks` | `/api/ops/snapshot` (low stock) + `/api/track-b/procurement/warnings` (uncoverable) | |
 | `pending_approvals` | `/api/approvals?status=pending` | count; details in the queue/approvals sections |
 | `orders_waiting`, `ticket_time_min` | `/api/ops/snapshot` | `queued_count` and `avg_ticket_minutes`, from the kitchen ticket lifecycle |
-| `safety_issues` | — | **not implemented**, returned as `null` |
+| `safety_issues` | `/api/ops/snapshot` | count of open temp/safety check failures |
+| `task_compliance` | `/api/ops/snapshot` | today's checklist counts + on-time `rate` |
 
 ### Status rules (`manager.derive_status`, tested in `tests/test_manager.py`)
 
 - **offline** — child `/api/health` unreachable.
-- **critical** — any of: uncoverable ingredient warning; kitchen backlog at or
-  above `BACKLOG_CRIT`; depleted ingredient; unstaffed station; pending approval
-  with critical-class urgency (`critical` / `uncoverable`).
+- **critical** — any of: uncoverable ingredient warning; a failed food-safety
+  check; kitchen backlog at or above `BACKLOG_CRIT`; depleted ingredient;
+  unstaffed station; pending approval with critical-class urgency
+  (`critical` / `uncoverable`).
 - **warning** — any of: below-safety-stock ingredient; any pending approval;
   kitchen backlog at or above `BACKLOG_WARN`; any absent staff (still covered).
 - **normal** — otherwise.
@@ -45,19 +47,14 @@ and last as `orders_waiting` / `ticket_time_min`.
 (default) and `instant`, which restores the old born-served behaviour and
 flushes any backlog left on the pass.
 
-## Not implemented — guidance
+## Food-safety checks
 
-### Safety / equipment issues
+A `temp`/`safety` checklist task reported not done — or left past its final
+overdue tier — emits `SignalType.FOOD_SAFETY_CHECK` and lands on the card as
+`safety_issues` (a red `N safety` chip in the Tickets metric), a `critical`
+status, a `safety` row in the priority queue, and a `food_safety_checks`
+incident. See [kitchen-task-notices.md](kitchen-task-notices.md).
 
-Closest existing machinery: `core/kitchen_tasks.py` already generates
-temperature/safety checklist tasks and escalates failures to approvals with
-`urgency="high"`. To surface them:
-
-1. Add equipment as a first-class object only if scenarios need it (a
-   `ScenarioEvent` breaking an "oven" that disables its station's dishes is the
-   natural fit — see `core/scenarios.py`).
-2. Expose open safety tasks / failed outcomes (`/api/kitchen/tasks/board`
-   filtered to `category in ("temp","safety")`, overdue or failed) as a count
-   in `/api/ops/snapshot`.
-3. Wire into the card + `derive_status` (failed food-safety check should be
-   **critical**) and into incidents (see [incidents.md](incidents.md)).
+Equipment failures are **not** part of this: no equipment model exists, and the
+agreed design is a `ScenarioEvent` disabling a station for a sim-window rather
+than an `Equipment` table (see `docs/fable/progress.md` Phase 3).
