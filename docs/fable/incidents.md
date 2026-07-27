@@ -1,7 +1,7 @@
 # Incident Management
 
-Status: **partial** — derived incidents implemented; two categories have no
-detector yet; incidents are not yet first-class objects.
+Status: **partial** — every category has a detector; incidents are not yet
+first-class objects (no ack / assign / resolve / history).
 
 ## What exists
 
@@ -14,10 +14,13 @@ detector yet; incidents are not yet first-class objects.
 | `food_safety` | live signal `EXPIRY_RISK` (expiring stock ≈ food-safety exposure) |
 | `food_safety_checks` | live signal `FOOD_SAFETY_CHECK` — a `temp`/`safety` checklist task reported not done, or past its final overdue tier |
 | `supplier_delay` | procurement plan items with status `at_risk` / `uncoverable` (`/api/track-b/procurement/plan`) |
+| `order_backlog` | live signal `ORDER_BACKLOG` — the kitchen pass past `BACKLOG_WARN` / `BACKLOG_CRIT` tickets |
+| `equipment_failure` | live signal `EQUIPMENT_FAILURE` — a station out of service for a scenario-driven window |
 
-The mapping is `manager.SIGNAL_TO_INCIDENT`. The response also lists
-`unavailable_categories` (`equipment_failure`, `order_backlog`) so the UI can
-label the gap honestly instead of showing a silent empty list.
+The mapping is `manager.SIGNAL_TO_INCIDENT`. `unavailable_categories` is now
+`[]` — every category has a detector — but the field is kept in the response so
+the contract is stable and a future gap can be declared honestly again. The UI
+hides the label when the list is empty.
 
 ### Merging + human phrasing (`manager.merge_incidents`)
 
@@ -37,6 +40,11 @@ deterministically and phrased as one sentence (tested in
   walk-in reading 9C."* Batching them would discard the reason, which is the
   incident. Note `_GROUP_PHRASES` is ingredient-batching only — a key added
   there renders `{names}` as `"some items"` for a non-ingredient signal.
+- The backlog reads in kitchen language, not counters: *"24 tickets are backed
+  up on the pass with nobody cooking — guests are waiting and orders will start
+  walking."* (`_BACKLOG_PHRASES`). Equipment names what broke and what it costs:
+  *"Grill oven is out of service — the Grill station's dishes are off the menu
+  until it is back."*
 - Staff signals stay per-person/station: *"Marco is sick."*, *"Station Grill
   has no qualified cover — its dishes are blocked."* Routine
   covered-station broadcasts are dropped.
@@ -47,18 +55,17 @@ frontend.
 
 ## Not implemented — guidance
 
-**Missing detectors** (each is: create the child-side signal, then add one line
-to `SIGNAL_TO_INCIDENT` — `food_safety_checks` was done this way):
+**Detectors are complete.** Each was: create the child-side signal, then add one
+line to `SIGNAL_TO_INCIDENT`. Two implementation notes worth keeping:
 
-- `equipment_failure` — no equipment model exists. Recommended: a
-  `ScenarioEvent` kind that disables a station for a sim-window (reuses the
-  station→dishes machinery that staffing already uses), emitting a new
-  `SignalType.EQUIPMENT_FAILURE`. See portfolio-overview.md §safety.
-- `order_backlog` — needs the kitchen ticket lifecycle
-  (portfolio-overview.md §orders waiting). Emit a signal when queue depth or
-  ticket time crosses a threshold; the POS already computes velocity anomalies
-  (`VELOCITY_ANOMALY_PCT` in `core/config.py`) which could serve as a v0
-  "unusual order volume" incident with zero new modeling.
+- `equipment_failure` has **no equipment model** — the live signal *is* the
+  outage and its TTL *is* the window, so `recompute_availability` blocks the
+  station's dishes with `RC_EQUIPMENT_DOWN` and re-enables them when the signal
+  lapses. Authored as a scenario event (`equipment_failure`, payload
+  `{station, until_sim | duration_sim_s, label}`).
+- `order_backlog` re-emits under a constant `dedup_key` while the queue stays
+  deep, so one live row tracks the current depth rather than one signal per
+  tick, and the TTL retires it once the pass drains.
 
 **Incidents as first-class objects.** Today an incident disappears when the
 underlying signal expires — there is no acknowledge / assign / resolve, and no

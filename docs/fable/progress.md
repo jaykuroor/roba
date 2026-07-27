@@ -49,19 +49,21 @@ Last full audit of the codebase against the docs: **2026-07-27**.
 | [approvals.md](approvals.md) | ✅ implemented | — | — |
 | [kitchen-task-notices.md](kitchen-task-notices.md) | ✅ implemented | — | — |
 | [portfolio-overview.md](portfolio-overview.md) | ✅ implemented | — | — |
-| [priority-action-queue.md](priority-action-queue.md) | 🟡 partial | € impact in `build_issues`; deadlines for non-approval issues | 3 |
-| [incidents.md](incidents.md) | 🟠 partial | 2 missing detectors (`equipment_failure`, `order_backlog`); incidents not first-class objects | 3, 4 |
+| [priority-action-queue.md](priority-action-queue.md) | ✅ implemented | — | — |
+| [incidents.md](incidents.md) | 🟡 partial | all 7 categories detected; incidents not first-class objects | 4 |
 | [catchup.md](catchup.md) | 🟠 infra only | LLM summary, expand-for-detail, history drawer, merge, auto-capture | 5, 6 |
 | [daily-summary.md](daily-summary.md) | 🟡 partial | LLM prose briefing, tomorrow-specific risk, end-of-day archive | 6 |
 
 **Already implemented and verified** (do not rebuild): manager registry / child spawn /
 HTTP+WS proxy, `/admin/api/overview` with the ranked `actions` queue, `/admin/api/approvals`
-with pass-through resolve, `/admin/api/incidents` (derived, 4 of 7 categories),
+with pass-through resolve, `/admin/api/incidents` (derived, all 7 categories),
 `/admin/api/summary` (numeric briefing), catch-up **capture** infrastructure, kitchen-task
 escalating notices, the `/admin` UI with its 4 tabs, (Phase 1) the kitchen ticket
-lifecycle with its `Tickets` card metric and Controls mode toggle, and (Phase 2) the
+lifecycle with its `Tickets` card metric and Controls mode toggle, (Phase 2) the
 `FOOD_SAFETY_CHECK` detector feeding `safety_issues` / `task_compliance` and the
-`food_safety_checks` incident category.
+`food_safety_checks` incident category, and (Phase 3) the `ORDER_BACKLOG` /
+`EQUIPMENT_FAILURE` detectors plus € at stake and order-by deadlines on the action queue.
+`/admin/api/incidents` now covers **all 7 categories** (`unavailable_categories` is `[]`).
 
 ---
 
@@ -224,35 +226,67 @@ and the incident appears under Incidents with human phrasing (not a raw status s
 Completes every incident category (`unavailable_categories` → `[]`) and finishes
 [priority-action-queue.md](priority-action-queue.md). **Depends on Phase 1.**
 
-- [ ] `SignalType.ORDER_BACKLOG` — emitted from the POS tick when queue depth or ticket time
+- [x] `SignalType.ORDER_BACKLOG` — emitted from the POS tick when queue depth or ticket time
       crosses the Phase 1 thresholds. Those are in place: `config.BACKLOG_WARN` /
       `BACKLOG_CRIT`, and `POSSimulator._drain_tickets` (`core/pos_simulator.py:416`)
       already counts the open pass every tick — emit from there, and mind
       `SIGNAL_COOLDOWN_SIM_S` or a sustained backlog signals on every tick.
-- [ ] **First, settle the `_fire_scenario_events` duplicate-firing bug** (§5) — otherwise
-      the scenario event below is consumed before it ever dispatches.
-- [ ] `SignalType.EQUIPMENT_FAILURE` + an `equipment_failure` handler in the
+      — 03ad727. Landed as a separate `_emit_backlog` called from `tick()` **after**
+      `_drain_tickets` has closed its session (see §4 — emitting under an open write
+      session is how this project has wedged the sim clock before). No cooldown bookkeeping
+      was needed: a constant `dedup_key` makes an unchanged depth a no-op and a changed
+      depth refresh the one live row in place (§14.3).
+- [x] **First, settle the `_fire_scenario_events` duplicate-firing bug** (§5) — otherwise
+      the scenario event below is consumed before it ever dispatches. — 03ad727. Deleted
+      the orchestrator method outright: `ScenarioEngine.tick` is the only owner (see §5).
+- [x] `SignalType.EQUIPMENT_FAILURE` + an `equipment_failure` handler in the
       `core/scenarios.py:200-214` dispatch table: payload `{station, until_sim, label}` → a
       blocking `MenuToggle` with a new `RC_EQUIPMENT_DOWN` reason code beside
       `RC_STATION_UNSTAFFED` (`core/availability.py:46`), cleared by
-      `recompute_availability` once `until_sim` passes.
-- [ ] `manager.SIGNAL_TO_INCIDENT` + phrases for both; `unavailable_categories` → `[]`.
+      `recompute_availability` once `until_sim` passes. — 03ad727. The signal's **TTL is
+      the outage window**, so nothing stores the window separately; accepts
+      `duration_sim_s` as a friendlier alternative to an absolute `until_sim`. Required
+      giving `recompute_availability` a periodic caller — see §4.
+- [x] `manager.SIGNAL_TO_INCIDENT` + phrases for both; `unavailable_categories` → `[]`.
       Phase 2 removed `food_safety_checks`, so only `equipment_failure` and `order_backlog`
       are left. Phrases go in their own dict or branch — **not** `_GROUP_PHRASES`, which is
       ingredient-batching only (§4). The empty-list render is already guarded.
-- [ ] `manager.build_issues`: monetary `impact` from `revenue_estimate` on the snapshot's
-      dishes (so "station unstaffed" prices its blocked dishes).
-- [ ] `manager.build_issues`: `deadline_sim` for stock issues from the plan's `order_date` /
+      — 03ad727 (`_BACKLOG_PHRASES` + an inline equipment branch)
+- [x] `manager.build_issues`: monetary `impact` from `revenue_estimate` on the snapshot's
+      dishes (so "station unstaffed" prices its blocked dishes). — 03ad727. Landed as a
+      **separate numeric `impact_eur`** rather than folded into the `impact` prose, so the
+      UI can render a chip and the value stays testable. `revenue_at_stake` returns `None`
+      (not `0.0`) when nothing can be attributed — see §4.
+- [x] `manager.build_issues`: `deadline_sim` for stock issues from the plan's `order_date` /
       `latest_safe_arrival` — both already on `/api/track-b/procurement/plan` items
       (`core/api.py:3158,3174`). Requires adding the plan to the `_instance_overview`
-      fan-out.
-- [ ] UI: € at stake on action rows. The two new incident categories render with no UI
-      change.
-- [ ] Tests: backlog signal thresholds; equipment event disables the station's dishes and
-      re-enables at `until_sim`; `build_issues` impact/deadline.
+      fan-out. — 03ad727 (`stock_deadlines`, earliest `order_date` per ingredient with
+      `latest_safe_arrival` as fallback; the plan joined the existing `asyncio.gather`, so
+      it is one more parallel read rather than a new round trip)
+- [x] UI: € at stake on action rows. The two new incident categories render with no UI
+      change. — 03ad727 (a danger chip beside the problem text, shown only when
+      `impact_eur` is non-null)
+- [x] Tests: backlog signal thresholds; equipment event disables the station's dishes and
+      re-enables at `until_sim`; `build_issues` impact/deadline. — 03ad727.
+      `tests/test_backlog_and_equipment.py` (10) + `tests/test_manager.py` (+7) +
+      `AdminPage.test.tsx` (+3), including an `/admin/api/incidents` endpoint test asserting
+      the empty `unavailable_categories`, and a regression test for the §5 bug that proves
+      the whole chain (orchestrator leaves the row → activate → fires → effect applied).
 
 **Done when** `/admin/api/incidents` returns `"unavailable_categories": []` and action rows
 show € at stake.
+
+> Verified end to end on the Bella's preset (03ad727): 24 tickets queued with every cook
+> out gives *"24 tickets are backed up on the pass with nobody cooking — guests are waiting
+> and orders will start walking."*; breaking the Grill writes 2 `equipment_down` blocks and
+> gives *"Grill oven is out of service — the Grill station's dishes are off the menu until
+> it is back."*; the queue prices three rows (*"Station Grill unstaffed | €90.00 at
+> stake"*); and a depleted Tomato with a plan `order_date` carries `deadline_sim` onto its
+> action row.
+>
+> The first smoke caught a phrasing bug the unit tests had happily asserted —
+> *"backed up on the pass with nobody on the pass"*. Worth running the real thing even when
+> the suite is green.
 
 ---
 
@@ -415,6 +449,27 @@ The non-obvious facts that shape this work. **Read this section before starting 
   `"some items"`. `FOOD_SAFETY_CHECK` therefore uses `_SAFETY_PHRASES` and its own branch,
   one row per check: the *reason* a fridge log was skipped is the incident, and merging two
   different HACCP failures into one sentence throws it away.
+- **Never emit a signal while holding an open write session** (added 2026-07-27).
+  `bus.emit` dispatches to subscribers *synchronously* (`core/bus.py:280` — deliberately
+  after its own session closes), so emitting from inside a function that still holds one
+  puts two write sessions on the same SQLite file with `db.DB_LOCK` in play. That is the
+  shape of the clock-freeze bug this project already hit once. `_emit_backlog` is a
+  separate method called after `_drain_tickets` returns, precisely so the drain's session
+  is closed first.
+- **`recompute_availability` had no periodic caller before Phase 3** (added 2026-07-27).
+  Every call site was event-driven — a spoilage report, an attendance change, a delivery.
+  That is fine for state that only changes *because* of an event, but an equipment outage
+  ends on the **clock**, so the station would have stayed blocked until some unrelated
+  event happened to recompute. It now also runs from `_kitchen_engine_tick`
+  (`core/api.py`, every 300 sim-s). Anything else that expires on time rather than on an
+  event can rely on that sweep — and note it also picks up daypart-boundary staffing
+  changes, which nothing recomputed before.
+- **`revenue_at_stake` returns `None`, never `0.0`, when nothing is attributable**
+  (added 2026-07-27). A €0.00 chip reads as "this problem is free"; no chip reads as "not
+  priced". Stock rows deliberately carry no `impact_eur`: the snapshot has no
+  ingredient→dish mapping, so pricing them would mean attributing every out-of-stock dish
+  to every low ingredient. If a future phase wants it, add the mapping to the snapshot
+  rather than guessing in the manager.
 - **A remediated food-safety failure clears the card but not the incident**
   (added 2026-07-27, deliberate). `safety_issues` reads live task status, so marking the
   check done drops the count and the card leaves `critical` at once. The
@@ -502,16 +557,20 @@ The non-obvious facts that shape this work. **Read this section before starting 
 Found during the 2026-07-27 audit. None of these are caused by the fable work; they are
 recorded because they will bite an implementor.
 
-- **`Orchestrator._fire_scenario_events` fires nothing but consumes everything.**
-  `core/orchestrator.py:383-401` queries every `ScenarioEvent` with `fired == 0 AND
-  at_sim_time <= now` — with **no `is_active` filter and no dispatch** — and sets
-  `fired = 1` (verified 2026-07-27). It runs every tick right after the `scenario_engine`
-  interval trigger, so events belonging to an *inactive* scenario are burned by the
-  orchestrator without `ScenarioEngine.tick` (`core/scenarios.py:146`) ever dispatching them.
-  So the seeded-but-inactive Friday Rush burns its six events as sim time passes them, and
-  activating the scenario afterwards fires nothing (`_set_active` does not reset `fired`).
-  **Must be settled before Phase 3**, which drives equipment failure through a scenario
-  event.
+- ~~**`Orchestrator._fire_scenario_events` fires nothing but consumes everything.**~~
+  **FIXED in Phase 3.** It queried every `ScenarioEvent` with `fired == 0 AND
+  at_sim_time <= now` — with no `is_active` filter and no dispatch — and set `fired = 1`,
+  so the seeded-but-inactive Friday Rush burned its six events as sim time passed them and
+  activating the scenario afterwards fired nothing. **The method is deleted**:
+  `ScenarioEngine.tick` (a registered interval trigger) is the sole owner of
+  `ScenarioEvent.fired`, and it both filters to active scenarios and actually dispatches.
+  Regression test:
+  `tests/test_backlog_and_equipment.py::test_orchestrator_no_longer_burns_an_inactive_scenarios_events`.
+  Consequence to know (added 2026-07-27): activating a scenario whose events are all in the
+  past now fires **all of them at once** on the next engine tick, because
+  `_set_active` still does not reset `fired` or rebase `at_sim_time`. That is the intended
+  demo behaviour for the Friday Rush, but a scenario authored with absolute sim-times and
+  activated late will dump its whole script in one tick.
 - **`make test` skips `track_a/tests`** (`Makefile:32`) while `pytest.ini` includes it.
 - **The Python suite destroys `demo.db`** — see §4 Tests.
 - **The Python suite fails differently depending on whether Vertex credentials are
