@@ -42,7 +42,6 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 STATE_DIR = Path(os.getenv("MANAGER_STATE_DIR", str(ROOT / "dbdata")))
 REGISTRY_PATH = STATE_DIR / "manager_registry.json"
-CATCHUP_DIR = STATE_DIR / "catchups"
 
 # Child probe timeout (fan-out reads). Spawning waits longer (STARTUP_TIMEOUT_S).
 # Generous because a child's event loop can stall for seconds during MILP
@@ -1126,13 +1125,318 @@ async def daily_summary() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Catch-up markers (docs/fable/catchup.md — infrastructure only; the readable
-# LLM summary + merge come later. Each catch-up snapshots the child's event
-# log since the previous marker, so the future summarizer never loses events.)
+# Catch-up summarizer (docs/fable/catchup.md §"Readable structured summary")
+#
+# One prompt per subsystem, never over the raw firehose: the bucketing below is
+# deterministic and unit-tested, so the LLM only ever writes prose about a
+# handful of related events and the manager can tell which events a bullet came
+# from. Merging is Phase 6's job; this file only summarizes one capture.
+# ---------------------------------------------------------------------------
+
+# ``EventLog.category`` -> subsystem bucket. There is no enum for it — every
+# writer passes a free string to ``core.events.log_event`` — so this map is
+# enumerated from the call sites and an unrecognised category lands in "other"
+# rather than being silently dropped.
+EVENT_BUCKETS: Dict[str, str] = {
+    # Purchase orders, sourcing plans, supplier negotiation.
+    "po_placed": "procurement",
+    "po_delivered": "procurement",
+    "po_pending_approval": "procurement",
+    "sourcing_plan": "procurement",
+    "sourcing_plan_skipped": "procurement",
+    "reorder_failed": "procurement",
+    "optimizer": "procurement",
+    "llm_optimize": "procurement",
+    "negotiation_requested": "procurement",
+    "negotiation_agreed": "procurement",
+    "negotiation_no_deal": "procurement",
+    "negotiation_skipped": "procurement",
+    # Stock movements and what they cost.
+    "receipt": "inventory",
+    "waste": "inventory",
+    "reconciliation": "inventory",
+    "stockout_risk": "inventory",
+    "low_stock": "inventory",
+    "manual_shortage": "inventory",
+    "inventory_signal_muted": "inventory",
+    "spoilage_pattern": "inventory",
+    # Forecasts and the cook feedback that tunes them.
+    "forecast": "demand",
+    "cook_feedback": "demand",
+    "batch_advisor": "demand",
+    # Who turned up.
+    "attendance": "staffing",
+    # What guests could actually order.
+    "menu_toggle": "menu",
+    "promo_proposal": "promos",
+    "promo_activated": "promos",
+    # Competitor intel and the calls that produced it.
+    "competitor": "market",
+    "call": "market",
+    # Scenario injections land in "other" alongside anything unrecognised.
+}
+
+# Render/prompt order. Every bucket here has at least one real event source —
+# note there is deliberately no "reviews" bucket: the review agent writes no
+# event_log rows at all (docs/fable/progress.md §4).
+BUCKET_ORDER = (
+    "procurement", "inventory", "demand", "staffing",
+    "menu", "promos", "market", "other",
+)
+
+_BUCKET_BRIEF = {
+    "procurement": "purchase orders, sourcing plans and supplier negotiation",
+    "inventory": "stock levels, deliveries received, waste and spoilage",
+    "demand": "demand forecasts and the cook feedback that tunes them",
+    "staffing": "who turned up, who was absent, and how it was covered",
+    "menu": "dishes taken off or put back on the menu",
+    "promos": "promotions proposed and activated",
+    "market": "competitor intel and the calls that produced it",
+    "other": "activity that belongs to no other subsystem",
+}
+
+# Mirrors core.llm.CANNED_NOTE — the marker a *degraded* LLM call carries when
+# the provider never actually answered. Kept as a literal so the summarizer is
+# testable without importing core; tests assert the two stay equal.
+CANNED_NOTE = "canned_fallback"
+
+# Prompt sizing. A busy sim-day can log thousands of rows; the cap keeps one
+# bucket's prompt bounded and reports what it dropped rather than lying.
+CATCHUP_MAX_EVENTS_PER_BUCKET = int(os.getenv("CATCHUP_MAX_EVENTS_PER_BUCKET", "120"))
+# Generous on purpose: a 2.5 "thinking" model spends reasoning tokens against
+# max_output_tokens, and a starved one truncates into the canned path (§4 LLM).
+CATCHUP_LLM_MAX_TOKENS = int(os.getenv("CATCHUP_LLM_MAX_TOKENS", "3000"))
+CATCHUP_MAX_BULLETS = 6
+
+_BULLET_SCHEMA = {
+    "type": "object",
+    "properties": {"bullets": {"type": "array"}},
+    "required": ["bullets"],
+}
+
+_PROVIDER: Optional[tuple] = None
+
+
+def _summarizer() -> tuple:
+    """The shared ``(LLMProvider, model)`` used to write catch-up prose.
+
+    ``core`` is imported here as a *library*: the manager's "do not reach into
+    child state, HTTP is the contract" rule is about child **data**, not shared
+    code (docs/fable/progress.md §4). The import is lazy so the manager still
+    boots and serves every non-LLM endpoint without the sim's dependencies.
+    """
+    global _PROVIDER
+    if _PROVIDER is None:
+        from core import config as core_config
+        from core.llm import LLMProvider
+        _PROVIDER = (
+            LLMProvider(timeout_s=core_config.LLM_AUTHORITY_TIMEOUT_S),
+            core_config.GEMINI_REASONER_MODEL,
+        )
+    return _PROVIDER
+
+
+def bucket_events(events: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Pure: group a capture's events by subsystem, in ``BUCKET_ORDER``.
+
+    Groups on ``category``. ``EventLog`` has **no** ``event_type`` column
+    whatever catchup.md §2 claims — see docs/fable/progress.md §4. Empty buckets
+    are omitted so they never cost a prompt.
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for event in events:
+        bucket = EVENT_BUCKETS.get(event.get("category") or "", "other")
+        grouped.setdefault(bucket, []).append(event)
+    return {b: grouped[b] for b in BUCKET_ORDER if b in grouped}
+
+
+def _event_digest(event: Dict[str, Any]) -> Dict[str, Any]:
+    """The fields worth spending prompt tokens on.
+
+    ``detail`` is deliberately dropped: one optimizer row's detail alone can be
+    kilobytes of solver output, while ``summary`` is already the human sentence
+    the narrative feed renders. The raw rows stay in the capture file, so
+    "click to expand" still shows everything.
+    """
+    return {
+        "id": event.get("id"),
+        "sim_time": event.get("sim_time"),
+        "category": event.get("category"),
+        "actor": event.get("actor"),
+        "summary": event.get("summary"),
+    }
+
+
+def _bucket_messages(bucket: str, events: List[Dict[str, Any]]) -> List[dict]:
+    """The one prompt this bucket gets."""
+    brief = _BUCKET_BRIEF.get(bucket, bucket)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are briefing a restaurant manager who has been away.\n"
+                f"Summarize the {bucket} activity below — {brief} — from the "
+                "restaurant's event log.\n\n"
+                f"Rules:\n"
+                f"- At most {CATCHUP_MAX_BULLETS} bullets. Fewer is better: "
+                "merge repetitive events into a single counted bullet.\n"
+                "- One short factual sentence each, past tense. No preamble, "
+                "no advice, no recommendations.\n"
+                "- Quantify wherever the events do (counts, euros, ingredient "
+                "and supplier names).\n"
+                '- Every bullet must list the "id" of each event it came from '
+                'in "event_ids" — the manager clicks a bullet to read those '
+                "raw events.\n"
+                "- Report only what the events say. Invent nothing.\n\n"
+                'Return JSON: {"bullets": [{"text": "...", "event_ids": [1, 2]}]}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps([_event_digest(e) for e in events], default=str),
+        },
+    ]
+
+
+def _as_event_id(value: Any) -> Optional[int]:
+    """Coerce an id the model echoed back; ``None`` when it is not one."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_bullets(
+    result: Any, valid_ids: set
+) -> Optional[List[Dict[str, Any]]]:
+    """Validated bullets, or ``None`` when the provider never really answered.
+
+    ``None`` is the canned-fallback / malformed case and must surface as an
+    error — rendering canned filler as a summary is a trap this project has
+    fallen into twice (docs/fable/progress.md §4 LLM).
+
+    Event ids are filtered to the ones actually put in the prompt: a
+    hallucinated id would make "click to expand" resolve against nothing.
+    """
+    if not isinstance(result, dict) or result.get("note") == CANNED_NOTE:
+        return None
+    raw = result.get("bullets")
+    if not isinstance(raw, list):
+        return None
+    bullets: List[Dict[str, Any]] = []
+    for item in raw[:CATCHUP_MAX_BULLETS]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        ids = item.get("event_ids")
+        bullets.append({
+            "text": text,
+            "event_ids": [
+                i for i in (_as_event_id(v) for v in (ids if isinstance(ids, list) else []))
+                if i in valid_ids
+            ],
+        })
+    return bullets
+
+
+def summarize_capture(
+    record: Dict[str, Any],
+    incidents: Optional[List[Dict[str, Any]]] = None,
+    complete: Optional[Any] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Turn one capture into the per-subsystem summary written to its file.
+
+    ``complete`` is ``LLMProvider.complete``; tests inject a fake. A degraded
+    provider returns ``error`` set and ``buckets`` empty — never prose.
+
+    ponytail: buckets are prompted sequentially, so a capture touching every
+    subsystem costs ~8 serial round trips. Fan out with a thread pool if the
+    wait becomes the complaint.
+    """
+    if complete is None:
+        provider, default_model = _summarizer()
+        complete, model = provider.complete, model or default_model
+
+    buckets: List[Dict[str, Any]] = []
+    for name, rows in bucket_events(record.get("events") or []).items():
+        recent = rows[-CATCHUP_MAX_EVENTS_PER_BUCKET:]
+        result = complete(
+            messages=_bucket_messages(name, recent),
+            json_schema=_BULLET_SCHEMA,
+            max_tokens=CATCHUP_LLM_MAX_TOKENS,
+            use_site="catchup_summary",
+            model=model,
+        )
+        bullets = _clean_bullets(result, {e.get("id") for e in recent})
+        if bullets is None:
+            return {
+                "generated_at": time.time(),
+                "model": model or "",
+                "error": (
+                    f"The summarizer did not answer: {model or 'the model'} fell "
+                    f"back to canned output on the '{name}' bucket. Check "
+                    "GEMINI_REASONER_MODEL and the Vertex credentials — a bad "
+                    "model id degrades silently."
+                ),
+                "buckets": [],
+                "incidents": incidents or [],
+            }
+        buckets.append({
+            "bucket": name,
+            "event_count": len(rows),
+            "truncated": len(rows) - len(recent),
+            "bullets": bullets,
+        })
+
+    return {
+        "generated_at": time.time(),
+        "model": model or "",
+        "error": None,
+        "buckets": buckets,
+        "incidents": incidents or [],
+    }
+
+
+def incidents_in_window(
+    instance_id: str, since_sim: float, until_sim: float
+) -> List[Dict[str, Any]]:
+    """Incidents *opened* inside a catch-up's window — "what blew up while you
+    were away", including ones that have since resolved.
+
+    Read from the Phase 4 store rather than re-derived from live signals,
+    because a signal that has expired can no longer tell you it ever fired.
+    ``opened_at`` is child sim-time (§4), the same clock the window uses. The
+    lower bound is exclusive to match the event filter in ``create_catchup``,
+    except on the very first capture, whose window starts at 0.
+    """
+    lower = ">=" if since_sim <= 0 else ">"
+    conn = incidents_db()
+    try:
+        return [dict(r) for r in conn.execute(
+            f"SELECT incident_id, category, summary, opened_at, status, resolved_at"
+            f" FROM incidents WHERE instance_id = ? AND opened_at {lower} ?"
+            " AND opened_at <= ? ORDER BY opened_at",
+            (instance_id, float(since_sim), float(until_sim)),
+        )]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Catch-up markers (docs/fable/catchup.md). Each catch-up snapshots the child's
+# event log since the previous marker, so the summarizer above never loses
+# events — it can run later, or again with a better prompt, after the child has
+# been reseeded. Merging windows is Phase 6.
 # ---------------------------------------------------------------------------
 
 def _catchup_dir(instance_id: str) -> Path:
-    d = CATCHUP_DIR / instance_id
+    # STATE_DIR is read at call time, like incidents_db() — a module-level
+    # CATCHUP_DIR constant froze the path at import and put captures outside
+    # whatever a test (or a late MANAGER_STATE_DIR) had relocated to.
+    d = STATE_DIR / "catchups" / instance_id
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -1182,13 +1486,41 @@ async def create_catchup(instance_id: str) -> Dict[str, Any]:
         "n": n, "instance_id": instance_id, "created_at": time.time(),
         "since_sim": since_sim, "until_sim": until_sim,
         "event_count": len(events), "events": events,
-        "summary": None,  # future: LLM-generated readable summary
+        "summary": None,  # filled in by .../summarize, on demand
     }
     (_catchup_dir(instance_id) / f"{n:06d}.json").write_text(
         json.dumps(record, indent=2, default=str)
     )
     return {k: record[k] for k in
             ("n", "created_at", "since_sim", "until_sim", "event_count", "summary")}
+
+
+@app.post("/admin/api/instances/{instance_id}/catchups/{n}/summarize")
+def summarize_catchup(instance_id: str, n: int) -> Dict[str, Any]:
+    """Write a readable summary into capture ``n`` and return it.
+
+    Idempotent overwrite — re-summarizing with a better prompt is expected, and
+    the raw ``events`` are never touched, so nothing is lost by trying again.
+
+    Deliberately a sync ``def``: ``LLMProvider.complete`` blocks, so FastAPI
+    runs this in its threadpool instead of stalling the event loop (and with it
+    every child health probe) for the length of a Gemini call.
+    """
+    _inst_or_404(instance_id)
+    path = _catchup_dir(instance_id) / f"{n:06d}.json"
+    if not path.exists():
+        raise HTTPException(404, "no such catch-up")
+    record = json.loads(path.read_text())
+    record["summary"] = summarize_capture(
+        record,
+        incidents_in_window(
+            instance_id,
+            float(record.get("since_sim") or 0.0),
+            float(record.get("until_sim") or 0.0),
+        ),
+    )
+    path.write_text(json.dumps(record, indent=2, default=str))
+    return record["summary"]
 
 
 # ---------------------------------------------------------------------------

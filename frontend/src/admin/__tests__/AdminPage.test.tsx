@@ -1,10 +1,18 @@
 // Restaurant-card rendering with real data, driven through the real
 // useAdminData hook by stubbing apiGet per path. The pattern for later phases:
 // add a field to the stub payload and assert what the card shows.
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { ActionItem, Incident, IncidentHistoryRow, InstanceCard } from "../useAdminData";
+import type {
+  ActionItem,
+  CatchupMarker,
+  CatchupRecord,
+  CatchupSummary,
+  Incident,
+  IncidentHistoryRow,
+  InstanceCard,
+} from "../useAdminData";
 
 const overview: { instances: InstanceCard[]; actions: ActionItem[] } = {
   instances: [],
@@ -17,6 +25,10 @@ const incidentData: { incidents: Incident[]; unavailable_categories: string[] } 
 };
 const history: { incidents: IncidentHistoryRow[] } = { incidents: [] };
 const posted: string[] = [];
+// Catch-ups are fetched on demand, so the stub answers the marker list and one
+// record per `n` (docs/fable/catchup.md).
+let catchupMarkers: CatchupMarker[] = [];
+let catchupRecords: Record<number, CatchupRecord> = {};
 
 vi.mock("../../api", () => ({
   apiGet: vi.fn((path: string) => {
@@ -25,11 +37,18 @@ vi.mock("../../api", () => ({
     if (path.startsWith("/admin/api/incidents")) return Promise.resolve(incidentData);
     if (path.startsWith("/admin/api/presets")) return Promise.resolve([]);
     if (path.startsWith("/admin/api/approvals")) return Promise.resolve([]);
+    const catchup = path.match(/\/catchups(?:\/(\d+))?$/);
+    if (catchup) {
+      return Promise.resolve(
+        catchup[1] == null ? catchupMarkers : catchupRecords[Number(catchup[1])],
+      );
+    }
     return new Promise(() => undefined); // /admin/api/summary — never resolves
   }),
   apiPost: vi.fn((path: string) => {
     posted.push(path);
-    return Promise.resolve({});
+    // /summarize returns the CatchupSummary it just persisted.
+    return Promise.resolve(path.endsWith("/summarize") ? freshSummary : {});
   }),
   apiPatch: vi.fn(() => new Promise(() => undefined)),
   apiDelete: vi.fn(() => new Promise(() => undefined)),
@@ -233,5 +252,174 @@ describe("incidents — acknowledge / resolve / history", () => {
     fireEvent.click(screen.getByText("History"));
     expect(await screen.findByText("Running low on Basil.")).toBeInTheDocument();
     expect(screen.getByText("resolved")).toBeInTheDocument();
+  });
+});
+
+
+// --- catch-up history drawer (docs/fable/catchup.md) ---------------------
+
+const BULLET =
+  "Two purchase orders were placed with Verdura Fresca and City Wholesale for a total of EUR 262.85.";
+const EVENT_SUMMARY = "PO #12 placed with Verdura Fresca for 4 items.";
+
+function bucketSummary(overrides: Partial<CatchupSummary> = {}): CatchupSummary {
+  return {
+    generated_at: 1700000100,
+    model: "gemini-2.5-pro",
+    error: null,
+    buckets: [
+      {
+        bucket: "procurement",
+        event_count: 2,
+        truncated: 0,
+        bullets: [{ text: BULLET, event_ids: [41] }],
+      },
+    ],
+    incidents: [],
+    ...overrides,
+  };
+}
+
+const freshSummary = bucketSummary({
+  buckets: [
+    {
+      bucket: "staffing",
+      event_count: 1,
+      truncated: 0,
+      bullets: [{ text: "Marco was marked absent for the evening shift.", event_ids: [] }],
+    },
+  ],
+});
+
+function marker(overrides: Partial<CatchupMarker> = {}): CatchupMarker {
+  return {
+    n: 1,
+    created_at: 1700000000,
+    since_sim: 0,
+    until_sim: 43200,
+    event_count: 12,
+    summary: null,
+    ...overrides,
+  };
+}
+
+function catchupRecord(m: CatchupMarker): CatchupRecord {
+  return {
+    ...m,
+    instance_id: "running_fox",
+    events: [
+      {
+        id: 41,
+        sim_time: 45000,
+        category: "po_placed",
+        actor: "procurement",
+        summary: EVENT_SUMMARY,
+        detail: null,
+      },
+    ],
+  };
+}
+
+describe("catch-up history drawer", () => {
+  /** Click something that kicks off a fetch, and let the resulting state
+   *  update land inside act() — the drawer loads on demand, not on render. */
+  async function click(el: HTMLElement) {
+    await act(async () => {
+      fireEvent.click(el);
+    });
+  }
+
+  async function openDrawer(markers: CatchupMarker[]) {
+    overview.instances = [card()];
+    overview.actions = [];
+    catchupMarkers = markers;
+    catchupRecords = Object.fromEntries(
+      markers.map((m) => [m.n, catchupRecord(m)]),
+    );
+    posted.length = 0;
+    render(<AdminPage />);
+    await waitFor(() => expect(screen.getByText("Bella's")).toBeInTheDocument());
+    await click(screen.getByText("Catch-ups"));
+  }
+
+  const summarized = marker({ n: 2, since_sim: 43200, until_sim: 86400,
+                              event_count: 2, summary: bucketSummary() });
+
+  it("lists the captured windows when opened", async () => {
+    await openDrawer([marker(), summarized]);
+    expect(await screen.findByText("#1")).toBeInTheDocument();
+    expect(screen.getByText("#2")).toBeInTheDocument();
+    expect(screen.getByText("Day 0 00:00 → Day 0 12:00")).toBeInTheDocument();
+    expect(screen.getByText("12 events")).toBeInTheDocument();
+    // Captures that already carry a summary say so.
+    expect(screen.getByText("summarized")).toBeInTheDocument();
+  });
+
+  it("renders a selected capture's bullets and expands one to its raw events", async () => {
+    await openDrawer([summarized]);
+    await click(await screen.findByText("#2"));
+    expect(await screen.findByText(BULLET)).toBeInTheDocument();
+    expect(screen.getByText("procurement")).toBeInTheDocument();
+    // Collapsed until asked.
+    expect(screen.queryByText(EVENT_SUMMARY)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText(BULLET));
+    expect(await screen.findByText(EVENT_SUMMARY)).toBeInTheDocument();
+    expect(
+      screen.getByText("Day 0 12:30 · po_placed · procurement"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders a degraded summary as an error and never as bullets", async () => {
+    // buckets is [] on a real error; carry one anyway so the test fails if the
+    // view ever falls through to prose. This has shipped twice (progress.md §4).
+    const failed = marker({
+      n: 3,
+      summary: bucketSummary({ error: "LLM returned the canned no-op response" }),
+    });
+    await openDrawer([failed]);
+    await click(await screen.findByText("#3"));
+    expect(
+      await screen.findByText("LLM returned the canned no-op response"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Summary failed/)).toBeInTheDocument();
+    expect(screen.queryByText(BULLET)).not.toBeInTheDocument();
+  });
+
+  it("summarizes an unsummarized capture through the manager", async () => {
+    await openDrawer([marker()]);
+    await click(await screen.findByText("#1"));
+    await click(await screen.findByText("Summarize"));
+    await waitFor(() =>
+      expect(posted).toContain("/admin/api/instances/running_fox/catchups/1/summarize"),
+    );
+    // The returned summary replaces the "not summarized yet" state in place.
+    expect(
+      await screen.findByText("Marco was marked absent for the evening shift."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Re-summarize")).toBeInTheDocument();
+  });
+
+  it("renders a bucket name it does not know rather than blanking it", async () => {
+    // The bucket set is enumerated from free-string event categories and will
+    // grow — an unknown one must still show up, never render empty.
+    const future = marker({
+      n: 4,
+      summary: bucketSummary({
+        buckets: [
+          {
+            bucket: "delivery_ops",
+            event_count: 1,
+            truncated: 3,
+            bullets: [{ text: "A courier no-showed.", event_ids: [] }],
+          },
+        ],
+      }),
+    });
+    await openDrawer([future]);
+    await click(await screen.findByText("#4"));
+    expect(await screen.findByText("delivery ops")).toBeInTheDocument();
+    expect(screen.getByText("A courier no-showed.")).toBeInTheDocument();
+    expect(screen.getByText("3 older events not summarized")).toBeInTheDocument();
   });
 });

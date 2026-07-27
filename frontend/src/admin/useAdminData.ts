@@ -100,6 +100,62 @@ export interface IncidentHistoryRow {
   resolved_at: number | null;
 }
 
+// Catch-ups (docs/fable/catchup.md). Fetched on demand, never polled — a
+// capture is an immutable snapshot of an event window; only its `summary` slot
+// is ever rewritten, and only by the drawer that asked for it.
+
+/** One raw child EventLog row, snapshotted at capture time. */
+export interface CatchupEvent {
+  id: number;
+  sim_time: number | null;
+  category: string;
+  actor: string;
+  summary: string;
+  detail: unknown;
+}
+
+export interface CatchupSummary {
+  generated_at: number;
+  model: string;
+  /** Non-null means the LLM degraded (bad model id, no credentials,
+   *  truncation). Render it as an error — never as prose. `buckets` is empty. */
+  error: string | null;
+  buckets: {
+    /** procurement | inventory | demand | staffing | menu | promos | market |
+     *  other — but keep it a free string and render whatever arrives: the set
+     *  is enumerated from event categories and will grow. */
+    bucket: string;
+    event_count: number;
+    /** Events dropped from the prompt; 0 normally. */
+    truncated: number;
+    bullets: { text: string; event_ids: number[] }[];
+  }[];
+  incidents: {
+    incident_id: number;
+    category: string;
+    summary: string;
+    opened_at: number | null;
+    status: string;
+    resolved_at: number | null;
+  }[];
+}
+
+/** Capture metadata, without the events — what the marker list is built from. */
+export interface CatchupMarker {
+  n: number;
+  created_at: number;
+  since_sim: number;
+  until_sim: number;
+  event_count: number;
+  summary: CatchupSummary | null;
+}
+
+/** A full capture: the marker plus the raw rows the bullets expand into. */
+export interface CatchupRecord extends CatchupMarker {
+  instance_id: string;
+  events: CatchupEvent[];
+}
+
 export interface Summary {
   generated_at: number;
   totals: {

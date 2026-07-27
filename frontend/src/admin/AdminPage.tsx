@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import {
   AlertTriangle,
+  Camera,
   Check,
+  ChevronDown,
+  ChevronRight,
   ExternalLink,
   History,
   Play,
@@ -15,6 +18,10 @@ import { PRESET_EMOJI, RestaurantLogo } from "../shell/RestaurantLogo";
 import {
   type ActionItem,
   type AdminApproval,
+  type CatchupEvent,
+  type CatchupMarker,
+  type CatchupRecord,
+  type CatchupSummary,
   type Incident,
   type IncidentHistoryRow,
   type InstanceCard,
@@ -151,6 +158,7 @@ function RestaurantCard({
 }) {
   const [busy, setBusy] = useState(false);
   const [catchupNote, setCatchupNote] = useState<string | null>(null);
+  const [showCatchups, setShowCatchups] = useState(false);
 
   async function run(action: () => Promise<unknown>) {
     setBusy(true);
@@ -278,8 +286,25 @@ function RestaurantCard({
           className="flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-text/60 hover:bg-muted disabled:opacity-40"
           title="Capture everything that happened since the last catch-up"
         >
-          <History size={13} /> Catch up
+          <Camera size={13} /> Catch up
         </button>
+        <button
+          type="button"
+          onClick={() => setShowCatchups(true)}
+          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-text/60 hover:bg-muted"
+          title={`Previous catch-ups for ${card.title}`}
+        >
+          {/* Not labelled "History" — the incidents tab owns that word, and two
+              History buttons on one screen is a coin flip for the reader. */}
+          <History size={13} /> Catch-ups
+        </button>
+        {showCatchups && (
+          <CatchupDrawer
+            instanceId={card.id}
+            title={card.title}
+            onClose={() => setShowCatchups(false)}
+          />
+        )}
         {card.online ? (
           <button
             type="button"
@@ -310,6 +335,299 @@ function RestaurantCard({
         </button>
       </div>
     </div>
+  );
+}
+
+/** One summary bullet. Click expands it into the raw events it was written
+ *  from — the whole point of capturing events rather than a (since, until)
+ *  marker (docs/fable/catchup.md). A bullet with no source ids is not
+ *  expandable, so it renders as plain text. */
+function CatchupBullet({
+  bullet,
+  events,
+}: {
+  bullet: { text: string; event_ids: number[] };
+  events: CatchupEvent[];
+}) {
+  const [open, setOpen] = useState(false);
+
+  if (bullet.event_ids.length === 0) {
+    return <li className="py-0.5 pl-5 text-sm text-text/80">{bullet.text}</li>;
+  }
+  const ids = new Set(bullet.event_ids);
+  const sources = events.filter((e) => ids.has(e.id));
+
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-start gap-1 rounded px-1 py-0.5 text-left text-sm text-text/80 hover:bg-muted/60"
+      >
+        <span className="mt-0.5 shrink-0 text-text/40">
+          {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        </span>
+        <span className="flex-1">{bullet.text}</span>
+        <span className="shrink-0 rounded bg-muted px-1 text-[11px] font-medium text-text/50">
+          {bullet.event_ids.length}
+        </span>
+      </button>
+      {open && (
+        <div className="ml-5 flex flex-col gap-0.5 border-l border-muted pl-2 pb-1">
+          {sources.length === 0 ? (
+            <p className="text-xs text-text/40">
+              Source events are no longer in this capture.
+            </p>
+          ) : (
+            sources.map((e) => (
+              <div key={e.id} className="text-xs text-text/60">
+                <span className="text-text/40">
+                  {fmtSim(e.sim_time)} · {e.category} · {e.actor}
+                </span>{" "}
+                {e.summary}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
+/** The summary of one capture, or the error that replaced it.
+ *  A degraded LLM call (bad model id, no credentials, truncation) comes back
+ *  with `error` set and no buckets — it is rendered as an error and never as
+ *  prose. That trap has bitten this project twice; see §4 of
+ *  docs/fable/progress.md. */
+function CatchupSummaryView({
+  summary,
+  events,
+}: {
+  summary: CatchupSummary;
+  events: CatchupEvent[];
+}) {
+  if (summary.error) {
+    return (
+      <div className="rounded-md border border-danger/40 bg-danger/10 p-3">
+        <div className="flex items-center gap-1.5 text-sm font-semibold text-danger">
+          <AlertTriangle size={14} /> Summary failed — no summary was written
+        </div>
+        <p className="mt-1 text-xs text-danger/90">{summary.error}</p>
+        <p className="mt-1 text-[11px] text-text/40">model: {summary.model}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {summary.buckets.length === 0 && (
+        <p className="text-sm text-text/40">The summary is empty.</p>
+      )}
+      {summary.buckets.map((bucket) => (
+        <div key={bucket.bucket}>
+          <div className="flex items-baseline gap-2">
+            <h5 className="text-xs font-semibold uppercase tracking-wide text-text/60">
+              {bucket.bucket.replace(/_/g, " ")}
+            </h5>
+            <span className="text-[11px] text-text/40">{bucket.event_count} events</span>
+          </div>
+          <ul className="mt-0.5">
+            {bucket.bullets.map((bullet, i) => (
+              <CatchupBullet key={i} bullet={bullet} events={events} />
+            ))}
+          </ul>
+          {bucket.truncated > 0 && (
+            <p className="pl-1 text-[11px] text-text/30">
+              {bucket.truncated} older events not summarized
+            </p>
+          )}
+        </div>
+      ))}
+
+      {summary.incidents.length > 0 && (
+        <div>
+          <h5 className="text-xs font-semibold uppercase tracking-wide text-text/60">
+            Incidents opened in this window
+          </h5>
+          <div className="mt-1 flex flex-col gap-1">
+            {summary.incidents.map((inc) => (
+              <div
+                key={inc.incident_id}
+                className="flex items-center gap-2 rounded border border-muted px-2 py-1 text-xs"
+              >
+                <span className="w-24 shrink-0 truncate rounded bg-muted px-1 text-center text-[11px] uppercase text-text/60">
+                  {inc.category.replace(/_/g, " ")}
+                </span>
+                <span className="min-w-0 flex-1 text-text/70">{inc.summary}</span>
+                <span
+                  className={`shrink-0 rounded px-1.5 text-[11px] font-semibold ${INCIDENT_STATUS_STYLE[inc.status] ?? INCIDENT_STATUS_STYLE.open}`}
+                >
+                  {inc.status === "resolved" ? "resolved" : "still open"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      <p className="text-[11px] text-text/30">model: {summary.model}</p>
+    </div>
+  );
+}
+
+/** Per-restaurant catch-up history. Fetched on open rather than polled — past
+ *  captures do not change while you read them, and summarizing is an explicit
+ *  (slow) act. */
+function CatchupDrawer({
+  instanceId,
+  title,
+  onClose,
+}: {
+  instanceId: string;
+  title: string;
+  onClose: () => void;
+}) {
+  const [markers, setMarkers] = useState<CatchupMarker[] | null>(null);
+  const [record, setRecord] = useState<CatchupRecord | null>(null);
+  const [selected, setSelected] = useState<number | null>(null);
+  const [summarizing, setSummarizing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    apiGet<CatchupMarker[]>(`/admin/api/instances/${instanceId}/catchups`)
+      .then(setMarkers)
+      .catch(() => setMarkers([]));
+  }, [instanceId]);
+
+  async function select(n: number) {
+    setSelected(n);
+    setRecord(null);
+    setError(null);
+    try {
+      setRecord(
+        await apiGet<CatchupRecord>(`/admin/api/instances/${instanceId}/catchups/${n}`),
+      );
+    } catch {
+      setError("Could not load that catch-up.");
+    }
+  }
+
+  async function summarize() {
+    if (record == null) return;
+    setSummarizing(true);
+    setError(null);
+    try {
+      const summary = await apiPost<CatchupSummary>(
+        `/admin/api/instances/${instanceId}/catchups/${record.n}/summarize`,
+      );
+      setRecord({ ...record, summary });
+      setMarkers(
+        (rows) => rows?.map((m) => (m.n === record.n ? { ...m, summary } : m)) ?? rows,
+      );
+    } catch {
+      setError("Summarizing failed — the manager could not reach the model.");
+    } finally {
+      setSummarizing(false);
+    }
+  }
+
+  const newestFirst = markers ? [...markers].reverse() : [];
+
+  return (
+    <>
+      <div className="fixed inset-0 z-40 bg-black/40" onClick={onClose} aria-hidden />
+      <aside className="fixed right-0 top-0 z-50 flex h-full w-[34rem] max-w-full flex-col bg-primary text-text shadow-2xl">
+        <header className="flex items-center gap-2 border-b border-muted px-4 py-3">
+          <History size={16} className="text-text/50" />
+          <h3 className="flex-1 text-sm font-semibold">Catch-ups — {title}</h3>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close catch-up history"
+            className="rounded-md p-1 text-text/40 hover:bg-muted hover:text-text"
+          >
+            <X size={16} />
+          </button>
+        </header>
+
+        <div className="flex-1 overflow-y-auto px-4 py-3">
+          {markers == null ? (
+            <p className="py-8 text-center text-sm text-text/40">Loading…</p>
+          ) : markers.length === 0 ? (
+            <p className="py-8 text-center text-sm text-text/40">
+              No catch-ups captured yet — press “Catch up” on the card.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-1">
+              {newestFirst.map((m) => (
+                <button
+                  key={m.n}
+                  type="button"
+                  onClick={() => select(m.n)}
+                  className={
+                    selected === m.n
+                      ? "flex items-center gap-2 rounded-md border border-accent bg-surface px-2 py-1.5 text-left text-xs"
+                      : "flex items-center gap-2 rounded-md border border-muted bg-surface px-2 py-1.5 text-left text-xs hover:border-text/30"
+                  }
+                >
+                  <span className="w-8 shrink-0 font-semibold text-text/60">#{m.n}</span>
+                  <span className="min-w-0 flex-1 text-text/70">
+                    {fmtSim(m.since_sim)} → {fmtSim(m.until_sim)}
+                  </span>
+                  <span className="shrink-0 text-text/40">{m.event_count} events</span>
+                  {m.summary && (
+                    <span
+                      className={
+                        m.summary.error
+                          ? "shrink-0 rounded bg-danger/15 px-1.5 text-[11px] font-semibold text-danger"
+                          : "shrink-0 rounded bg-success/15 px-1.5 text-[11px] font-semibold text-success"
+                      }
+                    >
+                      {m.summary.error ? "failed" : "summarized"}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {selected != null && (
+            <div className="mt-4 border-t border-muted pt-3">
+              {record == null ? (
+                <p className="text-sm text-text/40">{error ?? "Loading…"}</p>
+              ) : (
+                <>
+                  <div className="mb-2 flex items-center gap-2">
+                    <span className="text-xs text-text/50">
+                      Catch-up #{record.n} · {record.event_count} events
+                    </span>
+                    <button
+                      type="button"
+                      disabled={summarizing}
+                      onClick={summarize}
+                      className="ml-auto rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
+                    >
+                      {summarizing
+                        ? "Summarizing…"
+                        : record.summary
+                          ? "Re-summarize"
+                          : "Summarize"}
+                    </button>
+                  </div>
+                  {error && <p className="mb-2 text-xs text-danger">{error}</p>}
+                  {record.summary ? (
+                    <CatchupSummaryView summary={record.summary} events={record.events} />
+                  ) : (
+                    <p className="text-sm text-text/40">
+                      Not summarized yet.
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      </aside>
+    </>
   );
 }
 
