@@ -70,6 +70,10 @@ class SignalType(str, Enum):
     # overdue escalation — the HACCP failure behind the food_safety_checks
     # incident category (docs/fable/incidents.md).
     FOOD_SAFETY_CHECK = "FOOD_SAFETY_CHECK"
+    # Kitchen ticket queue past its warn/crit depth — guests are waiting.
+    ORDER_BACKLOG = "ORDER_BACKLOG"
+    # A station is out of service for a sim-window (scenario-driven).
+    EQUIPMENT_FAILURE = "EQUIPMENT_FAILURE"
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +278,21 @@ SIGNAL_REGISTRY: Dict[SignalType, Dict[str, Any]] = {
         "groups": ["kitchen", "inventory", "human", "frontend"],
         "priority": 5,
         "default_ttl_sim_s": 86400.0,          # 24h — a failed check stands all day
+    },
+    SignalType.ORDER_BACKLOG: {
+        # Re-emitted with the same dedup_key while the queue stays deep, so the
+        # row refreshes in place (payload + expires_at) rather than duplicating;
+        # once the pass drains, nothing refreshes it and the TTL retires it.
+        "groups": ["kitchen", "forecasting", "human", "frontend"],
+        "priority": 4,
+        "default_ttl_sim_s": 3600.0,           # 1h past the last refresh
+    },
+    SignalType.EQUIPMENT_FAILURE: {
+        # TTL is supplied at emit time as (until_sim - now): the signal *is* the
+        # outage window, so its expiry is what re-opens the station.
+        "groups": ["kitchen", "forecasting", "human", "frontend"],
+        "priority": 5,
+        "default_ttl_sim_s": None,             # caller supplies the window
     },
 }
 
@@ -645,6 +664,33 @@ class IngredientUncoverablePayload(BaseModel):
     reason: str                 # human-readable explanation from the planner
 
 
+class OrderBacklogPayload(BaseModel):
+    """Payload for ORDER_BACKLOG — the kitchen pass is deeper than
+    ``config.BACKLOG_WARN`` (or ``BACKLOG_CRIT``) tickets.
+
+    Emitted with a constant ``dedup_key`` while the queue stays deep, so the one
+    live row's payload tracks the current depth instead of spawning a signal per
+    tick; an unchanged depth is a total no-op (§14.3).
+    """
+    queued_count: int
+    cooking_count: int
+    level: str                  # "warning" | "critical"
+    threshold: int              # the threshold this crossed
+    cooks_present: int
+    avg_ticket_minutes: Optional[float] = None
+
+
+class EquipmentFailurePayload(BaseModel):
+    """Payload for EQUIPMENT_FAILURE — a station is out of service until
+    ``until_sim``. The signal's TTL *is* the outage window: when it expires,
+    ``recompute_availability`` re-enables the station's dishes.
+    """
+    station_id: int
+    station: str
+    until_sim: float
+    label: str                  # what broke, in kitchen language ("fryer")
+
+
 class FoodSafetyCheckPayload(BaseModel):
     """Payload for FOOD_SAFETY_CHECK — a ``temp``/``safety`` kitchen task the
     cook reported not done, or one left pending past its final overdue tier.
@@ -702,4 +748,6 @@ SIGNAL_PAYLOADS: Dict[SignalType, type[BaseModel]] = {
     SignalType.DEMAND_FORECAST_HORIZON: DemandForecastHorizonPayload,
     SignalType.INGREDIENT_UNCOVERABLE: IngredientUncoverablePayload,
     SignalType.FOOD_SAFETY_CHECK: FoodSafetyCheckPayload,
+    SignalType.ORDER_BACKLOG: OrderBacklogPayload,
+    SignalType.EQUIPMENT_FAILURE: EquipmentFailurePayload,
 }

@@ -1,14 +1,17 @@
 """Deterministic menu-item availability resolver.
 
-Computes which menu items must be disabled based on two independent reasons:
+Computes which menu items must be disabled based on three independent reasons:
 
   out_of_stock     — an ingredient used in the recipe is at/below its threshold
   station_unstaffed — the station for this item has no available staff this daypart
+  equipment_down   — the station is out of service for a live EQUIPMENT_FAILURE
+                     window (no Equipment table: the signal *is* the outage)
 
 Keeps the state as ``MenuToggle`` rows with ``reason_code`` set. The invariant:
 
   • MenuItem.active == 1  iff  zero active disable-blocks exist for the item.
-  • Block types: reason_code ∈ {"out_of_stock", "station_unstaffed", "manual"}.
+  • Block types: reason_code ∈ {"out_of_stock", "station_unstaffed",
+    "equipment_down", "manual"}.
   • Auto-disable writes a MenuToggle(action="disable", reason_code=X, active=1)
     and flips MenuItem.active = 0.
   • Auto-enable: only when ALL active blocks (system + manual) are cleared.
@@ -44,9 +47,10 @@ logger = logging.getLogger(__name__)
 # Reason codes (stored in MenuToggle.reason_code)
 RC_OUT_OF_STOCK = "out_of_stock"
 RC_STATION_UNSTAFFED = "station_unstaffed"
+RC_EQUIPMENT_DOWN = "equipment_down"
 RC_MANUAL = "manual"
 
-_SYSTEM_REASON_CODES = {RC_OUT_OF_STOCK, RC_STATION_UNSTAFFED}
+_SYSTEM_REASON_CODES = {RC_OUT_OF_STOCK, RC_STATION_UNSTAFFED, RC_EQUIPMENT_DOWN}
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +144,32 @@ def _staff_available(session: Any, staff_id: int, day: int, daypart: str) -> boo
     return status not in {"leave", "sick"}
 
 
+def _compute_equipment_down_stations(bus: Any, now: float) -> Set[int]:
+    """Station ids with a live EQUIPMENT_FAILURE window (docs/fable/incidents.md).
+
+    There is no ``Equipment`` table by design: the live signal *is* the outage,
+    and its TTL is the window, so a station re-opens when the bus sweeps the
+    signal. ``until_sim`` is re-checked anyway so an un-swept signal cannot hold
+    a station down past its window.
+    """
+    from .signals import SignalType
+    down: Set[int] = set()
+    try:
+        live = bus.live(type=SignalType.EQUIPMENT_FAILURE)
+    except Exception:  # noqa: BLE001 — availability must never break on this
+        logger.warning("equipment-failure lookup failed", exc_info=True)
+        return down
+    for signal in live:
+        payload = signal.payload or {}
+        try:
+            if float(payload.get("until_sim", 0.0)) <= now:
+                continue
+            down.add(int(payload["station_id"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return down
+
+
 def _compute_unstaffed_stations(session: Any, day: int, daypart: str) -> Set[int]:
     """Return all station_ids that have assigned staff but none currently available."""
     from .models import StaffStation, Station
@@ -224,11 +254,17 @@ def recompute_availability(
         station_blocked_items = _items_for_stations(session, unstaffed_station_ids)
 
         # ------------------------------------------------------------------
+        # 2b. Equipment outages: stations down for a scenario-driven window.
+        # ------------------------------------------------------------------
+        equipment_down_station_ids = _compute_equipment_down_stations(bus, now)
+        equipment_blocked_items = _items_for_stations(session, equipment_down_station_ids)
+
+        # ------------------------------------------------------------------
         # 3. Candidate items = items that currently have an auto-block
         #    OR that should now have one.
         # ------------------------------------------------------------------
         candidate_item_ids = (
-            oos_blocked_items | station_blocked_items
+            oos_blocked_items | station_blocked_items | equipment_blocked_items
             | _items_with_active_auto_block(session, MenuToggle)
         )
 
@@ -257,6 +293,17 @@ def recompute_availability(
             elif not should_station and has_station:
                 _clear_block(session, MenuToggle, item_id, RC_STATION_UNSTAFFED)
                 changes.append({"menu_item_id": item_id, "action": "cleared", "reason_code": RC_STATION_UNSTAFFED})
+
+            # Reconcile equipment_down block — cleared once the outage window
+            # ends (the EQUIPMENT_FAILURE signal expires or until_sim passes).
+            should_equipment = item_id in equipment_blocked_items
+            has_equipment = _has_active_block(session, MenuToggle, item_id, RC_EQUIPMENT_DOWN)
+            if should_equipment and not has_equipment:
+                _upsert_block(session, MenuToggle, item_id, RC_EQUIPMENT_DOWN, now, agent_name)
+                changes.append({"menu_item_id": item_id, "action": "disable", "reason_code": RC_EQUIPMENT_DOWN})
+            elif not should_equipment and has_equipment:
+                _clear_block(session, MenuToggle, item_id, RC_EQUIPMENT_DOWN)
+                changes.append({"menu_item_id": item_id, "action": "cleared", "reason_code": RC_EQUIPMENT_DOWN})
 
             # manual blocks are never touched here — they are sticky
 

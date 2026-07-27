@@ -207,6 +207,7 @@ class ScenarioEngine:
             "supplier_change": self._supplier_change,
             "weather_set": self._weather_set,
             "velocity_mult": self._velocity_mult,
+            "equipment_failure": self._equipment_failure,
         }.get(event_type)
         if handler is None:
             logger.warning("Unknown scenario event_type %r; skipping", event_type)
@@ -349,6 +350,68 @@ class ScenarioEngine:
         finally:
             session.close()
         self._log(sim_time, "scenario", f"Staff marked {status}", payload)
+
+    def _equipment_failure(self, payload: Dict[str, Any], sim_time: float) -> None:
+        """Take a station out of service until ``until_sim``.
+
+        Deliberately no ``Equipment`` table (docs/fable/progress.md §3): the live
+        ``EQUIPMENT_FAILURE`` signal *is* the outage and its TTL is the window,
+        so ``recompute_availability`` blocks the station's dishes with
+        ``RC_EQUIPMENT_DOWN`` now and re-enables them once the signal lapses.
+
+        Payload: ``{station | station_id, until_sim | duration_sim_s, label}``.
+        """
+        session = self.db_session_factory()
+        try:
+            station_id = payload.get("station_id")
+            if station_id is None and payload.get("station"):
+                row = (
+                    session.query(Station)
+                    .filter(Station.name.ilike(str(payload["station"])))
+                    .first()
+                )
+                station_id = row.id if row is not None else None
+            station = session.get(Station, int(station_id)) if station_id is not None else None
+            if station is None:
+                logger.warning("equipment_failure: station not found (%s)", payload)
+                return
+            station_id, station_name = int(station.id), str(station.name or station.id)
+        finally:
+            session.close()
+
+        until_sim = payload.get("until_sim")
+        if until_sim is None:
+            # A duration is friendlier to author in a scenario than an absolute
+            # sim-time; default to one sim-hour of downtime.
+            until_sim = sim_time + float(payload.get("duration_sim_s") or 3600.0)
+        until_sim = float(until_sim)
+        if until_sim <= sim_time:
+            logger.warning("equipment_failure: window already over (%s)", payload)
+            return
+
+        label = str(payload.get("label") or f"{station_name} equipment")
+        self.bus.emit(
+            SignalType.EQUIPMENT_FAILURE,
+            {
+                "station_id": station_id,
+                "station": station_name,
+                "until_sim": until_sim,
+                "label": label,
+            },
+            source="scenario_engine",
+            ttl=until_sim - sim_time,
+            dedup_key=f"equipment_down:{station_id}",
+        )
+        # Block the station's dishes immediately rather than waiting for the
+        # next kitchen-engine sweep.
+        try:
+            from .availability import recompute_availability
+            recompute_availability(
+                self.db_session_factory, self.bus, None, agent_name="scenario_equipment",
+            )
+        except Exception:  # noqa: BLE001 — the signal is the source of truth
+            logger.exception("equipment_failure: availability recompute failed")
+        self._log(sim_time, "scenario", f"{label} out of service", payload)
 
     def _supplier_change(self, payload: Dict[str, Any], sim_time: float) -> None:
         """Update the dynamic fields of every ``supplier_catalog`` row for an

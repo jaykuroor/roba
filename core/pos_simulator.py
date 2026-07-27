@@ -16,6 +16,8 @@ import math
 import random
 from typing import Any, Callable, List, Optional, Tuple
 
+from sqlalchemy import func
+
 from . import config
 from .models import MenuItem, Order, OrderLine, SimSettings
 
@@ -413,6 +415,52 @@ class POSSimulator:
         # counts rather than leaving capacity permanently at zero.
         return sum(1 for s in (cooks or staff) if _staff_available(session, int(s.id), day, daypart))
 
+    def _emit_backlog(self, sim_time: float) -> None:
+        """Raise ORDER_BACKLOG while the pass is deeper than BACKLOG_WARN.
+
+        Called *after* :meth:`_drain_tickets` has closed its session — ``emit``
+        dispatches to subscribers synchronously, and doing that under an open
+        write session is how this project has previously wedged the sim clock.
+
+        Re-emitting every tick is deliberate and cheap: one constant dedup_key
+        means an unchanged depth is a no-op and a changed depth refreshes the
+        single live row in place (§14.3). Nothing refreshes it once the queue
+        drains, so the TTL retires the incident on its own.
+        """
+        if self.bus is None:
+            return
+        session = self.db_session_factory()
+        try:
+            counts = dict(
+                session.query(Order.kitchen_status, func.count(Order.id))
+                .filter(Order.kitchen_status.in_(("queued", "cooking")))
+                .group_by(Order.kitchen_status)
+                .all()
+            )
+            queued = int(counts.get("queued", 0))
+            if queued < config.BACKLOG_WARN:
+                return
+            cooking = int(counts.get("cooking", 0))
+            cooks = self._cooks_present(session, sim_time)
+        finally:
+            session.close()
+
+        critical = queued >= config.BACKLOG_CRIT
+        from .signals import SignalType  # noqa: PLC0415
+        self.bus.emit(
+            SignalType.ORDER_BACKLOG,
+            {
+                "queued_count": queued,
+                "cooking_count": cooking,
+                "level": "critical" if critical else "warning",
+                "threshold": config.BACKLOG_CRIT if critical else config.BACKLOG_WARN,
+                "cooks_present": cooks,
+                "avg_ticket_minutes": None,
+            },
+            source="pos_simulator",
+            dedup_key="order_backlog",
+        )
+
     def _drain_tickets(self, sim_time: float, delta_sim: float, mode: str) -> None:
         """Advance kitchen tickets oldest-first at a staffing-dependent rate.
 
@@ -509,6 +557,8 @@ class POSSimulator:
             self._drain_tickets(
                 sim_time, sim_time - previous_sim_time, settings.kitchen_ticket_mode
             )
+            if settings.kitchen_ticket_mode == "lifecycle":
+                self._emit_backlog(sim_time)
 
         # Lazy init: make the first arrival due immediately.
         if self.next_order_due is None:

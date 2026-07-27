@@ -392,7 +392,17 @@ function ActionRow({
       </span>
       <RestaurantLogo id={action.instance_id} title={action.restaurant} size={26} />
       <div className="min-w-0 flex-1">
-        <div className="text-sm font-medium text-text">{action.problem}</div>
+        <div className="flex flex-wrap items-baseline gap-2">
+          <span className="text-sm font-medium text-text">{action.problem}</span>
+          {action.impact_eur != null && (
+            <span
+              className="rounded bg-danger/15 px-1.5 text-[11px] font-semibold text-danger"
+              title="Forecast revenue riding on the affected dishes today"
+            >
+              {fmtMoney(action.impact_eur)} at stake
+            </span>
+          )}
+        </div>
         <div className="text-xs text-text/50">
           {action.impact}
           {action.deadline_sim != null && (

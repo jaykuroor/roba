@@ -37,7 +37,7 @@ from .clock import (
     SimClock,
     get_or_create_sim_state,
 )
-from .models import ScenarioEvent, Signal
+from .models import Signal
 
 logger = logging.getLogger(__name__)
 
@@ -313,8 +313,12 @@ class Orchestrator:
         self._fire_deadline_triggers(now, jumped, window_start)
         # (5) sweep expired signals.
         self.bus.sweep(now)
-        # (6) fire due scenario events.
-        self._fire_scenario_events(now, jumped, window_start)
+        # (6) scenario events are owned entirely by ScenarioEngine.tick, which
+        #     runs as a registered interval trigger in (3). The orchestrator
+        #     used to *also* consume them here — with no is_active filter and no
+        #     dispatch — which burned the events of inactive scenarios as sim
+        #     time passed them, so activating a seeded scenario later fired
+        #     nothing. Two owners of `fired`, one of which never acted.
 
         # (8) assemble WS events: sim_tick first, then any signals emitted by
         #     the handlers above (queued on the bus), drained here.
@@ -379,27 +383,6 @@ class Orchestrator:
                 continue
             self._safe_call(t)
             t.fired = True
-
-    def _fire_scenario_events(
-        self, now: float, jumped: bool, window_start: Optional[float]
-    ) -> None:
-        session = self.db_session_factory()
-        try:
-            due = (
-                session.query(ScenarioEvent)
-                .filter(ScenarioEvent.fired == 0, ScenarioEvent.at_sim_time <= now)
-                .order_by(ScenarioEvent.at_sim_time.asc())
-                .all()
-            )
-            for ev in due:
-                # Scenario events inside the skipped closed window stay pending
-                # so they take effect on the next operating tick.
-                if self._in_closed_window(ev.at_sim_time, jumped, window_start, now):
-                    continue
-                ev.fired = 1
-            session.commit()
-        finally:
-            session.close()
 
     def _safe_call(self, trigger: Trigger) -> None:
         """Invoke a trigger's callback, isolating failures so one bad trigger

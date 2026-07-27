@@ -139,6 +139,51 @@ def derive_status(
     return "normal"
 
 
+def revenue_at_stake(
+    snapshot: Optional[Dict[str, Any]], dish_names: Optional[List[str]]
+) -> Optional[float]:
+    """Forecast revenue riding on ``dish_names`` today, or None if unknowable.
+
+    ``revenue_estimate`` (forecast qty × price) is already per-dish on the
+    snapshot, so pricing a blocked station is a lookup, not a model. Returns
+    None rather than 0.0 when nothing can be attributed — an unpriced row shows
+    no chip, which is honest; €0.00 would read as "this costs nothing".
+    """
+    if not dish_names:
+        return None
+    by_dish = {
+        str(d.get("name")): float(d.get("revenue_estimate") or 0.0)
+        for d in (snapshot or {}).get("dishes") or []
+    }
+    known = [by_dish[n] for n in dish_names if n in by_dish]
+    return round(sum(known), 2) if known else None
+
+
+def stock_deadlines(plan_items: Optional[List[Dict[str, Any]]]) -> Dict[str, float]:
+    """``{ingredient_name: order-by sim-time}`` from the procurement plan.
+
+    ``order_date`` is the actionable deadline (place it by then);
+    ``latest_safe_arrival`` is the fallback. Earliest wins per ingredient — the
+    plan can carry several orders for one ingredient and the manager needs the
+    next one.
+    """
+    deadlines: Dict[str, float] = {}
+    for item in plan_items or []:
+        name = item.get("ingredient_name")
+        due = item.get("order_date")
+        if due is None:
+            due = item.get("latest_safe_arrival")
+        if not name or due is None:
+            continue
+        try:
+            due = float(due)
+        except (TypeError, ValueError):
+            continue
+        if name not in deadlines or due < deadlines[name]:
+            deadlines[name] = due
+    return deadlines
+
+
 def build_issues(
     instance_id: str,
     title: str,
@@ -146,10 +191,12 @@ def build_issues(
     snapshot: Optional[Dict[str, Any]],
     warnings: List[Dict[str, Any]],
     pending_approvals: List[Dict[str, Any]],
+    plan_items: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Priority-action-queue entries for one restaurant (unranked)."""
     issues: List[Dict[str, Any]] = []
     snapshot = snapshot or {}
+    deadlines = stock_deadlines(plan_items)
 
     for a in pending_approvals:
         severity = URGENCY_TO_SEVERITY.get(str(a.get("urgency")), "medium")
@@ -172,6 +219,7 @@ def build_issues(
                 if approval_kind == "notice"
                 else "Approve if the numbers look right — Roba proposed this."
             ),
+            "impact_eur": None,
             "approval_id": a.get("id"),
         })
 
@@ -183,9 +231,10 @@ def build_issues(
             "problem": f"Cannot source {w.get('ingredient_name') or 'ingredient'} "
                        f"(short {w.get('short_qty', 0):g} {w.get('unit', '')})".strip(),
             "severity": "critical",
-            "deadline_sim": None,
+            "deadline_sim": deadlines.get(w.get("ingredient_name")),
             "impact": w.get("reason") or "Dishes using this ingredient will 86.",
             "recommended_action": "Open the restaurant → Procurement; onboard or call a supplier.",
+            "impact_eur": None,
             "approval_id": None,
         })
 
@@ -198,9 +247,10 @@ def build_issues(
             "problem": f"{s.get('ingredient', '?')} {'depleted' if depleted else 'below safety stock'} "
                        f"({s.get('on_hand_display', s.get('on_hand'))})",
             "severity": "high" if depleted else "medium",
-            "deadline_sim": None,
+            "deadline_sim": deadlines.get(s.get("ingredient")),
             "impact": "Menu items using it may be disabled." if depleted else "Stockout risk if demand holds.",
             "recommended_action": "Check the procurement plan covers it; expedite if not.",
+            "impact_eur": None,
             "approval_id": None,
         })
 
@@ -215,6 +265,7 @@ def build_issues(
                 "deadline_sim": None,
                 "impact": f"Dishes blocked: {', '.join(st.get('dishes') or []) or 'unknown'}",
                 "recommended_action": "Reassign a qualified cook or disable the dishes.",
+                "impact_eur": revenue_at_stake(snapshot, st.get("dishes")),
                 "approval_id": None,
             })
 
@@ -232,6 +283,7 @@ def build_issues(
                 else f"{check.get('overdue_min', 0)} min past due and still not done."
             ),
             "recommended_action": "Get the check done and logged now — HACCP records cannot be back-filled.",
+            "impact_eur": None,
             "approval_id": None,
         })
 
@@ -246,6 +298,7 @@ def build_issues(
                 "deadline_sim": None,
                 "impact": f"At risk: {', '.join(member['sole_cover_dishes_at_risk'])}",
                 "recommended_action": "Find cover or 86 the affected dishes for today.",
+                "impact_eur": revenue_at_stake(snapshot, member["sole_cover_dishes_at_risk"]),
                 "approval_id": None,
             })
 
@@ -260,9 +313,11 @@ def rank_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ))
 
 
-# Incident categories (docs/fable/incidents.md). equipment_failure and
-# order_backlog have no detector yet — documented, returned as unavailable.
+# Incident categories (docs/fable/incidents.md). Every category now has a
+# detector, so `unavailable_categories` is empty.
 SIGNAL_TO_INCIDENT = {
+    "ORDER_BACKLOG": "order_backlog",
+    "EQUIPMENT_FAILURE": "equipment_failure",
     "STAFF_AVAILABILITY": "staff_no_show",
     "STAFF_COVERAGE": "staff_no_show",
     "STOCKOUT_RISK": "stockout",
@@ -287,6 +342,12 @@ _DELAY_PHRASES = {
 # Food-safety checks stay one row per check rather than batching into a
 # {names} list: the *reason* a fridge log was skipped is the whole point, and
 # merging two different HACCP failures into one sentence would lose it.
+_BACKLOG_PHRASES = {
+    "critical": "{queued} tickets are backed up on the pass with {cooks} — guests are "
+                "waiting and orders will start walking.",
+    "warning": "{queued} tickets waiting on the pass with {cooks} — the kitchen is "
+               "falling behind.",
+}
 _SAFETY_PHRASES = {
     "not_done": "{title} — the kitchen reported this not done{reason}.",
     "overdue": "{title} — still not done {overdue_min} min past due; a food-safety "
@@ -333,6 +394,30 @@ def merge_incidents(
         payload = s.get("payload") or {}
         if sig_type in _GROUP_PHRASES:
             grouped.setdefault(sig_type, []).append(s)
+        elif sig_type == "ORDER_BACKLOG":
+            cooks = payload.get("cooks_present")
+            rows.append({
+                "category": category, "signal_type": sig_type,
+                "summary": _BACKLOG_PHRASES[
+                    "critical" if payload.get("level") == "critical" else "warning"
+                ].format(
+                    queued=payload.get("queued_count") or 0,
+                    cooks=("nobody cooking" if not cooks
+                           else "1 cook working" if cooks == 1
+                           else f"{cooks} cooks working"),
+                ),
+                "count": 1, "names": [], "created_at": s.get("created_at"),
+            })
+        elif sig_type == "EQUIPMENT_FAILURE":
+            rows.append({
+                "category": category, "signal_type": sig_type,
+                "summary": (
+                    f"{payload.get('label') or 'Equipment'} is out of service — the "
+                    f"{payload.get('station') or 'station'} station's dishes are off "
+                    f"the menu until it is back."
+                ),
+                "count": 1, "names": [], "created_at": s.get("created_at"),
+            })
         elif sig_type == "FOOD_SAFETY_CHECK":
             note = str(payload.get("note") or "").strip()
             rows.append({
@@ -639,11 +724,15 @@ async def _instance_overview(inst: Dict[str, Any]) -> Dict[str, Any]:
         }
     sim_time = float((health.get("sim") or {}).get("sim_time") or 0.0)
     day_start = (sim_time // SECONDS_PER_DAY) * SECONDS_PER_DAY
-    snapshot, stats, approvals, warnings = await asyncio.gather(
+    snapshot, stats, approvals, warnings, plan = await asyncio.gather(
         _get(inst, "/api/ops/snapshot"),
         _get(inst, f"/api/pos/stats?since={day_start}&window=day"),
         _get(inst, "/api/approvals?status=pending"),
         _get(inst, "/api/track-b/procurement/warnings"),
+        # Only for the order-by deadlines on stock rows — the plan is already
+        # fetched per-instance by /admin/api/incidents, so this is one more
+        # parallel read, not a new round trip.
+        _get(inst, "/api/track-b/procurement/plan"),
     )
     approvals = approvals or []
     warnings = warnings or []
@@ -653,7 +742,8 @@ async def _instance_overview(inst: Dict[str, Any]) -> Dict[str, Any]:
     status = derive_status(online=True, snapshot=snapshot, warnings=warnings,
                            pending_approvals=approvals)
     issues = build_issues(inst["id"], inst["title"], snapshot=snapshot,
-                          warnings=warnings, pending_approvals=approvals)
+                          warnings=warnings, pending_approvals=approvals,
+                          plan_items=(plan or {}).get("items") or [])
     return {
         **inst,
         "online": True,
@@ -746,8 +836,9 @@ async def incidents() -> Dict[str, Any]:
     rows.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
     return {
         "incidents": rows,
-        # Explicitly unavailable so the UI can label them honestly.
-        "unavailable_categories": ["equipment_failure", "order_backlog"],
+        # Every category has a detector now (Phase 3) — kept in the response so
+        # the UI contract is stable and a future gap can be declared again.
+        "unavailable_categories": [],
     }
 
 

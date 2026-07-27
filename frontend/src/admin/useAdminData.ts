@@ -51,6 +51,8 @@ export interface ActionItem {
   severity: "critical" | "high" | "medium" | "low";
   deadline_sim: number | null;
   impact: string;
+  /** Forecast revenue at stake today; null when it cannot be attributed. */
+  impact_eur: number | null;
   recommended_action: string;
   approval_id: number | null;
 }

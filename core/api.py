@@ -249,6 +249,18 @@ def _kitchen_engine_tick() -> None:
     finally:
         session.close()
 
+    # Availability has no other periodic caller — every other call site is
+    # event-driven (a spoilage report, an attendance change, a delivery). An
+    # equipment outage ends on the *clock*, so without this sweep the station's
+    # dishes stay blocked until some unrelated event happens to recompute.
+    try:
+        from .availability import recompute_availability
+        recompute_availability(
+            db.new_session, ctx.bus, ctx.hub.broadcast, agent_name="kitchen_engine",
+        )
+    except Exception:  # noqa: BLE001 - never stall the sim on a recompute
+        logger.exception("kitchen_engine availability recompute failed")
+
 
 def _bootstrap() -> None:
     """Create tables + singletons and wire every core object (§ app bootstrap)."""

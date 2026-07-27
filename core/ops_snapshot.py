@@ -218,6 +218,7 @@ def build_ops_snapshot(
         _reason_labels = {
             "out_of_stock": "out of stock",
             "station_unstaffed": "station unstaffed",
+            "equipment_down": "equipment down",
             "manual": "manually disabled",
         }
         item_disable_reasons: Dict[int, str] = {}

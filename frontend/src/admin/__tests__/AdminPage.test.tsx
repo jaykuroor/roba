@@ -4,9 +4,9 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { InstanceCard } from "../useAdminData";
+import type { ActionItem, InstanceCard } from "../useAdminData";
 
-const overview: { instances: InstanceCard[]; actions: [] } = {
+const overview: { instances: InstanceCard[]; actions: ActionItem[] } = {
   instances: [],
   actions: [],
 };
@@ -114,5 +114,49 @@ describe("restaurant card — task compliance", () => {
   it("says nothing before anything is due", async () => {
     await renderCard({ task_compliance: { ...counts, accountable: 0, rate: null } });
     expect(screen.queryByText(/on time/)).not.toBeInTheDocument();
+  });
+});
+
+
+function action(overrides: Partial<ActionItem> = {}): ActionItem {
+  return {
+    instance_id: "running_fox",
+    restaurant: "Bella's",
+    kind: "staff",
+    problem: "Station Grill unstaffed",
+    severity: "high",
+    deadline_sim: null,
+    impact: "Dishes blocked: Burger, Fries",
+    impact_eur: null,
+    recommended_action: "Reassign a qualified cook or disable the dishes.",
+    approval_id: null,
+    ...overrides,
+  };
+}
+
+describe("priority queue — € at stake", () => {
+  async function renderActions(rows: ActionItem[]) {
+    overview.instances = [card()];
+    overview.actions = rows;
+    render(<AdminPage />);
+    await waitFor(() => expect(screen.getByText(rows[0].problem)).toBeInTheDocument());
+  }
+
+  it("shows the revenue at stake when the row can be priced", async () => {
+    await renderActions([action({ impact_eur: 165 })]);
+    expect(screen.getByText("€165.00 at stake")).toBeInTheDocument();
+  });
+
+  it("shows no chip when the impact cannot be attributed", async () => {
+    await renderActions([action({ impact_eur: null })]);
+    expect(screen.queryByText(/at stake/)).not.toBeInTheDocument();
+  });
+
+  it("shows an order-by deadline on stock rows", async () => {
+    await renderActions([
+      action({ kind: "stock", problem: "Tomato below safety stock (200 g)",
+               deadline_sim: 3000, impact_eur: null }),
+    ]);
+    expect(screen.getByText(/deadline Day 0 00:50/)).toBeInTheDocument();
   });
 });

@@ -325,3 +325,135 @@ def test_offline_card_reports_no_ticket_numbers(monkeypatch):
         "/api/approvals": [], "/api/track-b/procurement/warnings": [],
     })
     assert set(card) - {"note", "sim"} <= set(online)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — the last two incident categories + priority-queue enrichment
+# ---------------------------------------------------------------------------
+
+def test_merge_incidents_phrases_backlog_and_equipment():
+    signals = [
+        {"type": "ORDER_BACKLOG", "created_at": 40.0, "payload": {
+            "queued_count": 24, "cooking_count": 1, "level": "critical",
+            "threshold": 20, "cooks_present": 0}},
+        {"type": "EQUIPMENT_FAILURE", "created_at": 41.0, "payload": {
+            "station_id": 1, "station": "Grill", "until_sim": 50000.0,
+            "label": "flat-top grill"}},
+    ]
+    rows = manager.merge_incidents(signals, [], {})
+
+    backlog = next(r for r in rows if r["category"] == "order_backlog")
+    assert "24 tickets" in backlog["summary"]
+    assert "nobody cooking" in backlog["summary"]
+
+    equipment = next(r for r in rows if r["category"] == "equipment_failure")
+    assert "flat-top grill is out of service" in equipment["summary"]
+    assert "Grill station" in equipment["summary"]
+
+    # No raw payload keys or status codes reach the manager.
+    for row in (backlog, equipment):
+        for leak in ("queued_count", "until_sim", "critical", "level"):
+            assert leak not in row["summary"], row["summary"]
+
+
+def test_backlog_phrasing_counts_cooks_in_english():
+    def summary(cooks):
+        rows = manager.merge_incidents([{
+            "type": "ORDER_BACKLOG", "created_at": 1.0,
+            "payload": {"queued_count": 9, "cooking_count": 1, "level": "warning",
+                        "threshold": 8, "cooks_present": cooks},
+        }], [], {})
+        return rows[0]["summary"]
+
+    assert "nobody cooking" in summary(0)
+    assert "1 cook working" in summary(1)
+    assert "3 cooks working" in summary(3)
+
+
+def test_revenue_at_stake_prices_only_what_it_can_attribute():
+    snapshot = {"dishes": [
+        {"name": "Burger", "revenue_estimate": 120.0},
+        {"name": "Salad", "revenue_estimate": 30.5},
+    ]}
+    assert manager.revenue_at_stake(snapshot, ["Burger", "Salad"]) == 150.5
+    assert manager.revenue_at_stake(snapshot, ["Burger"]) == 120.0
+    # Unknown dishes are not worth €0 — they are unknown, so no chip is shown.
+    assert manager.revenue_at_stake(snapshot, ["Risotto"]) is None
+    assert manager.revenue_at_stake(snapshot, []) is None
+    assert manager.revenue_at_stake({}, ["Burger"]) is None
+
+
+def test_stock_deadlines_take_the_earliest_order_by_per_ingredient():
+    items = [
+        {"ingredient_name": "Tomato", "order_date": 5000.0},
+        {"ingredient_name": "Tomato", "order_date": 3000.0},   # earlier wins
+        {"ingredient_name": "Basil", "order_date": None, "latest_safe_arrival": 9000.0},
+        {"ingredient_name": "Flour"},                          # no date at all
+        {"order_date": 1.0},                                   # no name
+    ]
+    assert manager.stock_deadlines(items) == {"Tomato": 3000.0, "Basil": 9000.0}
+    assert manager.stock_deadlines(None) == {}
+
+
+def test_build_issues_prices_blocked_dishes_and_dates_stock_rows():
+    snapshot = {
+        "dishes": [
+            {"name": "Burger", "revenue_estimate": 120.0},
+            {"name": "Fries", "revenue_estimate": 45.0},
+            {"name": "Risotto", "revenue_estimate": 80.0},
+        ],
+        "stations": [{"station": "Grill", "covered": False, "dishes": ["Burger", "Fries"]}],
+        "staff": [{"name": "Marco", "status": "sick", "sole_cover_dishes_at_risk": ["Risotto"]}],
+        "low_stock_ingredients": [
+            {"ingredient": "Tomato", "status": "below_safety_stock", "on_hand_display": "200 g"},
+        ],
+    }
+    plan_items = [{"ingredient_name": "Tomato", "order_date": 3000.0}]
+
+    issues = manager.build_issues("running_fox", "Bella's", snapshot=snapshot,
+                                  warnings=[], pending_approvals=[], plan_items=plan_items)
+
+    station = next(i for i in issues if "Grill" in i["problem"])
+    assert station["impact_eur"] == 165.0          # 120 + 45
+
+    sole_cover = next(i for i in issues if "Marco" in i["problem"])
+    assert sole_cover["impact_eur"] == 80.0
+
+    stock = next(i for i in issues if "Tomato" in i["problem"])
+    assert stock["deadline_sim"] == 3000.0
+    assert stock["impact_eur"] is None             # not attributable to dishes
+
+    # Every row carries the key so the UI never reads undefined.
+    assert all("impact_eur" in i for i in issues)
+
+
+def test_build_issues_without_a_plan_still_works():
+    """The plan fan-out can fail — stock rows just lose their deadline."""
+    snapshot = {"low_stock_ingredients": [
+        {"ingredient": "Tomato", "status": "depleted", "on_hand_display": "0 g"},
+    ]}
+    issues = manager.build_issues("running_fox", "Bella's", snapshot=snapshot,
+                                  warnings=[], pending_approvals=[])
+    assert issues[0]["deadline_sim"] is None
+
+
+def test_incidents_endpoint_declares_no_unavailable_categories(monkeypatch):
+    """The Phase 3 'done when': every category has a detector."""
+    async def fake_get(_inst, path):
+        if path.startswith("/api/signals"):
+            return [{"type": "ORDER_BACKLOG", "created_at": 1.0, "payload": {
+                "queued_count": 24, "cooking_count": 0, "level": "critical",
+                "threshold": 20, "cooks_present": 0}}]
+        if path.startswith("/api/track-b/procurement/plan"):
+            return {"items": []}
+        return []
+
+    monkeypatch.setattr(manager, "_get", fake_get)
+    monkeypatch.setattr(manager.registry, "instances", {
+        "running_fox": {"id": "running_fox", "title": "Bella's"},
+    })
+    result = asyncio.run(manager.incidents())
+
+    assert result["unavailable_categories"] == []
+    assert [r["category"] for r in result["incidents"]] == ["order_backlog"]
+    assert result["incidents"][0]["restaurant"] == "Bella's"

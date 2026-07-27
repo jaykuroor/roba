@@ -82,8 +82,8 @@ def test_tick_jumps_over_closed_hours_and_skips_window(system):
     )
     interval_trigger.next_due = 82810.0
 
-    # Scenario events: one before close (fires), one inside the window (stays
-    # pending so it takes effect on the next operating tick).
+    # Scenario events straddling the jump — the orchestrator must leave both
+    # alone (see the ownership assertion below).
     ev_before = _add_scenario_event(session_factory, 82799.0)
     ev_in_window = _add_scenario_event(session_factory, 82850.0)
 
@@ -111,10 +111,15 @@ def test_tick_jumps_over_closed_hours_and_skips_window(system):
     # The interval trigger's schedule rolled forward past the skipped window.
     assert interval_trigger.next_due > 115200.0
 
-    # Scenario events: before-close fired (consumed), in-window still pending.
+    # Scenario events belong to ScenarioEngine.tick (a registered interval
+    # trigger), which filters to *active* scenarios and actually dispatches.
+    # The orchestrator must not consume them: it used to mark them fired with
+    # no is_active filter and no dispatch, so a seeded-but-inactive scenario
+    # burned its events as sim time passed them and activating it later fired
+    # nothing at all.
     session = session_factory()
     try:
-        assert session.get(ScenarioEvent, ev_before).fired == 1
+        assert session.get(ScenarioEvent, ev_before).fired == 0
         assert session.get(ScenarioEvent, ev_in_window).fired == 0
     finally:
         session.close()
