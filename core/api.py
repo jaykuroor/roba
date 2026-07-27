@@ -218,6 +218,9 @@ def _migrate_schema() -> None:
         ("kitchen_tasks", "severity", "ALTER TABLE kitchen_tasks ADD COLUMN severity TEXT"),
         ("sim_settings", "auto_plan_on_forecast", "ALTER TABLE sim_settings ADD COLUMN auto_plan_on_forecast INTEGER DEFAULT 1"),
         ("supplier_terms", "max_discount_amount", "ALTER TABLE supplier_terms ADD COLUMN max_discount_amount REAL"),
+        ("orders", "kitchen_status", "ALTER TABLE orders ADD COLUMN kitchen_status TEXT DEFAULT 'served'"),
+        ("orders", "served_at", "ALTER TABLE orders ADD COLUMN served_at REAL"),
+        ("sim_settings", "kitchen_ticket_mode", "ALTER TABLE sim_settings ADD COLUMN kitchen_ticket_mode TEXT DEFAULT 'lifecycle'"),
     ]
     with db.engine.connect() as conn:
         for table, column, ddl in migrations:
@@ -572,12 +575,20 @@ class PosBody(BaseModel):
     availability_oos_mode: Optional[str] = None  # "threshold" | "zero"
     batch_auto_qty: Optional[bool] = None  # forecaster adjusts batch quantities without manager approval
     auto_plan_on_forecast: Optional[bool] = None  # every forecast triggers procurement plan + due orders
+    kitchen_ticket_mode: Optional[str] = None  # "lifecycle" | "instant"
 
     @field_validator("availability_oos_mode")
     @classmethod
     def _validate_oos_mode(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and v not in ("threshold", "zero"):
             raise ValueError("availability_oos_mode must be 'threshold' or 'zero'")
+        return v
+
+    @field_validator("kitchen_ticket_mode")
+    @classmethod
+    def _validate_ticket_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("lifecycle", "instant"):
+            raise ValueError("kitchen_ticket_mode must be 'lifecycle' or 'instant'")
         return v
 
 

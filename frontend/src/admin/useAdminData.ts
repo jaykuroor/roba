@@ -23,9 +23,10 @@ export interface InstanceCard {
   absent: string[];
   stock_risks: { ingredient?: string; status?: string; on_hand_display?: string }[];
   pending_approvals: number;
-  orders_waiting: null; // not implemented — docs/fable/portfolio-overview.md
-  ticket_time_min: null;
-  safety_issues: null;
+  /** Kitchen tickets still queued, and the last sim-hour's average ticket time. */
+  orders_waiting: number | null;
+  ticket_time_min: number | null;
+  safety_issues: null; // not implemented — docs/fable/progress.md Phase 2
   issues: ActionItem[];
 }
 

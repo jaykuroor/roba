@@ -46,6 +46,11 @@ const STATUS_BORDER: Record<string, string> = {
   offline: "border-l-muted",
 };
 
+// Mirrors core.config.BACKLOG_WARN / BACKLOG_CRIT (and manager.py's copy) — the
+// card colours the backlog at the same points derive_status changes status.
+const BACKLOG_WARN = 8;
+const BACKLOG_CRIT = 20;
+
 const SEVERITY_STYLE: Record<string, string> = {
   critical: "bg-danger text-white",
   high: "bg-amber-500 text-white",
@@ -104,6 +109,19 @@ function SalesVsForecast({ card }: { card: InstanceCard }) {
   );
 }
 
+/** Kitchen tickets still waiting, with the last sim-hour's average ticket time. */
+function TicketBacklog({ card }: { card: InstanceCard }) {
+  if (card.orders_waiting == null) return <span className="text-text/40">—</span>;
+  return (
+    <span className="flex items-baseline gap-1.5">
+      {card.orders_waiting}
+      {card.ticket_time_min != null && (
+        <span className="text-xs text-text/40">{card.ticket_time_min}m avg</span>
+      )}
+    </span>
+  );
+}
+
 function RestaurantCard({
   card,
   onChanged,
@@ -150,6 +168,10 @@ function RestaurantCard({
     }
   }
 
+  const backlog = card.orders_waiting ?? 0;
+  const ticketAccent =
+    backlog >= BACKLOG_CRIT ? "text-danger" : backlog >= BACKLOG_WARN ? "text-amber-400" : undefined;
+
   const issueBadges = [
     card.pending_approvals > 0 && {
       label: `${card.pending_approvals} approval${card.pending_approvals > 1 ? "s" : ""}`,
@@ -190,7 +212,7 @@ function RestaurantCard({
         </a>
       </div>
 
-      <div className="mt-3 grid grid-cols-3 gap-x-4 gap-y-2">
+      <div className="mt-3 grid grid-cols-4 gap-x-4 gap-y-2">
         <Metric label="Sales today" value={<SalesVsForecast card={card} />} />
         <Metric label="Orders" value={card.orders_today ?? "—"} />
         <Metric
@@ -200,6 +222,7 @@ function RestaurantCard({
           }
           accent={card.absent.length ? "text-amber-400" : undefined}
         />
+        <Metric label="Tickets" value={<TicketBacklog card={card} />} accent={ticketAccent} />
       </div>
 
       {issueBadges.length > 0 && (

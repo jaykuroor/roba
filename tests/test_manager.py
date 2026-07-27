@@ -1,8 +1,12 @@
-"""Pure-logic tests for the multi-restaurant manager (manager.py).
+"""Tests for the multi-restaurant manager (manager.py).
 
 No processes are spawned — these cover the derivation logic the dashboard
-depends on: instance ids, status rules, issue building, and ranking.
+depends on (instance ids, status rules, issue building, ranking) plus the card
+fan-out, which is exercised by stubbing ``manager._get`` rather than talking to
+a real child.
 """
+import asyncio
+
 import manager
 
 
@@ -45,6 +49,27 @@ def test_derive_status_levels():
     # pending approvals → warning, critical-urgency approval → critical
     assert manager.derive_status(online=True, snapshot=healthy, warnings=[], pending_approvals=[{"urgency": "normal"}]) == "warning"
     assert manager.derive_status(online=True, snapshot=healthy, warnings=[], pending_approvals=[{"urgency": "uncoverable"}]) == "critical"
+
+
+def test_derive_status_kitchen_backlog():
+    """A growing pass is a manager-visible problem (docs/fable/progress.md Phase 1)."""
+    healthy = {"low_stock_ingredients": [], "stations": [{"covered": True}],
+               "staff": [{"status": "present"}]}
+
+    def at(backlog):
+        return manager.derive_status(
+            online=True, snapshot={**healthy, "queued_count": backlog},
+            warnings=[], pending_approvals=[],
+        )
+
+    assert at(0) == "normal"
+    assert at(manager.BACKLOG_WARN - 1) == "normal"
+    assert at(manager.BACKLOG_WARN) == "warning"
+    assert at(manager.BACKLOG_CRIT - 1) == "warning"
+    assert at(manager.BACKLOG_CRIT) == "critical"
+    # A snapshot from before the lifecycle existed has no queued_count at all.
+    assert manager.derive_status(online=True, snapshot=healthy, warnings=[],
+                                 pending_approvals=[]) == "normal"
 
 
 def test_build_issues_and_ranking():
@@ -154,3 +179,56 @@ def test_build_issues_notice_kind_changes_recommendation():
     assert "Acknowledge" in notice["recommended_action"]
     assert decision["approval_kind"] == "decision"
     assert "Approve" in decision["recommended_action"]
+
+
+# ---------------------------------------------------------------------------
+# Card fan-out
+#
+# The pattern for every later phase: stub ``manager._get`` with the child
+# responses the card is assembled from, and call ``_instance_overview``
+# directly. No child process, no HTTP, no registry.
+# ---------------------------------------------------------------------------
+
+def _overview(monkeypatch, responses):
+    async def fake_get(_inst, path):
+        for prefix, payload in responses.items():
+            if path.startswith(prefix):
+                return payload
+        return None
+
+    monkeypatch.setattr(manager, "_get", fake_get)
+    return asyncio.run(manager._instance_overview(
+        {"id": "running_fox", "title": "Bella's", "preset": "bellas_kitchen", "port": 8101}
+    ))
+
+
+def test_instance_overview_reports_tickets_from_the_snapshot(monkeypatch):
+    card = _overview(monkeypatch, {
+        "/api/health": {"sim": {"sim_time": 30000.0, "day_number": 0}},
+        "/api/ops/snapshot": {
+            "staff": [{"name": "Luca", "status": "present"}],
+            "dishes": [], "stations": [], "low_stock_ingredients": [],
+            "queued_count": 11, "cooking_count": 1, "avg_ticket_minutes": 7.5,
+        },
+        "/api/pos/stats": {"revenue": 120.0, "orders": 9},
+        "/api/approvals": [],
+        "/api/track-b/procurement/warnings": [],
+    })
+    assert card["orders_waiting"] == 11
+    assert card["ticket_time_min"] == 7.5
+    assert card["status"] == "warning"  # 11 ≥ BACKLOG_WARN
+
+
+def test_offline_card_reports_no_ticket_numbers(monkeypatch):
+    """An offline card must not show the last numbers it saw."""
+    monkeypatch.setattr(manager.registry, "instances", {})
+    card = _overview(monkeypatch, {})
+    assert card["online"] is False
+    assert card["orders_waiting"] is None and card["ticket_time_min"] is None
+    # Every card key the UI reads exists on both branches.
+    online = _overview(monkeypatch, {
+        "/api/health": {"sim": {"sim_time": 0.0}},
+        "/api/ops/snapshot": {}, "/api/pos/stats": {},
+        "/api/approvals": [], "/api/track-b/procurement/warnings": [],
+    })
+    assert set(card) - {"note", "sim"} <= set(online)

@@ -25,6 +25,9 @@ WINDOW_SECONDS = 54000.0
 # Catch up under high simulation speeds without letting one tick flood the DB.
 MAX_ORDERS_PER_TICK = 25
 ZERO_RATE_RETRY_SIM_S = 15.0
+# Substrings that mark a ``Staff.role`` as kitchen labour for the ticket drain
+# (seeds use cook / line_cook / fry_cook / grill_chef / head_chef).
+COOK_ROLE_HINTS = ("cook", "chef")
 
 
 def _hhmm_to_seconds(hhmm: str) -> int:
@@ -108,6 +111,10 @@ class _Settings:
         self.daypart_curve: dict = (
             (row.daypart_curve if row is not None else None) or {}
         )
+        # "lifecycle" (default) runs the queued → cooking → served drain;
+        # "instant" is the historical behaviour — every order is born served.
+        mode = getattr(row, "kitchen_ticket_mode", None) if row is not None else None
+        self.kitchen_ticket_mode: str = mode if mode in ("lifecycle", "instant") else "lifecycle"
 
 
 class POSSimulator:
@@ -139,6 +146,10 @@ class POSSimulator:
         # Sim-time of the previous tick, used to detect a backward clock jump
         # (stop / restart rewind sim_time) and restart the arrival schedule.
         self._last_tick_sim_time: Optional[float] = None
+        # Fractional kitchen-drain capacity carried between ticks: at 1× a tick
+        # is 15 sim-s, which buys well under one ticket, so whole tickets only
+        # come due once enough ticks have accumulated.
+        self._drain_credit: float = 0.0
 
     # -- formatter wiring ---------------------------------------------------
 
@@ -345,6 +356,10 @@ class POSSimulator:
                 )
             )
 
+        # Kitchen ticket lifecycle: in "lifecycle" mode the order joins the pass
+        # and is drained by :meth:`_drain_tickets`; in "instant" mode it is born
+        # served (the pre-lifecycle behaviour).
+        lifecycle = settings.kitchen_ticket_mode == "lifecycle"
         order = Order(
             sim_time=sim_time,
             service_mode=channel,
@@ -354,6 +369,8 @@ class POSSimulator:
             status="closed",
             channel=channel,
             total=order_total,
+            kitchen_status="queued" if lifecycle else "served",
+            served_at=None if lifecycle else sim_time,
         )
         return order, lines
 
@@ -375,6 +392,96 @@ class POSSimulator:
         finally:
             session.close()
 
+    # -- kitchen ticket lifecycle -------------------------------------------
+
+    def _cooks_present(self, session: Any, sim_time: float) -> int:
+        """Number of kitchen staff on shift right now.
+
+        Presence comes from :func:`core.availability._staff_available` (the same
+        attendance rules that unstaff a station), so a sick cook slows the pass
+        and blocks their station consistently.
+        """
+        from .availability import _staff_available  # noqa: PLC0415 (circular at import time)
+        from .models import Staff  # noqa: PLC0415
+        from track_a.agents.forecaster import current_daypart  # noqa: PLC0415
+
+        day = int(sim_time // 86400)
+        daypart = current_daypart(sim_time)
+        staff = session.query(Staff).filter(Staff.active == 1).all()
+        cooks = [s for s in staff if any(h in str(s.role or "").lower() for h in COOK_ROLE_HINTS)]
+        # A preset with no cook-ish role names still has a kitchen — everybody
+        # counts rather than leaving capacity permanently at zero.
+        return sum(1 for s in (cooks or staff) if _staff_available(session, int(s.id), day, daypart))
+
+    def _drain_tickets(self, sim_time: float, delta_sim: float, mode: str) -> None:
+        """Advance kitchen tickets oldest-first at a staffing-dependent rate.
+
+        One unit of capacity serves one ticket already on the pass and pulls one
+        more off the queue, so throughput is exactly
+        ``cooks × KITCHEN_TICKETS_PER_COOK_PER_HOUR`` and every ticket spends one
+        slot ``cooking``. With nobody in the kitchen capacity is zero and the
+        queue simply grows.
+        """
+        session = self.db_session_factory()
+        try:
+            if mode != "lifecycle":
+                # Instant mode: flush whatever the lifecycle left behind, so
+                # flipping the toggle empties the backlog instead of freezing it.
+                open_tickets = (
+                    session.query(Order)
+                    .filter(Order.kitchen_status.in_(("queued", "cooking")))
+                    .all()
+                )
+                for order in open_tickets:
+                    order.kitchen_status = "served"
+                    order.served_at = sim_time
+                if open_tickets:
+                    session.commit()
+                return
+
+            open_tickets = (
+                session.query(Order)
+                .filter(Order.kitchen_status.in_(("queued", "cooking")))
+                .count()
+            )
+            if not open_tickets:
+                # Nothing on the pass: skip the attendance reads, and drop any
+                # part-ticket of credit so a quiet night cannot bank capacity
+                # and instantly clear the next morning's first orders.
+                self._drain_credit = 0.0
+                return
+
+            cooks = self._cooks_present(session, sim_time)
+            credit = self._drain_credit + (
+                cooks
+                * float(config.KITCHEN_TICKETS_PER_COOK_PER_HOUR)
+                * max(delta_sim, 0.0)
+                / 3600.0
+            )
+            capacity = int(credit)
+            self._drain_credit = credit - capacity
+            if capacity <= 0:
+                return
+
+            touched = False
+            for status, nxt in (("cooking", "served"), ("queued", "cooking")):
+                rows = (
+                    session.query(Order)
+                    .filter(Order.kitchen_status == status)
+                    .order_by(Order.sim_time.asc(), Order.id.asc())
+                    .limit(capacity)
+                    .all()
+                )
+                for order in rows:
+                    order.kitchen_status = nxt
+                    if nxt == "served":
+                        order.served_at = sim_time
+                    touched = True
+            if touched:
+                session.commit()
+        finally:
+            session.close()
+
     # -- the tick (§10) -----------------------------------------------------
 
     def tick(self, sim_time: float) -> Optional[Order]:
@@ -388,12 +495,20 @@ class POSSimulator:
         # sim_time to the start of the day). Restart the arrival schedule from
         # the new sim_time so the first order fires immediately rather than
         # waiting for sim_time to climb back to the stale next_order_due.
-        if (
-            self._last_tick_sim_time is not None
-            and sim_time < self._last_tick_sim_time
-        ):
+        previous_sim_time = self._last_tick_sim_time
+        if previous_sim_time is not None and sim_time < previous_sim_time:
             self.next_order_due = sim_time
+            self._drain_credit = 0.0
+            previous_sim_time = None
         self._last_tick_sim_time = sim_time
+
+        settings = self._read_settings()
+        # Drain before generating so an order is never served in the same tick
+        # it arrives. The first tick has no elapsed window to drain over.
+        if previous_sim_time is not None:
+            self._drain_tickets(
+                sim_time, sim_time - previous_sim_time, settings.kitchen_ticket_mode
+            )
 
         # Lazy init: make the first arrival due immediately.
         if self.next_order_due is None:
@@ -407,10 +522,10 @@ class POSSimulator:
 
             due_at = float(self.next_order_due)
             interval_at = due_at
-            interval = self._interval(interval_at)
+            interval = self._interval(interval_at, settings)
             if not math.isfinite(interval) and due_at < sim_time:
                 interval_at = sim_time
-                interval = self._interval(interval_at)
+                interval = self._interval(interval_at, settings)
             if not math.isfinite(interval):
                 self.next_order_due = sim_time + ZERO_RATE_RETRY_SIM_S
                 break

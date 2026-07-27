@@ -50,6 +50,11 @@ PROBE_TIMEOUT_S = 10.0
 STARTUP_TIMEOUT_S = 90.0
 APPROVAL_TTL_SIM_S = 21600.0  # mirrors core.approvals.APPROVAL_TTL_SIM_S
 SECONDS_PER_DAY = 86400.0
+# Kitchen ticket backlog thresholds — mirrors core.config.BACKLOG_WARN /
+# BACKLOG_CRIT (same env vars, so overriding one overrides both; the manager
+# deliberately imports no core module).
+BACKLOG_WARN = int(os.getenv("BACKLOG_WARN", "8"))
+BACKLOG_CRIT = int(os.getenv("BACKLOG_CRIT", "20"))
 
 # ---------------------------------------------------------------------------
 # Instance ids — memorable adjective_animal names (running_fox style)
@@ -109,7 +114,10 @@ def derive_status(
     low_stock = snapshot.get("low_stock_ingredients") or []
     stations = snapshot.get("stations") or []
     staff = snapshot.get("staff") or []
+    backlog = snapshot.get("queued_count") or 0
     if warnings:  # INGREDIENT_UNCOVERABLE — nothing can source the demand
+        return "critical"
+    if backlog >= BACKLOG_CRIT:  # the pass is drowning — guests are waiting
         return "critical"
     if any(s.get("status") == "depleted" for s in low_stock):
         return "critical"
@@ -121,6 +129,8 @@ def derive_status(
     ):
         return "critical"
     if low_stock or pending_approvals:
+        return "warning"
+    if backlog >= BACKLOG_WARN:
         return "warning"
     if any(s.get("status") != "present" for s in staff):
         return "warning"
@@ -581,7 +591,9 @@ async def _instance_overview(inst: Dict[str, Any]) -> Dict[str, Any]:
             "sales_today": None, "forecast_today": None, "orders_today": None,
             "staff_present": None, "staff_total": None, "absent": [],
             "stock_risks": [], "pending_approvals": 0,
-            # Not implemented yet — see docs/fable/portfolio-overview.md.
+            # No snapshot to read them from — an offline card must not report
+            # the last numbers it saw. safety_issues lands in Phase 2
+            # (docs/fable/progress.md).
             "orders_waiting": None, "ticket_time_min": None, "safety_issues": None,
         }
     sim_time = float((health.get("sim") or {}).get("sim_time") or 0.0)
@@ -621,8 +633,10 @@ async def _instance_overview(inst: Dict[str, Any]) -> Dict[str, Any]:
             for w in warnings
         ],
         "pending_approvals": len(approvals),
-        # Not implemented yet — see docs/fable/portfolio-overview.md.
-        "orders_waiting": None, "ticket_time_min": None, "safety_issues": None,
+        "orders_waiting": snapshot.get("queued_count"),
+        "ticket_time_min": snapshot.get("avg_ticket_minutes"),
+        # Phase 2 — see docs/fable/progress.md.
+        "safety_issues": None,
     }
 
 

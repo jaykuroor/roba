@@ -32,12 +32,15 @@ def build_ops_snapshot(
 
     Falls back gracefully if any data source is unavailable.
     """
+    from sqlalchemy import func  # noqa: PLC0415
+
     from .models import (  # noqa: PLC0415
         Attendance,
         Ingredient,
         InventoryLevel,
         MenuItem,
         MenuToggle,
+        Order,
         RecipeLine,
         Recipe,
         Staff,
@@ -216,6 +219,33 @@ def build_ops_snapshot(
                     "status": "depleted" if oh <= 0 else "below_safety_stock",
                 })
 
+        # ------------------------------------------------------------------
+        # 7. Kitchen ticket backlog (docs/fable/portfolio-overview.md)
+        # ------------------------------------------------------------------
+        ticket_counts = dict(
+            session.query(Order.kitchen_status, func.count(Order.id))
+            .filter(Order.kitchen_status.in_(("queued", "cooking")))
+            .group_by(Order.kitchen_status)
+            .all()
+        )
+        # Rolling average over the last sim-hour: recent enough to react to a
+        # cook going home, long enough not to swing on a single ticket.
+        recently_served = (
+            session.query(Order.sim_time, Order.served_at)
+            .filter(Order.served_at.isnot(None), Order.served_at >= now - 3600.0)
+            .all()
+        )
+        avg_ticket_minutes = (
+            round(
+                sum(float(sa) - float(st or 0.0) for st, sa in recently_served)
+                / len(recently_served)
+                / 60.0,
+                1,
+            )
+            if recently_served
+            else None
+        )
+
     finally:
         session.close()
 
@@ -225,10 +255,15 @@ def build_ops_snapshot(
         "staff": staff_list,
         "stations": stations_list,
         "low_stock_ingredients": low_stock_items,
+        "queued_count": int(ticket_counts.get("queued", 0)),
+        "cooking_count": int(ticket_counts.get("cooking", 0)),
+        "avg_ticket_minutes": avg_ticket_minutes,
         "note": (
             "forecast_qty is the most recent per-item demand forecast. "
             "revenue_estimate = forecast_qty × price. "
             "sole_cover_dishes_at_risk lists dishes that would lose their only "
-            "qualified cook if that staffer is absent."
+            "qualified cook if that staffer is absent. "
+            "queued_count is the kitchen ticket backlog and avg_ticket_minutes "
+            "the average order-to-served time over the last sim-hour."
         ),
     }

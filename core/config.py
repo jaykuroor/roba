@@ -46,6 +46,22 @@ CANCEL_RATE = 0.03
 VELOCITY_WINDOW_SIM_S = 1800
 VELOCITY_ANOMALY_PCT = 0.30
 
+# kitchen ticket lifecycle (docs/fable/portfolio-overview.md)
+# Tickets one present cook clears per sim-hour. THE calibration knob: a real
+# pass depends on dish complexity, station layout and how good the cook is, so
+# expect to tune it per preset rather than trusting the default.
+# Sizing it against the shipped presets: the Poisson rate is
+# BASE_ORDERS_PER_DAY × daypart_weight / 54000, so at 300/day the busiest
+# daypart (lunch, w=0.34) still only lands ~7 orders/hour. 12 means a single
+# present cook clears the pass and a backlog only builds when the kitchen is
+# effectively empty. To watch *one* absence bite while others stay on, lower
+# this (~5) or raise base_orders_per_day in Controls.
+KITCHEN_TICKETS_PER_COOK_PER_HOUR = float(os.getenv("KITCHEN_TICKETS_PER_COOK_PER_HOUR", "12"))
+# Queue depth at which a restaurant card turns warning / critical.
+# manager.py mirrors these (it deliberately imports no core module).
+BACKLOG_WARN = int(os.getenv("BACKLOG_WARN", "8"))
+BACKLOG_CRIT = int(os.getenv("BACKLOG_CRIT", "20"))
+
 # forecasting
 FORECAST_INTERVAL_SIM_S = 1800
 HISTORY_DAYS = 30

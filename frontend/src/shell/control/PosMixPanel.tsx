@@ -20,6 +20,59 @@ function normalise(mix: Record<string, number>): Record<string, number> {
   return Object.fromEntries(Object.entries(mix).map(([k, v]) => [k, v / total]));
 }
 
+type TicketMode = "lifecycle" | "instant";
+
+/** Kitchen ticket lifecycle switch (docs/fable/portfolio-overview.md).
+ *  Applied immediately rather than on Apply — flipping to "instant" is how you
+ *  clear a backlog, and waiting for a batched save hides that. */
+function KitchenTicketModeToggle() {
+  const [mode, setMode] = useState<TicketMode>("lifecycle");
+
+  useEffect(() => {
+    apiGet<SimSettings>("/api/sim/pos")
+      .then((s) => {
+        if (s.kitchen_ticket_mode === "instant" || s.kitchen_ticket_mode === "lifecycle") {
+          setMode(s.kitchen_ticket_mode);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  async function change(next: TicketMode) {
+    const previous = mode;
+    setMode(next);
+    try {
+      await apiPatch("/api/sim/pos", { kitchen_ticket_mode: next });
+    } catch {
+      setMode(previous);
+    }
+  }
+
+  return (
+    <div>
+      <SectionHeading>Kitchen Tickets</SectionHeading>
+      <p className="mb-2 text-[10px] text-text/40">
+        Lifecycle queues each order until a cook clears it, so short-staffing grows a
+        visible backlog. Instant closes orders the moment they arrive.
+      </p>
+      <div className="flex items-center gap-4 text-sm">
+        {(["lifecycle", "instant"] as const).map((value) => (
+          <label key={value} className="flex cursor-pointer items-center gap-1">
+            <input
+              type="radio"
+              name="kitchen_ticket_mode"
+              value={value}
+              checked={mode === value}
+              onChange={() => void change(value)}
+            />
+            <span className="text-text/80">{value}</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function PosMixPanel() {
   const [settings, setSettings] = useState<SimSettings | null>(null);
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
@@ -84,6 +137,8 @@ export function PosMixPanel() {
           />
         </label>
       </div>
+
+      <KitchenTicketModeToggle />
 
       <div>
         <SectionHeading>Channel Mix</SectionHeading>

@@ -268,6 +268,11 @@ class Order(Base):
     status = mapped_column(String)             # open | closed | cancelled
     channel = mapped_column(String)
     total = mapped_column(Float)
+    # Kitchen ticket lifecycle (docs/fable/portfolio-overview.md). Independent of
+    # ``status``, which is the *payment* state. Defaults to ``served`` so seeded
+    # history and instant-mode orders never show up as a backlog.
+    kitchen_status = mapped_column(String, default="served")  # queued | cooking | served
+    served_at = mapped_column(Float)           # sim-time the ticket left the pass
 
     def __repr__(self):
         return f"<Order id={self.id} sim_time={self.sim_time} status={self.status!r} total={self.total}>"
@@ -1051,6 +1056,7 @@ class SimSettings(Base):
     batch_auto_qty = mapped_column(Integer, default=0)  # bool 0/1 — forecaster may adjust batch quantities without approval
     staff_checkin_mode = mapped_column(String, default="sim_auto")  # "sim_auto" | "manual" — cook-desk staff board
     auto_plan_on_forecast = mapped_column(Integer, default=1)  # bool 0/1 — every forecast triggers procurement plan + due orders
+    kitchen_ticket_mode = mapped_column(String, default="lifecycle")  # "lifecycle" | "instant" — POS ticket drain
 
     def __repr__(self):
         return (f"<SimSettings id={self.id} base_orders_per_day={self.base_orders_per_day} "

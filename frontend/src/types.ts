@@ -140,6 +140,7 @@ export interface SimSettings {
   daypart_curve: Record<string, number> | null;
   channel_mix: Record<string, number> | null;
   anomaly_injections: AnomalyInjection[] | null;
+  kitchen_ticket_mode?: "lifecycle" | "instant" | null;
 }
 
 /** One windowed POS anomaly injection (§10). */
