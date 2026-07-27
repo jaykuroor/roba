@@ -415,7 +415,7 @@ The non-obvious facts that shape this work. **Read this section before starting 
   gitignored, so a worktree has no Vertex credentials and ~14 LLM-dependent tests
   (`track_a/tests/test_forecaster.py`, `test_staff.py`, `track_b/tests/test_market.py`,
   `test_optimizer.py`) fail on the canned fallback for reasons that have nothing to do with
-  your change. `cp ../../../.env ../../../roba.json .` before trusting a suite run.
+  your change. `cp ../../../.env ../../../roba.json .` before trusting a suite run — but note §5: credentials swap *which* tests fail, they do not produce a green run.
   `frontend/node_modules` is likewise absent — symlink it rather than reinstalling.
 - Frontend typecheck is folded into `npm run build` (`tsc -b`) — there is no separate
   `typecheck` script, and `make test` does not run the build.
@@ -442,6 +442,24 @@ recorded because they will bite an implementor.
   event.
 - **`make test` skips `track_a/tests`** (`Makefile:32`) while `pytest.ini` includes it.
 - **The Python suite destroys `demo.db`** — see §4 Tests.
+- **The Python suite fails differently depending on whether Vertex credentials are
+  present** (added 2026-07-27, both verified against clean `main`). There is no single
+  green baseline — check which set you are looking at before blaming your change:
+  - **Without `.env` / `roba.json`** (e.g. a fresh worktree): 14 failures in
+    `track_a/tests/test_forecaster.py` (10), `test_staff.py` (1),
+    `track_b/tests/test_market.py` (2), `test_optimizer.py` (1) — everything that needs a
+    real completion degrades to the canned no-op.
+  - **With credentials**: those 14 pass, and **two others start failing** —
+    `tests/test_seeding.py::test_generate_offline_produces_valid_bundle` and
+    `tests/test_api_session_lifecycle.py::test_running_sim_periodically_updates_core_feeds`.
+    The seeding one is a real bug: `core/seeding.py:374` indexes the LLM's generated bundle
+    without validating its shape, so it dies on whatever the model returned that run — the
+    exception is *not stable* (`TypeError: cannot use 'dict' as a dict key` and
+    `AttributeError: 'str' object has no attribute 'get'` from two runs of the same test).
+  - With credentials the suite also takes **well over an hour** (the forecaster tests make
+    real `gemini-2.5-pro` calls at `LLM_AUTHORITY_TIMEOUT_S=75`), versus ~3 minutes without.
+    For a regression check, run credential-less on your branch **and** on clean `main` and
+    diff the failure lists — that is fast and decisive.
 - **The frontend suite has 7 failing tests and the build has 5 type errors**, all
   pre-existing and unrelated to the fable work (verified against `main`, 2026-07-27).
   Tests: `src/track_b/__tests__/InventoryDashboard.test.tsx` (2) and
