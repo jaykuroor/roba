@@ -2337,11 +2337,14 @@ def dev_seed_batches() -> Dict[str, Any]:
     return {"seeded": count, "sim_time": now}
 
 
+@app.post("/api/track-a/batches/suggest")
 @app.post("/api/dev/suggest-batches")
 async def dev_suggest_batches() -> Dict[str, Any]:
     """Manually trigger the start-of-day batch advisor (Gemini 2.5 Pro).
 
-    Useful for testing without waiting for the daily clock boundary.
+    Backs the control bar's "Suggest batch change" button, and runs without
+    waiting for the daily clock boundary. ``force=True`` also means every
+    proposal lands as a ``batch`` approval card rather than auto-applying.
     Only runs if the forecaster agent is registered.
     """
     forecaster = ctx.track_a.get("forecaster") if ctx.track_a else None

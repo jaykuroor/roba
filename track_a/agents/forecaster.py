@@ -85,6 +85,78 @@ MATERIAL_SIGNAL_TYPES = {
 }
 
 
+def _gap_proposals(
+    batches: List[Dict[str, Any]],
+    forecasts: List[Dict[str, Any]],
+    now: float,
+) -> List[Dict[str, Any]]:
+    """One batch proposal from the plan-vs-forecast gap, in the LLM's own shape.
+
+    Used when the batch advisor's LLM returns nothing — a degraded provider
+    must not turn a manual "suggest a change" click into silence. Picks the
+    uncooked cook batch furthest from its item's latest forecast; with no
+    uncooked batches, proposes adding one for the strongest forecast.
+    """
+    latest: Dict[int, Dict[str, Any]] = {}
+    for f in forecasts:  # already ordered newest-first by the caller
+        latest.setdefault(int(f.get("menu_item_id") or 0), f)
+
+    best: Optional[Dict[str, Any]] = None
+    for b in batches:
+        if b.get("decision") != "cook" or b.get("cooked_at") is not None:
+            continue
+        f = latest.get(int(b.get("menu_item_id") or 0))
+        if f is None:
+            continue
+        gap = int(f["forecast_qty"]) - int(round(float(b.get("planned_qty") or 0)))
+        if abs(gap) < 1:
+            continue
+        if best is None or abs(gap) > abs(best["gap"]):
+            best = {"batch": b, "forecast": f, "gap": gap}
+
+    if best is not None:
+        b, f, gap = best["batch"], best["forecast"], best["gap"]
+        planned = int(round(float(b.get("planned_qty") or 0)))
+        direction = "up" if gap > 0 else "down"
+        return [{
+            "type": "requantify",
+            "menu_item_id": b.get("menu_item_id"),
+            "dish_name": b.get("dish"),
+            "target_qty": int(f["forecast_qty"]),
+            "target_window_start": b.get("cook_by") or now,
+            "forecast_demand": int(f["forecast_qty"]),
+            "projected_benefit_description": (
+                f"Closes a {abs(gap)}-portion gap "
+                f"({'shortfall' if gap > 0 else 'likely waste'})."
+            ),
+            "reasoning": (
+                f"Batch #{b.get('id')} plans {planned} portions but the latest "
+                f"{f.get('daypart') or 'window'} forecast is {int(f['forecast_qty'])} — "
+                f"size it {direction}."
+            ),
+        }]
+
+    # Nothing on the schedule to resize — suggest cooking the strongest forecast.
+    ranked = [f for f in latest.values() if int(f["forecast_qty"]) > 0]
+    if not ranked:
+        return []
+    top = max(ranked, key=lambda f: int(f["forecast_qty"]))
+    window = top.get("window") or {}
+    return [{
+        "type": "add_batch",
+        "menu_item_id": top.get("menu_item_id"),
+        "dish_name": f"Item #{top.get('menu_item_id')}",
+        "target_qty": int(top["forecast_qty"]),
+        "target_window_start": (window or {}).get("start") or now,
+        "forecast_demand": int(top["forecast_qty"]),
+        "projected_benefit_description": "Nothing is scheduled against this demand.",
+        "reasoning": (
+            f"No uncooked batch covers the {top.get('daypart') or 'next'} window, "
+            f"where the forecast is {int(top['forecast_qty'])} portions."
+        ),
+    }]
+
+
 class DemandForecaster(BaseAgent):
     """Rolling item forecasts, LLM optimization, memory, and batch decisions."""
 
@@ -765,10 +837,14 @@ class DemandForecaster(BaseAgent):
         approval.
 
         Args:
-            force: When True, bypasses the once-per-day guard (for dev/testing).
+            force: Manual run (the control-bar button, dev/testing). Bypasses the
+                once-per-day guard, and routes every proposal to approval instead
+                of auto-applying ``requantify`` — someone asked to *see* the
+                suggestion, so it must land as a card.
 
         Returns:
-            Dict with ``proposals``, ``schedule_assessment``, ``routed``, ``source``.
+            Dict with ``proposals``, ``schedule_assessment``, ``routed``,
+            ``source`` and ``created`` (approval cards raised).
         """
         from core.reasoner import suggest_batch_changes
 
@@ -777,7 +853,7 @@ class DemandForecaster(BaseAgent):
 
         if not force:
             if self._last_batch_suggestion_day == day_num:
-                return {"proposals": [], "schedule_assessment": "Already ran today.", "routed": [], "source": "skip"}
+                return {"proposals": [], "schedule_assessment": "Already ran today.", "routed": [], "source": "skip", "created": 0}
 
         self._last_batch_suggestion_day = day_num
 
@@ -830,6 +906,13 @@ class DemandForecaster(BaseAgent):
 
         result = suggest_batch_changes(context, timeout_s=45.0)
         proposals = result.get("proposals") or []
+        if not proposals:
+            # The LLM had nothing (or degraded to a canned no-op). A manual run
+            # is a request for a suggestion, so fall back to the deterministic
+            # forecast-vs-plan gap rather than returning silence.
+            proposals = _gap_proposals(board["batches"], forecast_data, now)
+            if proposals:
+                result["source"] = f"{result.get('source', 'unknown')}+gap_fallback"
         routed: List[Dict[str, Any]] = []
 
         for proposal in proposals:
@@ -842,7 +925,7 @@ class DemandForecaster(BaseAgent):
             benefit = str(proposal.get("projected_benefit_description") or "")
             reasoning = str(proposal.get("reasoning") or "")
 
-            if ptype == "requantify" and batch_auto_qty:
+            if ptype == "requantify" and batch_auto_qty and not force:
                 # Auto-apply: update the nearest upcoming approved batch for this item
                 try:
                     session2 = self.db_session_factory()
@@ -889,7 +972,7 @@ class DemandForecaster(BaseAgent):
                     # Fall back to approval
                     ptype = "requantify_fallback"
 
-            if ptype != "requantify" or not batch_auto_qty:
+            if ptype != "requantify" or not batch_auto_qty or force:
                 # Route to manager approval
                 if self.approvals is not None:
                     try:
@@ -929,6 +1012,7 @@ class DemandForecaster(BaseAgent):
             "schedule_assessment": result.get("schedule_assessment", ""),
             "routed": routed,
             "source": result.get("source", "unknown"),
+            "created": sum(1 for r in routed if r["action"] == "approval_created"),
         }
 
     def generate_suggestions(self) -> Dict[str, Any]:

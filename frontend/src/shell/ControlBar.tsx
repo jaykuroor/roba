@@ -5,6 +5,7 @@ import {
   Pause,
   Play,
   RotateCcw,
+  Sparkles,
   Square,
   StepForward,
   Wifi,
@@ -229,6 +230,8 @@ export function ControlBar({
   const wsConnected = useWsConnected();
   const approvals = useApprovals();
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestNote, setSuggestNote] = useState<string | null>(null);
 
   const status = simState?.status ?? "stopped";
   const speed = simState?.speed ?? 1;
@@ -251,6 +254,30 @@ export function ControlBar({
         .catch(() => undefined);
     } finally {
       setPendingAction(null);
+    }
+  }
+
+  async function suggestBatchChange() {
+    if (suggesting) return;
+    setSuggesting(true);
+    setSuggestNote(null);
+    try {
+      // Runs the batch advisor; each proposal lands in the approval inbox as a
+      // "batch" card. The bell count updates itself off the WS event.
+      const r = await apiPost<{ created?: number }>(
+        "/api/track-a/batches/suggest",
+      );
+      const n = r.created ?? 0;
+      setSuggestNote(
+        n > 0
+          ? `${n} batch suggestion${n === 1 ? "" : "s"} in the inbox`
+          : "no change to suggest",
+      );
+    } catch {
+      setSuggestNote("advisor failed");
+    } finally {
+      setSuggesting(false);
+      window.setTimeout(() => setSuggestNote(null), 8000);
     }
   }
 
@@ -354,6 +381,25 @@ export function ControlBar({
 
           <Section label="Velocity">
             <VelocitySlider />
+          </Section>
+
+          <Section label="Batches">
+            <button
+              type="button"
+              onClick={() => void suggestBatchChange()}
+              disabled={suggesting}
+              title="Ask the batch advisor for a batch/quantity change — the proposal arrives as an approval card"
+              className="flex h-8 items-center gap-1.5 rounded-md border border-muted bg-primary px-2.5 text-sm font-medium text-text hover:border-accent disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Sparkles
+                size={14}
+                className={suggesting ? "animate-pulse" : undefined}
+              />
+              {suggesting ? "Thinking…" : "Suggest change"}
+            </button>
+            {suggestNote && (
+              <span className="text-xs text-text/50">{suggestNote}</span>
+            )}
           </Section>
 
           <Section label="WS">

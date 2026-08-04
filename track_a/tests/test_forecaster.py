@@ -1350,3 +1350,53 @@ def test_narrow_forecast_does_not_emit_horizon_signal(bus, session_factory, seed
     sigs2 = bus.live(type=SignalType.DEMAND_FORECAST_HORIZON)
     days2 = (sigs2[0].payload or {}).get("days") or []
     assert len(days2) == 7, "narrow forecast clobbered the 7-day procurement horizon"
+
+
+def test_manual_batch_advisor_always_raises_a_card(bus, session_factory, seeded, monkeypatch):
+    """The control-bar button must produce an approval card, not silence.
+
+    Hardest case: the LLM returns nothing (degraded/canned) *and* batch_auto_qty
+    is on, which would otherwise auto-apply the qty with no notification.
+    """
+    import core.reasoner as reasoner
+
+    monkeypatch.setattr(
+        reasoner, "suggest_batch_changes",
+        lambda context, timeout_s=45.0: {"proposals": [], "source": "canned"},
+    )
+
+    now = float(bus.sim_time)
+    session = session_factory()
+    try:
+        session.get(SimSettings, 1).batch_auto_qty = 1
+        session.add(Batch(
+            batch_definition_id=1, menu_item_id=1, decided_at=now,
+            serve_window={"start": now + 3600, "end": now + 7200},
+            decision="cook", planned_qty=4, actual_made_qty=0.0, sold_qty=0.0,
+            wasted_qty=0.0, status="approved", by="agent",
+        ))
+        session.add(Forecast(
+            menu_item_id=1, window={"start": now + 3600, "end": now + 7200},
+            daypart="lunch", forecast_qty=11, baseline_qty=11.0, multipliers={},
+            confidence=0.8, generated_at=now, trigger_reason="test",
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+    agent = DemandForecaster(bus, session_factory)
+    agent.approvals = ApprovalsHub(bus, session_factory)
+    result = agent.suggest_day_batches(force=True)
+
+    assert result["created"] == 1, result
+
+    session = session_factory()
+    try:
+        row = session.query(ApprovalRequest).filter(ApprovalRequest.type == "batch").one()
+        assert row.status == "pending"
+        assert row.payload["target_qty"] == 11        # sized to the forecast
+        assert row.payload["menu_item_id"] == 1
+        # The plan was untouched — it is a suggestion awaiting a decision.
+        assert session.query(Batch).one().planned_qty == 4
+    finally:
+        session.close()
